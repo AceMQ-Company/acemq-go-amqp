@@ -19,7 +19,7 @@ go get github.com/AceMQ-Company/acemq-go-amqp
 
 ```go
 import (
-	acemq "github.com/AceMQ-Company/acemq-go-amqp"
+	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
 	_ "github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
 )
 
@@ -77,12 +77,24 @@ deliberately no kinder than RabbitMQ. See [testing](testing.md).
 the UUIDs. The AMQP client lives behind a transport registry in a subpackage, so
 a program that only uses `memory://` never compiles it in.
 
-## Two packages
+## The layout
+
+The module is a package per concern, with nothing at its root:
 
 | | |
 |---|---|
-| `github.com/AceMQ-Company/acemq-go-amqp` | envelopes, codecs, publishing, consuming, retry, the in-memory transport |
+| `.../acemq-go-amqp/amqp` | envelopes, codecs, publishing, consuming, retry, the in-memory transport |
 | `.../acemq-go-amqp/rabbitmq` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go` |
+
+The package in `amqp/` is named `acemq`, so the import carries the name:
+
+```go
+import acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+```
+
+The directory says what the package is; the name says whose it is. It also keeps
+the module root free for the packages that will sit beside these two, and
+`acemq.Connect` reads better at every call site than `amqp.Connect` would.
 
 The blank import is what registers the `amqp` and `amqps` schemes:
 
@@ -118,7 +130,7 @@ elsewhere.
 - [Exchanges, queues and bindings](topology.md)
 - [Retries, redelivery and shutdown](reliability.md)
 - [Testing without a broker](testing.md)
-- [API reference](https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp) on
+- [API reference](https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp) on
   pkg.go.dev
 
 ## Status

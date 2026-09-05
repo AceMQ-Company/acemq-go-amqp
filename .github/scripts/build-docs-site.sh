@@ -151,7 +151,7 @@ NAV='<nav class="top">
     </div>
   </div>
 
-  <a class="api" href="https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp">API reference</a>
+  <a class="api" href="https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp">API reference</a>
   <a class="enterprise" href="https://acemq.org/">JVM libraries</a>
   <a class="enterprise" href="https://acemq.org/acemq-dotnet-amqp/">.NET library</a>
   <a class="enterprise" href="https://acemq.com">Enterprise support</a>

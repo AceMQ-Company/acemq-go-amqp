@@ -15,10 +15,10 @@
 // Package rabbitmq is the RabbitMQ transport for AceMQ.
 //
 // Importing it registers the amqp and amqps schemes, after which
-// [github.com/AceMQ-Company/acemq-go-amqp.Connect] can reach a broker:
+// [github.com/AceMQ-Company/acemq-go-amqp/amqp.Connect] can reach a broker:
 //
 //	import (
-//		acemq "github.com/AceMQ-Company/acemq-go-amqp"
+//		acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
 //		_ "github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
 //	)
 //
@@ -40,7 +40,7 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
-	acemq "github.com/AceMQ-Company/acemq-go-amqp"
+	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
 )
 
 func init() {

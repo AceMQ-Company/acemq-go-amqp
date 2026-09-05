@@ -15,7 +15,7 @@ go get github.com/AceMQ-Company/acemq-go-amqp
 
 ```go
 import (
-	acemq "github.com/AceMQ-Company/acemq-go-amqp"
+	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
 	_ "github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
 )
 
@@ -101,10 +101,12 @@ the same as it does in the other languages.
 
 ## What is in the box
 
+A package per concern, with nothing at the module root:
+
 | Package | |
 |---|---|
-| `acemq` | envelopes, codecs, publishing, consuming, retry, the in-memory transport. No dependencies outside the standard library. |
-| `acemq/rabbitmq` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go`. |
+| `amqp/` | envelopes, codecs, publishing, consuming, retry, the in-memory transport. No dependencies outside the standard library. Named `acemq`. |
+| `rabbitmq/` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go`. |
 
 ## Retry, and the attempt counter
 

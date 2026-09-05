@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	acemq "github.com/AceMQ-Company/acemq-go-amqp"
+	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
 	_ "github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
 )
 

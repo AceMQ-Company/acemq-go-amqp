@@ -19,6 +19,13 @@
 // reads what a Java producer writes, and the fixtures in internal/testdata pin
 // that rather than leaving it to be discovered in production.
 //
+//	import acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+//
+// The package is named acemq and the directory amqp, so the import needs the
+// name on it. That is deliberate: the module root stays free for the packages
+// beside this one, and "acemq.Connect" reads better at every call site than
+// "amqp.Connect" would.
+//
 // # Getting a message across
 //
 //	mq, err := acemq.Connect(ctx, "amqp://guest:guest@localhost:5672/")
@@ -59,7 +66,13 @@
 //
 // # Layout
 //
+// The module is a package per concern, with nothing at its root:
+//
+//	amqp/      this package: envelopes, codecs, publishing, consuming, retry,
+//	           and the in-memory transport
+//	rabbitmq/  the RabbitMQ transport
+//
 // This package has no dependencies outside the standard library. The RabbitMQ
-// transport lives in a subpackage and brings its own; importing this package
-// alone does not compile it in.
+// transport brings its own; importing this package alone does not compile it
+// in.
 package acemq

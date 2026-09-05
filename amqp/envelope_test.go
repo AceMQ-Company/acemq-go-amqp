@@ -40,7 +40,7 @@ type fixtureCase struct {
 
 func loadFixtures(t *testing.T) fixtureFile {
 	t.Helper()
-	raw, err := os.ReadFile("internal/testdata/envelope-fixtures.json")
+	raw, err := os.ReadFile("../internal/testdata/envelope-fixtures.json")
 	if err != nil {
 		t.Fatalf("cannot read the fixtures: %v", err)
 	}
