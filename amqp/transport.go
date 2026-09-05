@@ -20,6 +20,8 @@ import (
 	"net/url"
 	"sort"
 	"sync"
+
+	"github.com/AceMQ-Company/acemq-go-amqp/security"
 )
 
 // Transport is what a broker has to provide. The in-memory transport in this
@@ -129,10 +131,22 @@ type Delivery struct {
 	Nack func(requeue bool) error
 }
 
+// DialOptions are what a transport needs that a URL cannot carry.
+type DialOptions struct {
+	// Security is how to reach the broker safely: TLS mode, trusted authority,
+	// client certificate, credentials. Nil means the transport's own defaults,
+	// which for RabbitMQ is TLS only if the URL says amqps and verification
+	// against the system trust store.
+	Security *security.Options
+}
+
 var (
 	transportsMu sync.RWMutex
-	transports   = map[string]func(ctx context.Context, url string) (Transport, error){}
+	transports   = map[string]DialFunc{}
 )
+
+// DialFunc opens a connection to a broker.
+type DialFunc func(ctx context.Context, url string, opts DialOptions) (Transport, error)
 
 // RegisterTransport associates a URL scheme with a way of dialling it.
 //
@@ -142,7 +156,7 @@ var (
 // arrangement database/sql uses for its drivers:
 //
 //	import _ "github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
-func RegisterTransport(scheme string, dial func(ctx context.Context, url string) (Transport, error)) {
+func RegisterTransport(scheme string, dial DialFunc) {
 	transportsMu.Lock()
 	defer transportsMu.Unlock()
 	transports[scheme] = dial
@@ -160,7 +174,7 @@ func TransportSchemes() []string {
 	return schemes
 }
 
-func dialTransport(ctx context.Context, rawURL string) (Transport, error) {
+func dialTransport(ctx context.Context, rawURL string, opts DialOptions) (Transport, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("acemq: %q is not a usable broker URL: %w", rawURL, err)
@@ -176,5 +190,5 @@ func dialTransport(ctx context.Context, rawURL string) (Transport, error) {
 				"_ \"github.com/AceMQ-Company/acemq-go-amqp/rabbitmq\"",
 			parsed.Scheme, TransportSchemes())
 	}
-	return dial(ctx, rawURL)
+	return dial(ctx, rawURL, opts)
 }

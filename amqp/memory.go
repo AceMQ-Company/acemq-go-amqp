@@ -43,7 +43,7 @@ var (
 	brokers   = map[string]*memBroker{}
 )
 
-func dialMemory(_ context.Context, rawURL string) (Transport, error) {
+func dialMemory(_ context.Context, rawURL string, _ DialOptions) (Transport, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("acemq: %q is not a usable memory URL: %w", rawURL, err)

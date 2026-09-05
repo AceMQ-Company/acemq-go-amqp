@@ -35,21 +35,70 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	neturl "net/url"
 	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+	"github.com/AceMQ-Company/acemq-go-amqp/security"
 )
+
+// applyCredentials puts the configured login into the URL.
+//
+// The client takes credentials from the URL and nowhere else, so this is where
+// a password read from a file or an environment variable joins the connection.
+// It replaces whatever the URL carried: a caller who configured a provider
+// meant it to be used.
+func applyCredentials(rawURL string, sec *security.Options) (string, error) {
+	creds, present, err := sec.Credentials()
+	if err != nil {
+		return "", err
+	}
+	if !present {
+		return rawURL, nil
+	}
+
+	parsed, err := neturl.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("acemq: %q is not a usable broker URL: %w", rawURL, err)
+	}
+	parsed.User = neturl.UserPassword(creds.Username(), creds.Secret())
+	return parsed.String(), nil
+}
+
+// checkScheme refuses a combination that cannot mean what it says.
+//
+// Asking for TLS and then connecting to amqp:// produces a plaintext
+// connection with no warning at all, which is the quietest possible way to
+// lose the thing that was configured most deliberately.
+func checkScheme(rawURL string, sec *security.Options) error {
+	parsed, err := neturl.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("acemq: %q is not a usable broker URL: %w", rawURL, err)
+	}
+	switch {
+	case sec.Mode() != security.ModeDisabled && parsed.Scheme == "amqp":
+		return fmt.Errorf(
+			"acemq: security is set to %s but the URL is amqp://, which is plaintext. "+
+				"Use amqps://, or security.Disabled() if plaintext is what you meant",
+			sec.Mode())
+	case sec.Mode() == security.ModeDisabled && parsed.Scheme == "amqps":
+		return fmt.Errorf(
+			"acemq: security is disabled but the URL is amqps://, which is encrypted. " +
+				"Use amqp://, or drop security.Disabled()")
+	}
+	return nil
+}
 
 func init() {
 	acemq.RegisterTransport("amqp", dial)
 	acemq.RegisterTransport("amqps", dial)
 }
 
-func dial(ctx context.Context, url string) (acemq.Transport, error) {
-	return Dial(ctx, url)
+func dial(ctx context.Context, url string, opts acemq.DialOptions) (acemq.Transport, error) {
+	return Dial(ctx, url, Config{Security: opts.Security})
 }
 
 // dialTimeout bounds both reaching the broker and the handshake that follows,
@@ -81,8 +130,14 @@ func contextDialer(ctx context.Context, timeout time.Duration) func(string, stri
 
 // Config is what a URL cannot carry.
 type Config struct {
-	// TLS is used for an amqps:// connection. Nil means the client's default,
-	// which verifies the broker against the system roots.
+	// Security is how to reach the broker safely: TLS mode, trusted authority,
+	// client certificate and credentials. Prefer it to TLS below, which it
+	// overrides when both are given.
+	Security *security.Options
+
+	// TLS configures an amqps:// connection directly, for a caller who would
+	// rather build the *tls.Config themselves. Nil means the client's default,
+	// which verifies against the system roots.
 	TLS *tls.Config
 
 	// Name identifies this connection in RabbitMQ's management interface, which
@@ -117,8 +172,31 @@ func Dial(ctx context.Context, url string, cfg ...Config) (*Transport, error) {
 		props = amqp.Table{"product": "AceMQ for Go"}
 	}
 
+	tlsConfig := c.TLS
+	if c.Security != nil {
+		if err := c.Security.Err(); err != nil {
+			return nil, err
+		}
+		built, err := c.Security.TLSConfig()
+		if err != nil {
+			return nil, err
+		}
+		// nil here means the security options asked for plaintext, and that has
+		// to win over an inherited *tls.Config rather than being ignored.
+		tlsConfig = built
+
+		var err2 error
+		url, err2 = applyCredentials(url, c.Security)
+		if err2 != nil {
+			return nil, err2
+		}
+		if err := checkScheme(url, c.Security); err != nil {
+			return nil, err
+		}
+	}
+
 	conn, err := amqp.DialConfig(url, amqp.Config{
-		TLSClientConfig: c.TLS,
+		TLSClientConfig: tlsConfig,
 		Properties:      props,
 		Dial:            contextDialer(ctx, dialTimeout),
 	})

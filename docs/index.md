@@ -73,6 +73,11 @@ See [retries and redelivery](reliability.md).
 publishing, consuming, acknowledgement and retry without Docker. It is
 deliberately no kinder than RabbitMQ. See [testing](testing.md).
 
+**Security you have to opt out of.** TLS with a named authority, credentials
+read fresh on every connection, and development certificates that are refused
+unless you say otherwise — on every path, including the insecure one. See
+[security](security.md).
+
 **A core with no dependencies.** Nothing outside the standard library, including
 the UUIDs. The AMQP client lives behind a transport registry in a subpackage, so
 a program that only uses `memory://` never compiles it in.
@@ -85,6 +90,8 @@ The module is a package per concern, with nothing at its root:
 |---|---|
 | `.../acemq-go-amqp/amqp` | envelopes, codecs, publishing, consuming, retry, the in-memory transport |
 | `.../acemq-go-amqp/rabbitmq` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go` |
+| `.../acemq-go-amqp/security` | TLS modes, trusted authorities, credentials |
+| `.../acemq-go-amqp/devcerts` | development certificates, behind the `acemq-certs` command |
 
 The package in `amqp/` is named `acemq`, so the import carries the name:
 
@@ -128,6 +135,7 @@ elsewhere.
 - [Getting started](getting-started.md) — the first message, explained
 - [Publishing](publishing.md) and [consuming](consuming.md)
 - [Exchanges, queues and bindings](topology.md)
+- [Security](security.md) — TLS, trust and credentials
 - [Retries, redelivery and shutdown](reliability.md)
 - [Testing without a broker](testing.md)
 - [API reference](https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp) on

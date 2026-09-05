@@ -145,6 +145,7 @@ NAV='<nav class="top">
   <div class="group">
     <button type="button" aria-haspopup="true">Operations</button>
     <div class="menu">
+      <a href="security.html">Security</a>
       <a href="reliability.html">Retries, redelivery, shutdown</a>
       <a href="serialization.html">Codecs</a>
       <a href="licence.html">Licence</a>

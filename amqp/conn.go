@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/AceMQ-Company/acemq-go-amqp/security"
 )
 
 // Conn is a connection to a broker. It is safe for concurrent use.
@@ -34,16 +36,33 @@ type Conn struct {
 	subs   []*Consumer
 }
 
+// connConfig is what the options build up.
+//
+// The options configure this rather than the connection itself, because
+// [WithSecurity] has to be known before the transport is dialled — by the time
+// a *Conn exists, the handshake has already happened.
+type connConfig struct {
+	codec    Codec
+	origin   string
+	retry    RetryPolicy
+	prefetch int
+	security *security.Options
+}
+
+func defaultConfig() connConfig {
+	return connConfig{codec: JSONCodec{}, origin: defaultOrigin(), prefetch: 20}
+}
+
 // ConnOption configures a connection.
-type ConnOption func(*Conn) error
+type ConnOption func(*connConfig) error
 
 // WithCodec sets the codec used for payloads. The default is [JSONCodec].
 func WithCodec(c Codec) ConnOption {
-	return func(conn *Conn) error {
+	return func(cfg *connConfig) error {
 		if c == nil {
 			return errors.New("acemq: WithCodec was given a nil codec")
 		}
-		conn.codec = c
+		cfg.codec = c
 		return nil
 	}
 }
@@ -52,7 +71,7 @@ func WithCodec(c Codec) ConnOption {
 // service@host. The default is acemq@{hostname}, which names the machine but
 // not the service.
 func WithOrigin(origin string) ConnOption {
-	return func(conn *Conn) error { conn.origin = origin; return nil }
+	return func(cfg *connConfig) error { cfg.origin = origin; return nil }
 }
 
 // WithRetry sets the retry policy consumers use by default.
@@ -61,22 +80,45 @@ func WithOrigin(origin string) ConnOption {
 // will hand it back as fast as it can. That is rarely what anybody wants for
 // long, so set a policy for anything that is not a toy.
 func WithRetry(p RetryPolicy) ConnOption {
-	return func(conn *Conn) error {
+	return func(cfg *connConfig) error {
 		if err := p.Validate(); err != nil {
 			return err
 		}
-		conn.retry = p
+		cfg.retry = p
 		return nil
 	}
 }
 
 // WithPrefetch sets how many unacknowledged messages a consumer will hold.
 func WithPrefetch(n int) ConnOption {
-	return func(conn *Conn) error {
+	return func(cfg *connConfig) error {
 		if n < 0 {
 			return fmt.Errorf("acemq: WithPrefetch must not be negative, got %d", n)
 		}
-		conn.prefetch = n
+		cfg.prefetch = n
+		return nil
+	}
+}
+
+// WithSecurity sets how the broker is reached: TLS mode, trusted authority,
+// client certificate and credentials.
+//
+//	mq, err := acemq.Connect(ctx, "amqps://broker:5671/",
+//		acemq.WithSecurity(security.Required().
+//			TrustCertificateAuthorityFile("certs/ca.crt").
+//			WithCredentials(security.EnvironmentCredentials("MQ_USER", "MQ_PASSWORD"))))
+//
+// Credentials given here override anything in the URL, which is how a password
+// stays out of logs and process listings.
+func WithSecurity(s *security.Options) ConnOption {
+	return func(cfg *connConfig) error {
+		if s == nil {
+			return errors.New("acemq: WithSecurity was given no options")
+		}
+		if err := s.Err(); err != nil {
+			return err
+		}
+		cfg.security = s
 		return nil
 	}
 }
@@ -92,47 +134,56 @@ func WithPrefetch(n int) ConnOption {
 // Every memory:// URL with a different host is a different broker, so tests
 // that run in parallel can each have their own.
 func Connect(ctx context.Context, url string, opts ...ConnOption) (*Conn, error) {
-	transport, err := dialTransport(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-
-	conn := &Conn{
-		transport: transport,
-		codec:     JSONCodec{},
-		origin:    defaultOrigin(),
-		prefetch:  20,
-	}
+	cfg := defaultConfig()
 	for _, opt := range opts {
-		if err := opt(conn); err != nil {
-			_ = transport.Close()
+		if err := opt(&cfg); err != nil {
 			return nil, err
 		}
 	}
-	return conn, nil
+
+	// Dialled after the options are read, because the security configuration
+	// has to be in hand before the handshake rather than after it.
+	transport, err := dialTransport(ctx, url, DialOptions{Security: cfg.security})
+	if err != nil {
+		return nil, err
+	}
+	return newConn(transport, cfg), nil
 }
 
 // NewConn wraps a transport you built yourself.
 //
 // Connect covers the ordinary case. This is for a transport that is not reached
-// by a URL — a fake in a test, or one that needs configuration a URL cannot
-// carry, such as a TLS setup with a private certificate authority.
+// by a URL — a fake in a test, or one built with configuration a URL cannot
+// carry.
 func NewConn(transport Transport, opts ...ConnOption) (*Conn, error) {
 	if transport == nil {
 		return nil, errors.New("acemq: NewConn was given a nil transport")
 	}
-	conn := &Conn{
-		transport: transport,
-		codec:     JSONCodec{},
-		origin:    defaultOrigin(),
-		prefetch:  20,
-	}
+
+	cfg := defaultConfig()
 	for _, opt := range opts {
-		if err := opt(conn); err != nil {
+		if err := opt(&cfg); err != nil {
 			return nil, err
 		}
 	}
-	return conn, nil
+	if cfg.security != nil {
+		// Silently ignoring it would leave somebody believing a connection was
+		// verified when the transport they built themselves decided otherwise.
+		return nil, errors.New(
+			"acemq: WithSecurity has no effect on NewConn, because the transport is already " +
+				"connected; configure security where the transport is built, such as rabbitmq.Dial")
+	}
+	return newConn(transport, cfg), nil
+}
+
+func newConn(transport Transport, cfg connConfig) *Conn {
+	return &Conn{
+		transport: transport,
+		codec:     cfg.codec,
+		origin:    cfg.origin,
+		retry:     cfg.retry,
+		prefetch:  cfg.prefetch,
+	}
 }
 
 // Codec is the codec this connection publishes with.

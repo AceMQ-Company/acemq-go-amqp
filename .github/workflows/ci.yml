@@ -108,3 +108,75 @@ jobs:
             exit 1
           fi
           echo "$passed broker tests passed"
+
+  tls:
+    # The TLS tests need a broker serving certificates this repository
+    # generated, which a service container cannot do: the files do not exist
+    # until a step has run. So the broker is started by hand, after them.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Generate development certificates
+        run: go run ./cmd/acemq-certs --out "$RUNNER_TEMP/certs" --broker localhost --days 1
+
+      - name: Start a broker serving them
+        run: |
+          # Readable by the broker's user inside the container, which is not
+          # the user that generated them.
+          chmod 644 "$RUNNER_TEMP"/certs/*.key
+          docker run -d --name acemq-tls \
+            -p 5671:5671 -p 5672:5672 \
+            -v "$RUNNER_TEMP/certs:/certs:ro" \
+            -v "$RUNNER_TEMP/certs/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+            rabbitmq:4-alpine
+          for i in $(seq 1 60); do
+            if docker exec acemq-tls rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
+              echo "the broker is up"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::the broker never became ready"
+          docker logs acemq-tls
+          exit 1
+
+      - name: Test over TLS and plaintext together
+        # The generated configuration keeps the plaintext listener open beside
+        # the TLS one, so both halves of the transport suite run against the
+        # same broker and nothing is left skipping.
+        env:
+          ACEMQ_TEST_AMQPS_URL: amqps://guest:guest@localhost:5671/
+          ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
+          ACEMQ_TEST_CA: ${{ runner.temp }}/certs/ca.crt
+        run: go test -race -count=1 -v ./rabbitmq/
+
+      - name: Check nothing skipped
+        # Every one of these skips when its variables are unset, and a skip
+        # reads as success. Without this, losing a variable would silently stop
+        # testing TLS at all.
+        env:
+          ACEMQ_TEST_AMQPS_URL: amqps://guest:guest@localhost:5671/
+          ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
+          ACEMQ_TEST_CA: ${{ runner.temp }}/certs/ca.crt
+        run: |
+          output=$(go test -count=1 -v ./rabbitmq/ 2>&1)
+          if echo "$output" | grep -q -- "--- SKIP"; then
+            echo "::error::a broker test skipped while a broker was running"
+            echo "$output" | grep -- "--- SKIP"
+            exit 1
+          fi
+          passed=$(echo "$output" | grep -c -- "--- PASS" || true)
+          if [ "$passed" -lt 15 ]; then
+            echo "::error::only $passed broker tests passed; expected at least 15"
+            exit 1
+          fi
+          echo "$passed broker tests passed"
+
+      - name: What the broker said, if anything went wrong
+        if: failure()
+        run: docker logs acemq-tls

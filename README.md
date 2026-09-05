@@ -107,6 +107,32 @@ A package per concern, with nothing at the module root:
 |---|---|
 | `amqp/` | envelopes, codecs, publishing, consuming, retry, the in-memory transport. No dependencies outside the standard library. Named `acemq`. |
 | `rabbitmq/` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go`. |
+| `security/` | TLS modes, trusted authorities, credentials. No dependencies either. |
+| `devcerts/` | development certificates, behind `cmd/acemq-certs`. |
+
+## Security
+
+```go
+mq, err := acemq.Connect(ctx, "amqps://broker:5671/",
+	acemq.WithSecurity(security.Required().
+		TrustCertificateAuthorityFile("/etc/acemq/ca.crt").
+		WithCredentials(security.EnvironmentCredentials("MQ_USER", "MQ_PASSWORD"))))
+```
+
+Naming an authority replaces the system trust store rather than adding to it.
+Credentials are read on every connection, so a rotated password is picked up,
+and they override the URL so the password stays out of logs. Certificates
+stamped `ACEMQ DEVELOPMENT ONLY - DO NOT TRUST` are refused on every path —
+including `Insecure` — unless `AllowDevelopmentCertificates()` says otherwise.
+
+Certificates for local work:
+
+```bash
+go install github.com/AceMQ-Company/acemq-go-amqp/cmd/acemq-certs@latest
+acemq-certs --out certs --broker localhost --days 30
+```
+
+Full detail in [the security guide](https://acemq.org/acemq-go-amqp/security.html).
 
 ## Retry, and the attempt counter
 
