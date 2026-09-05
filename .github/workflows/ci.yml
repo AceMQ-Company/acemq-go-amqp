@@ -65,54 +65,13 @@ jobs:
       - run: go test -race -count=1 ./...
 
   integration:
-    runs-on: ubuntu-latest
-    services:
-      rabbitmq:
-        image: rabbitmq:4-alpine
-        ports:
-          - 5672:5672
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 12
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-
-      - name: Test against RabbitMQ
-        env:
-          ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
-        run: go test -race -count=1 -v ./rabbitmq/
-
-      - name: Check the broker tests actually ran
-        # They skip when the URL is unset, and a skip reads as success. Without
-        # this, losing the environment variable would silently stop testing
-        # against a broker at all.
-        env:
-          ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
-        run: |
-          output=$(go test -count=1 -v ./rabbitmq/ 2>&1)
-          if echo "$output" | grep -q -- "--- SKIP"; then
-            echo "::error::a broker test skipped while a broker was running"
-            echo "$output" | grep -- "--- SKIP"
-            exit 1
-          fi
-          passed=$(echo "$output" | grep -c -- "--- PASS" || true)
-          if [ "$passed" -lt 5 ]; then
-            echo "::error::only $passed broker tests passed; expected at least 5"
-            exit 1
-          fi
-          echo "$passed broker tests passed"
-
-  tls:
-    # The TLS tests need a broker serving certificates this repository
-    # generated, which a service container cannot do: the files do not exist
-    # until a step has run. So the broker is started by hand, after them.
+    # One broker, both listeners, the whole transport suite.
+    #
+    # This was two jobs: a service container for plaintext and this one for TLS.
+    # That left the TLS tests skipping in the plaintext job, which the skip
+    # guard rightly failed on — a job that cannot run half its tests should not
+    # be pretending to. The certificates cannot come from a service container
+    # either, because they do not exist until a step has generated them.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -130,13 +89,18 @@ jobs:
           # the user that generated them.
           chmod 644 "$RUNNER_TEMP"/certs/*.key
           docker run -d --name acemq-tls \
+            -e HOME=/tmp \
             -p 5671:5671 -p 5672:5672 \
             -v "$RUNNER_TEMP/certs:/certs:ro" \
             -v "$RUNNER_TEMP/certs/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
             rabbitmq:4-alpine
+          # Both listeners, checked from outside. rabbitmq-diagnostics needs
+          # the Erlang cookie and reports a CLI problem as a broker problem,
+          # which is not the question being asked here.
           for i in $(seq 1 60); do
-            if docker exec acemq-tls rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
-              echo "the broker is up"
+            if (exec 3<>/dev/tcp/localhost/5671) 2>/dev/null &&
+               (exec 3<>/dev/tcp/localhost/5672) 2>/dev/null; then
+              echo "both listeners are up"
               exit 0
             fi
             sleep 3
