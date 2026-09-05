@@ -1,0 +1,364 @@
+// Copyright 2026 AceMQ.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package rabbitmq_test
+
+import (
+	"context"
+	"errors"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	acemq "github.com/AceMQ-Company/acemq-go-amqp"
+	_ "github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
+)
+
+// These tests need a broker. Point ACEMQ_TEST_AMQP_URL at one:
+//
+//	docker run -d -p 5672:5672 rabbitmq:4-alpine
+//	ACEMQ_TEST_AMQP_URL=amqp://guest:guest@localhost:5672/ go test ./rabbitmq/
+//
+// They are skipped rather than failed when it is unset, so that `go test ./...`
+// works on a machine with no broker. CI sets it, so the skip does not become a
+// way for these to quietly stop running.
+func brokerURL(t *testing.T) string {
+	t.Helper()
+	url := os.Getenv("ACEMQ_TEST_AMQP_URL")
+	if url == "" {
+		t.Skip("ACEMQ_TEST_AMQP_URL is not set; skipping the tests that need a broker")
+	}
+	return url
+}
+
+type OrderPlaced struct {
+	OrderID    string `json:"orderId"`
+	TotalCents int64  `json:"totalCents"`
+}
+
+func connect(t *testing.T, opts ...acemq.ConnOption) *acemq.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	mq, err := acemq.Connect(ctx, brokerURL(t), opts...)
+	if err != nil {
+		t.Fatalf("cannot reach the broker: %v", err)
+	}
+	t.Cleanup(func() { _ = mq.Close() })
+	return mq
+}
+
+// queueName keeps tests from colliding on a broker that outlives them.
+func queueName(t *testing.T) string {
+	t.Helper()
+	name := "acemq-go-test-" + strings.ToLower(t.Name())
+	return strings.NewReplacer("/", "-", " ", "-").Replace(name)
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestAMessageGoesThroughARealBroker(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	queue := queueName(t)
+
+	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
+		t.Fatal(err)
+	}
+
+	got := make(chan acemq.Message[OrderPlaced], 1)
+	sub, err := acemq.Consume(ctx, mq, queue,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			got <- m
+			return acemq.Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	pub := acemq.NewPublisher[OrderPlaced](mq, "", queue)
+	err = pub.Send(ctx, OrderPlaced{OrderID: "o-1", TotalCents: 4250},
+		acemq.CorrelationID("corr-1"),
+		acemq.Header("x-tenant", "acme"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case m := <-got:
+		if m.Payload.OrderID != "o-1" || m.Payload.TotalCents != 4250 {
+			t.Errorf("payload = %+v", m.Payload)
+		}
+		// Every envelope field has to survive a real broker's header table,
+		// which is where a port usually differs from the original.
+		if m.Envelope.CorrelationID != "corr-1" {
+			t.Errorf("CorrelationID = %q", m.Envelope.CorrelationID)
+		}
+		if m.Envelope.Type != queue {
+			t.Errorf("Type = %q, want the routing key %q", m.Envelope.Type, queue)
+		}
+		if m.Envelope.Attempt != 1 {
+			t.Errorf("Attempt = %d, want 1", m.Envelope.Attempt)
+		}
+		if m.Envelope.Headers["x-tenant"] != "acme" {
+			t.Errorf("application headers = %v", m.Envelope.Headers)
+		}
+		if !strings.HasPrefix(m.Envelope.Origin, "acemq@") {
+			t.Errorf("Origin = %q", m.Envelope.Origin)
+		}
+		if m.Envelope.FirstSeen.IsZero() {
+			t.Error("FirstSeen did not survive the broker")
+		}
+		for k := range m.Envelope.Headers {
+			if acemq.IsAceHeader(k) {
+				t.Errorf("reserved header %q reached the application", k)
+			}
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the message never arrived")
+	}
+}
+
+// TestTheAttemptCounterAdvancesAgainstARealBroker is the one worth having a
+// broker for.
+//
+// The in-memory transport is written to behave this way, so on its own it
+// proves only that it matches its own design. This proves the thing the design
+// is about: RabbitMQ requeues the bytes it was given, the attempt header still
+// reads 1, and the count has to come from the redelivery flag.
+func TestTheAttemptCounterAdvancesAgainstARealBroker(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t, acemq.WithRetry(acemq.FixedRetry(3, 0)))
+	queue := queueName(t)
+
+	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var attempts []int
+
+	sub, err := acemq.Consume(ctx, mq, queue,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			mu.Lock()
+			attempts = append(attempts, m.Envelope.Attempt)
+			n := len(attempts)
+			mu.Unlock()
+
+			if n < 3 {
+				return acemq.Retry(errors.New("not yet"))
+			}
+			return acemq.Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := acemq.NewPublisher[OrderPlaced](mq, "", queue).
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "three deliveries", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(attempts) >= 3
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i, want := range []int{1, 2, 3} {
+		if attempts[i] != want {
+			t.Errorf("delivery %d reported attempt %d, want %d (all: %v)",
+				i+1, attempts[i], want, attempts)
+		}
+	}
+}
+
+func TestRetriesStopAndTheMessageLeavesTheQueue(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t, acemq.WithRetry(acemq.FixedRetry(2, 0)))
+	queue := queueName(t)
+
+	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	calls := 0
+
+	sub, err := acemq.Consume(ctx, mq, queue,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			return acemq.Retry(errors.New("still broken"))
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := acemq.NewPublisher[OrderPlaced](mq, "", queue).
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "both attempts", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls >= 2
+	})
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Errorf("the handler ran %d times against a real broker, want exactly 2", calls)
+	}
+}
+
+func TestATopicExchangeRoutesOnARealBroker(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	exchange := queueName(t) + "-x"
+	euQueue := queueName(t) + "-eu"
+
+	if err := mq.DeclareExchange(ctx, exchange, "topic", acemq.TransientExchange()); err != nil {
+		t.Fatal(err)
+	}
+	if err := mq.DeclareQueue(ctx, euQueue, acemq.AutoDelete()); err != nil {
+		t.Fatal(err)
+	}
+	if err := mq.Bind(ctx, euQueue, exchange, "orders.*.eu"); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var keys []string
+	sub, err := acemq.Consume(ctx, mq, euQueue,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			mu.Lock()
+			keys = append(keys, m.RoutingKey)
+			mu.Unlock()
+			return acemq.Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	for _, key := range []string{"orders.created.eu", "orders.created.us"} {
+		if err := acemq.NewPublisher[OrderPlaced](mq, exchange, key).
+			Send(ctx, OrderPlaced{OrderID: key}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	waitFor(t, "the eu message", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(keys) >= 1
+	})
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// The broker's own matching, not this library's. If the two disagreed, the
+	// in-memory transport would be certifying behaviour that does not happen.
+	if len(keys) != 1 || keys[0] != "orders.created.eu" {
+		t.Errorf("the eu-bound queue received %v, want just orders.created.eu", keys)
+	}
+}
+
+func TestDeclaringAQueueTwiceWithDifferentSettingsIsRefused(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	queue := queueName(t)
+
+	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second connection, because the failed declaration kills the channel it
+	// was made on.
+	other := connect(t)
+	err := other.DeclareQueue(ctx, queue, acemq.Transient(), acemq.AutoDelete())
+
+	if err == nil {
+		t.Fatal("redeclaring a queue with different settings was accepted; " +
+			"the code and the broker would silently disagree about what the queue is")
+	}
+	if !strings.Contains(err.Error(), "PRECONDITION_FAILED") {
+		t.Errorf("the error does not name the broker's refusal: %v", err)
+	}
+}
+
+func TestClosingWaitsForAHandlerAgainstARealBroker(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	queue := queueName(t)
+
+	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	var finished bool
+	var mu sync.Mutex
+
+	sub, err := acemq.Consume(ctx, mq, queue,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			close(started)
+			time.Sleep(300 * time.Millisecond)
+			mu.Lock()
+			finished = true
+			mu.Unlock()
+			return acemq.Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := acemq.NewPublisher[OrderPlaced](mq, "", queue).
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	<-started
+	if err := sub.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !finished {
+		t.Error("Close returned while the handler was still running")
+	}
+}

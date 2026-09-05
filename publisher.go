@@ -1,0 +1,123 @@
+// Copyright 2026 AceMQ.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package acemq
+
+import (
+	"context"
+	"fmt"
+)
+
+// Publisher sends messages of one type to one destination.
+//
+// It is safe for concurrent use and cheap to keep: build one per message type
+// at start-up rather than one per message.
+type Publisher[T any] struct {
+	conn       *Conn
+	exchange   string
+	routingKey string
+	codec      Codec
+	persistent bool
+}
+
+// NewPublisher builds a publisher for an exchange and routing key.
+//
+// Publish to a queue by name by leaving the exchange empty: on RabbitMQ the
+// default exchange routes to the queue whose name matches the routing key.
+//
+//	pub := acemq.NewPublisher[OrderPlaced](mq, "", "orders")
+//
+// It is a function rather than a method on [Conn] because a method cannot have
+// its own type parameter before Go 1.27, and this module supports earlier
+// toolchains. See the package documentation.
+func NewPublisher[T any](conn *Conn, exchange, routingKey string, opts ...PublisherOption[T]) *Publisher[T] {
+	p := &Publisher[T]{
+		conn:       conn,
+		exchange:   exchange,
+		routingKey: routingKey,
+		codec:      conn.codec,
+		persistent: true,
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+// PublisherOption configures a publisher.
+type PublisherOption[T any] func(*Publisher[T])
+
+// PublishWith uses a codec other than the connection's for this publisher, so
+// one connection can send JSON to one queue and something denser to another.
+func PublishWith[T any](c Codec) PublisherOption[T] {
+	return func(p *Publisher[T]) { p.codec = c }
+}
+
+// NotPersistent asks the broker not to write these messages to disk. Faster,
+// and gone if the broker restarts.
+func NotPersistent[T any]() PublisherOption[T] {
+	return func(p *Publisher[T]) { p.persistent = false }
+}
+
+// Send publishes one message.
+//
+// The envelope is built here: an identifier, a type defaulting to the routing
+// key, a correlation defaulting to the identifier, this connection's origin,
+// and the current time. Options override any of those.
+func (p *Publisher[T]) Send(ctx context.Context, payload T, opts ...EnvelopeOption) error {
+	env, err := p.envelope(opts)
+	if err != nil {
+		return err
+	}
+
+	body, err := p.codec.Encode(payload)
+	if err != nil {
+		return fmt.Errorf("acemq: cannot encode a %T for %q: %w", payload, p.routingKey, err)
+	}
+
+	return p.conn.transport.Publish(ctx, p.exchange, p.routingKey, Outbound{
+		Body:        body,
+		ContentType: p.codec.ContentType(),
+		MessageID:   env.ID,
+		Headers:     env.ToWire(),
+		Persistent:  p.persistent,
+	})
+}
+
+// SendEnvelope publishes a message with an envelope you built yourself, for
+// when one message's metadata is derived from another's.
+func (p *Publisher[T]) SendEnvelope(ctx context.Context, payload T, env Envelope) error {
+	body, err := p.codec.Encode(payload)
+	if err != nil {
+		return fmt.Errorf("acemq: cannot encode a %T for %q: %w", payload, p.routingKey, err)
+	}
+
+	return p.conn.transport.Publish(ctx, p.exchange, p.routingKey, Outbound{
+		Body:        body,
+		ContentType: p.codec.ContentType(),
+		MessageID:   env.ID,
+		Headers:     env.ToWire(),
+		Persistent:  p.persistent,
+	})
+}
+
+func (p *Publisher[T]) envelope(opts []EnvelopeOption) (Envelope, error) {
+	// The routing key is the default message type, and this connection's origin
+	// the default origin, so both are applied before the caller's options and
+	// can be overridden by them.
+	all := make([]EnvelopeOption, 0, len(opts)+1)
+	all = append(all, Origin(p.conn.origin))
+	all = append(all, opts...)
+	return NewEnvelope(p.routingKey, all...)
+}

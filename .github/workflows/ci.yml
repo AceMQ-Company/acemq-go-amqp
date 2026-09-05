@@ -1,0 +1,110 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # The oldest toolchain the module claims to support. Building with it
+          # is what keeps that claim true: a newer one would happily compile a
+          # generic method and nobody would notice until somebody on 1.23 tried.
+          go-version: '1.23'
+
+      - name: Check the formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Check that go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          if ! git diff --quiet go.mod go.sum; then
+            echo "::error::go mod tidy changed go.mod or go.sum; commit the result"
+            git diff go.mod go.sum
+            exit 1
+          fi
+
+  newest-toolchain:
+    # The module targets 1.23, but it should not be broken by the current
+    # release either. Failing here means something the newest toolchain
+    # disallows, not something the oldest cannot do.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:4-alpine
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Test against RabbitMQ
+        env:
+          ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
+        run: go test -race -count=1 -v ./rabbitmq/
+
+      - name: Check the broker tests actually ran
+        # They skip when the URL is unset, and a skip reads as success. Without
+        # this, losing the environment variable would silently stop testing
+        # against a broker at all.
+        env:
+          ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
+        run: |
+          output=$(go test -count=1 -v ./rabbitmq/ 2>&1)
+          if echo "$output" | grep -q -- "--- SKIP"; then
+            echo "::error::a broker test skipped while a broker was running"
+            echo "$output" | grep -- "--- SKIP"
+            exit 1
+          fi
+          passed=$(echo "$output" | grep -c -- "--- PASS" || true)
+          if [ "$passed" -lt 5 ]; then
+            echo "::error::only $passed broker tests passed; expected at least 5"
+            exit 1
+          fi
+          echo "$passed broker tests passed"
