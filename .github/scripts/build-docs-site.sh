@@ -179,9 +179,16 @@ for f in docs/*.md; do
   # pandoc's template renders a title block from "title" and would print the
   # H1 that the markdown already contains.
   title="$(head -n1 "$f" | sed 's/^#\{1,6\} *//')"
+  # The overview's own heading is the site's name, and suffixing it produces
+  # "AceMQ for Go — AceMQ for Go" in the browser tab.
+  if [ "$title" = "AceMQ for Go" ]; then
+    pagetitle="$title"
+  else
+    pagetitle="$title — AceMQ for Go"
+  fi
   pandoc "$f" \
     --from=gfm --to=html5 --standalone \
-    --metadata pagetitle="$title — AceMQ for Go" \
+    --metadata pagetitle="$pagetitle" \
     "${HIGHLIGHT[@]}" \
     --css=style.css \
     --include-before-body="$OUT/.nav.html" \

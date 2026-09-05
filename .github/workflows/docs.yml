@@ -94,7 +94,7 @@ jobs:
       status: ${{ needs.deploy.result }}
       title: "AceMQ for Go documentation build FAILED"
       message: "The site was not updated, so it still shows the previous version."
-      url: https://acemq-company.github.io/acemq-go-amqp/
+      url: https://acemq.org/acemq-go-amqp/
     secrets:
       # Explicit, not `inherit`. A reusable workflow in another repository does
       # not receive inherited secrets, so `inherit` here produces a notify job
