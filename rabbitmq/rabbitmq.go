@@ -143,6 +143,14 @@ type Config struct {
 	// Name identifies this connection in RabbitMQ's management interface, which
 	// is what somebody looks at when working out who is holding a message.
 	Name string
+
+	// WithoutConfirms turns publisher confirms off.
+	//
+	// They are on by default. Turning them off makes publishing faster and
+	// makes a successful publish mean nothing more than "the bytes left this
+	// process", so it is worth doing only where losing a message costs less
+	// than the round trip.
+	WithoutConfirms bool
 }
 
 // Transport is a connection to a RabbitMQ broker.
@@ -154,6 +162,12 @@ type Transport struct {
 	// simpler to reason about than a pool for the traffic a publisher generates.
 	mu      sync.Mutex
 	channel *amqp.Channel
+
+	// returns carries messages the broker could not route. It is drained after
+	// a confirm rather than watched, because the protocol guarantees a return
+	// arrives before the confirm for the same publish.
+	returns    chan amqp.Return
+	confirming bool
 
 	subsMu sync.Mutex
 	subs   []*subscription
@@ -210,7 +224,21 @@ func Dial(ctx context.Context, url string, cfg ...Config) (*Transport, error) {
 		return nil, fmt.Errorf("acemq: connected to the broker but cannot open a channel: %w", err)
 	}
 
-	return &Transport{conn: conn, channel: ch}, nil
+	// Publisher confirms, unless asked not to. Without them a publish that
+	// returns nil means the bytes reached the socket, which is not the same as
+	// the broker having taken responsibility for them — and the difference is
+	// only ever noticed after messages have been lost.
+	transport := &Transport{conn: conn, channel: ch}
+	if !c.WithoutConfirms {
+		if err := ch.Confirm(false); err != nil {
+			_ = ch.Close()
+			_ = conn.Close()
+			return nil, fmt.Errorf("acemq: the broker will not enable publisher confirms: %w", err)
+		}
+		transport.confirming = true
+		transport.returns = ch.NotifyReturn(make(chan amqp.Return, 64))
+	}
+	return transport, nil
 }
 
 // DeclareQueue creates a queue if it is not already there.
@@ -263,26 +291,102 @@ func (t *Transport) Bind(_ context.Context, queue, exchange, routingKey string) 
 // Publish sends one message.
 func (t *Transport) Publish(
 	ctx context.Context, exchange, routingKey string, msg acemq.Outbound,
-) error {
+) (acemq.PublishResult, error) {
 	delivery := amqp.Transient
 	if msg.Persistent {
 		delivery = amqp.Persistent
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	err := t.channel.PublishWithContext(ctx, exchange, routingKey, false, false, amqp.Publishing{
+	publishing := amqp.Publishing{
 		Body:         msg.Body,
 		ContentType:  msg.ContentType,
 		MessageId:    msg.MessageID,
 		Headers:      amqp.Table(msg.Headers),
 		DeliveryMode: delivery,
-	})
-	if err != nil {
-		return fmt.Errorf("acemq: cannot publish to %q with key %q: %w", exchange, routingKey, err)
 	}
-	return nil
+	result := acemq.PublishResult{MessageID: msg.MessageID, Routed: true}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !t.confirming {
+		err := t.channel.PublishWithContext(
+			ctx, exchange, routingKey, msg.Mandatory, false, publishing)
+		if err != nil {
+			return result, fmt.Errorf(
+				"acemq: cannot publish to %q with key %q: %w", exchange, routingKey, err)
+		}
+		// Nothing was promised, so nothing is claimed. Routed stays true
+		// because without a confirm there is no moment at which a return is
+		// known to have arrived.
+		return result, nil
+	}
+
+	confirmation, err := t.channel.PublishWithDeferredConfirmWithContext(
+		ctx, exchange, routingKey, msg.Mandatory, false, publishing)
+	if err != nil {
+		return result, fmt.Errorf(
+			"acemq: cannot publish to %q with key %q: %w", exchange, routingKey, err)
+	}
+
+	acked, err := confirmation.WaitContext(ctx)
+	if err != nil {
+		return result, fmt.Errorf(
+			"acemq: waiting for the broker to confirm message %s: %w", msg.MessageID, err)
+	}
+	if !acked {
+		// A nack is the broker saying it could not take the message. Retrying
+		// is the caller's decision; losing it quietly is not on offer.
+		return result, fmt.Errorf(
+			"acemq: the broker refused message %s published to %q with key %q",
+			msg.MessageID, exchange, routingKey)
+	}
+	result.Confirmed = true
+
+	if msg.Mandatory {
+		// The protocol sends basic.return before the confirm for the same
+		// publish, so by now any return is already in the channel and this
+		// does not need to wait for one.
+		if reason, returned := t.takeReturn(msg.MessageID); returned {
+			result.Routed = false
+			result.ReturnReason = reason
+		}
+	}
+	return result, nil
+}
+
+// takeReturn looks for a return matching a message just confirmed.
+//
+// Drained rather than waited on: the broker sends basic.return before the
+// confirm, so anything that was coming has arrived. Returns for other messages
+// are put back, because a publisher sharing this channel is entitled to its own.
+func (t *Transport) takeReturn(messageID string) (string, bool) {
+	var others []amqp.Return
+	defer func() {
+		for _, r := range others {
+			select {
+			case t.returns <- r:
+			default:
+				// The buffer is full and this return is for a message nobody
+				// asked about. Dropping it loses a diagnostic, not a message.
+			}
+		}
+	}()
+
+	for {
+		select {
+		case r, ok := <-t.returns:
+			if !ok {
+				return "", false
+			}
+			if r.MessageId == messageID {
+				return fmt.Sprintf("%d %s", r.ReplyCode, r.ReplyText), true
+			}
+			others = append(others, r)
+		default:
+			return "", false
+		}
+	}
 }
 
 // Consume reads from a queue on a channel of its own.

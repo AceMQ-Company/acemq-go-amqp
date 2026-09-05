@@ -29,6 +29,7 @@ type Publisher[T any] struct {
 	routingKey string
 	codec      Codec
 	persistent bool
+	mandatory  bool
 }
 
 // NewPublisher builds a publisher for an exchange and routing key.
@@ -70,46 +71,82 @@ func NotPersistent[T any]() PublisherOption[T] {
 	return func(p *Publisher[T]) { p.persistent = false }
 }
 
+// Mandatory makes [Publisher.Send] fail when a message reaches no queue.
+//
+// Without it the broker drops an unroutable message silently, which is the
+// quietest way to discover a binding was never made — the publisher succeeds,
+// the consumer waits, and nothing anywhere says why. With it, a message nothing
+// is bound to receive is an error at the point of publishing.
+//
+// It costs a round trip only when the message is actually unroutable.
+func Mandatory[T any]() PublisherOption[T] {
+	return func(p *Publisher[T]) { p.mandatory = true }
+}
+
 // Send publishes one message.
 //
 // The envelope is built here: an identifier, a type defaulting to the routing
 // key, a correlation defaulting to the identifier, this connection's origin,
 // and the current time. Options override any of those.
 func (p *Publisher[T]) Send(ctx context.Context, payload T, opts ...EnvelopeOption) error {
+	_, err := p.SendResult(ctx, payload, opts...)
+	return err
+}
+
+// SendResult publishes one message and returns what the broker said about it.
+//
+// Use it when the answer matters beyond success or failure — whether the
+// message was confirmed, whether it reached a queue, which identifier it went
+// out with.
+func (p *Publisher[T]) SendResult(
+	ctx context.Context, payload T, opts ...EnvelopeOption,
+) (PublishResult, error) {
 	env, err := p.envelope(opts)
 	if err != nil {
-		return err
+		return PublishResult{}, err
 	}
-
-	body, err := p.codec.Encode(payload)
-	if err != nil {
-		return fmt.Errorf("acemq: cannot encode a %T for %q: %w", payload, p.routingKey, err)
-	}
-
-	return p.conn.transport.Publish(ctx, p.exchange, p.routingKey, Outbound{
-		Body:        body,
-		ContentType: p.codec.ContentType(),
-		MessageID:   env.ID,
-		Headers:     env.ToWire(),
-		Persistent:  p.persistent,
-	})
+	return p.publish(ctx, payload, env)
 }
 
 // SendEnvelope publishes a message with an envelope you built yourself, for
 // when one message's metadata is derived from another's.
 func (p *Publisher[T]) SendEnvelope(ctx context.Context, payload T, env Envelope) error {
+	_, err := p.publish(ctx, payload, env)
+	return err
+}
+
+func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (PublishResult, error) {
 	body, err := p.codec.Encode(payload)
 	if err != nil {
-		return fmt.Errorf("acemq: cannot encode a %T for %q: %w", payload, p.routingKey, err)
+		return PublishResult{}, fmt.Errorf(
+			"acemq: cannot encode a %T for %q: %w", payload, p.routingKey, err)
 	}
 
-	return p.conn.transport.Publish(ctx, p.exchange, p.routingKey, Outbound{
+	result, err := p.conn.transport.Publish(ctx, p.exchange, p.routingKey, Outbound{
 		Body:        body,
 		ContentType: p.codec.ContentType(),
 		MessageID:   env.ID,
 		Headers:     env.ToWire(),
 		Persistent:  p.persistent,
+		Mandatory:   p.mandatory,
 	})
+	if err != nil {
+		return result, err
+	}
+
+	// Reported as an error rather than left in the result, because a caller
+	// using Send never sees the result and would otherwise carry on believing
+	// the message went somewhere.
+	if p.mandatory && !result.Routed {
+		reason := result.ReturnReason
+		if reason == "" {
+			reason = "no queue is bound to receive it"
+		}
+		return result, fmt.Errorf(
+			"acemq: message %s to exchange %q with key %q reached no queue (%s); "+
+				"the broker dropped it", env.ID, p.exchange, p.routingKey, reason)
+	}
+	return result, nil
 }
 
 func (p *Publisher[T]) envelope(opts []EnvelopeOption) (Envelope, error) {

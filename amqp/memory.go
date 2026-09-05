@@ -124,7 +124,9 @@ func (t *memTransport) Bind(_ context.Context, queue, exchange, routingKey strin
 	return nil
 }
 
-func (t *memTransport) Publish(_ context.Context, exchange, routingKey string, msg Outbound) error {
+func (t *memTransport) Publish(
+	_ context.Context, exchange, routingKey string, msg Outbound,
+) (PublishResult, error) {
 	t.broker.mu.Lock()
 	targets := t.broker.route(exchange, routingKey)
 	t.broker.mu.Unlock()
@@ -138,7 +140,19 @@ func (t *memTransport) Publish(_ context.Context, exchange, routingKey string, m
 			headers:     copyHeaders(msg.Headers),
 		})
 	}
-	return nil
+
+	// Everything here is in memory and has already happened, so the message is
+	// as confirmed as it will ever be. Routing is reported honestly, which is
+	// what lets a test catch a binding it forgot before a broker does.
+	result := PublishResult{
+		MessageID: msg.MessageID,
+		Confirmed: true,
+		Routed:    len(targets) > 0,
+	}
+	if !result.Routed {
+		result.ReturnReason = "NO_ROUTE"
+	}
+	return result, nil
 }
 
 // route finds the queues a message should reach. Called with the broker locked.

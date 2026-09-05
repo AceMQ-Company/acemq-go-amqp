@@ -24,7 +24,7 @@ import (
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
-	_ "github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
+	"github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
 )
 
 // These tests need a broker. Point ACEMQ_TEST_AMQP_URL at one:
@@ -360,5 +360,132 @@ func TestClosingWaitsForAHandlerAgainstARealBroker(t *testing.T) {
 	defer mu.Unlock()
 	if !finished {
 		t.Error("Close returned while the handler was still running")
+	}
+}
+
+// ---- publisher confirms ----------------------------------------------
+
+// TestTheBrokerActuallyConfirms is the difference between "the bytes left this
+// process" and "the broker has taken responsibility".
+//
+// Only a real broker can demonstrate it: the in-memory transport confirms
+// everything because everything has already happened by the time it answers.
+func TestTheBrokerActuallyConfirms(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	queue := queueName(t)
+
+	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := acemq.NewPublisher[OrderPlaced](mq, "", queue).
+		SendResult(ctx, OrderPlaced{OrderID: "o-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !result.Confirmed {
+		t.Error("the broker did not confirm the message, so nothing was promised about it")
+	}
+}
+
+func TestAnUnroutableMandatoryMessageIsAnErrorAgainstARealBroker(t *testing.T) {
+	// RabbitMQ returns the message and confirms it, in that order. Getting the
+	// ordering wrong would make this pass by accident on a fast broker and fail
+	// on a slow one, so it is worth having against the real thing.
+	ctx := context.Background()
+	mq := connect(t)
+	exchange := queueName(t) + "-x"
+
+	if err := mq.DeclareExchange(ctx, exchange, "topic", acemq.TransientExchange()); err != nil {
+		t.Fatal(err)
+	}
+
+	err := acemq.NewPublisher[OrderPlaced](mq, exchange, "nothing.listens.here",
+		acemq.Mandatory[OrderPlaced]()).
+		Send(ctx, OrderPlaced{OrderID: "o-1"})
+
+	if err == nil {
+		t.Fatal("an unroutable message was published without complaint")
+	}
+	if !strings.Contains(err.Error(), "reached no queue") {
+		t.Errorf("the error does not say what happened: %v", err)
+	}
+	if !strings.Contains(err.Error(), "NO_ROUTE") {
+		t.Errorf("the broker's own reason is missing: %v", err)
+	}
+}
+
+func TestARoutableMandatoryMessageIsNotMistakenForAnUnroutableOne(t *testing.T) {
+	// The other half of the return correlation: a message that did arrive must
+	// not pick up a return meant for something else.
+	ctx := context.Background()
+	mq := connect(t)
+	queue := queueName(t)
+	exchange := queueName(t) + "-x"
+
+	if err := mq.DeclareExchange(ctx, exchange, "topic", acemq.TransientExchange()); err != nil {
+		t.Fatal(err)
+	}
+	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
+		t.Fatal(err)
+	}
+	if err := mq.Bind(ctx, queue, exchange, "orders.placed"); err != nil {
+		t.Fatal(err)
+	}
+
+	pub := acemq.NewPublisher[OrderPlaced](mq, exchange, "orders.placed",
+		acemq.Mandatory[OrderPlaced]())
+	unroutable := acemq.NewPublisher[OrderPlaced](mq, exchange, "nobody.listens",
+		acemq.Mandatory[OrderPlaced]())
+
+	// Interleaved, on the same channel, so a return for one is in flight while
+	// the other is being confirmed.
+	for i := range 5 {
+		if err := unroutable.Send(ctx, OrderPlaced{OrderID: "dropped"}); err == nil {
+			t.Fatal("the unroutable publisher succeeded")
+		}
+		result, err := pub.SendResult(ctx, OrderPlaced{OrderID: "kept"})
+		if err != nil {
+			t.Fatalf("round %d: a routable message was reported as unroutable: %v", i, err)
+		}
+		if !result.Routed {
+			t.Fatalf("round %d: Routed is false for a message that reached a bound queue", i)
+		}
+	}
+}
+
+func TestConfirmsCanBeTurnedOff(t *testing.T) {
+	url := brokerURL(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	transport, err := rabbitmq.Dial(ctx, url, rabbitmq.Config{WithoutConfirms: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mq, err := acemq.NewConn(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mq.Close()
+
+	queue := queueName(t)
+	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := acemq.NewPublisher[OrderPlaced](mq, "", queue).
+		SendResult(ctx, OrderPlaced{OrderID: "o-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing was promised, so nothing is claimed. Reporting Confirmed here
+	// would be a lie that looks like a guarantee.
+	if result.Confirmed {
+		t.Error("Confirmed is true with confirms turned off")
 	}
 }

@@ -143,8 +143,8 @@ jobs:
             exit 1
           fi
           passed=$(echo "$output" | grep -c -- "--- PASS" || true)
-          if [ "$passed" -lt 15 ]; then
-            echo "::error::only $passed broker tests passed; expected at least 15"
+          if [ "$passed" -lt 19 ]; then
+            echo "::error::only $passed broker tests passed; expected at least 19"
             exit 1
           fi
           echo "$passed broker tests passed"

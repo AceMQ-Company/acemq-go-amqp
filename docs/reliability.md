@@ -106,6 +106,52 @@ This library takes the honest cost rather than the invisible one, and says so
 here so it can be planned for: use short delays with a high attempt count, or
 raise the prefetch, or move long waits to a delay queue in the broker.
 
+## Publisher confirms
+
+On by default. Without them a `Send` that returns nil means the bytes reached
+the socket — not that the broker has taken responsibility for them, and the
+difference is only ever noticed after messages have been lost.
+
+```go
+result, err := pub.SendResult(ctx, order)
+// result.Confirmed — the broker has it
+// result.Routed    — it reached a queue (with Mandatory)
+```
+
+A broker that refuses a message is an error rather than a silent drop. Turning
+them off is possible where losing a message costs less than the round trip:
+
+```go
+transport, err := rabbitmq.Dial(ctx, url, rabbitmq.Config{WithoutConfirms: true})
+mq, err := acemq.NewConn(transport)
+```
+
+`Confirmed` is then false, because nothing was promised and claiming otherwise
+would be a lie that looks like a guarantee.
+
+## Messages that reach no queue
+
+An unroutable message is dropped by the broker, silently. The publisher
+succeeds, the consumer waits, and nothing anywhere says why — usually because a
+binding was never made.
+
+```go
+pub := acemq.NewPublisher[OrderPlaced](mq, "events", "order.placed",
+	acemq.Mandatory[OrderPlaced]())
+```
+
+Now that is an error at the point of publishing:
+
+```
+acemq: message 7f3c… to exchange "events" with key "order.placed" reached no
+queue (312 NO_ROUTE); the broker dropped it
+```
+
+It costs a round trip only when the message is actually unroutable. RabbitMQ
+sends the return *before* the confirm for the same publish, which is what lets
+this be reported synchronously rather than arriving later with nothing to
+attach it to.
+
 ## Dead-lettering
 
 A rejected message is dropped unless the queue sends it somewhere:

@@ -37,8 +37,8 @@ type Transport interface {
 	// Bind routes messages from an exchange to a queue.
 	Bind(ctx context.Context, queue, exchange, routingKey string) error
 
-	// Publish sends one message.
-	Publish(ctx context.Context, exchange, routingKey string, msg Outbound) error
+	// Publish sends one message and reports what the broker said about it.
+	Publish(ctx context.Context, exchange, routingKey string, msg Outbound) (PublishResult, error)
 
 	// Consume delivers messages to deliver until the returned Subscription is
 	// closed. Each delivery arrives on its own goroutine or in sequence
@@ -95,6 +95,28 @@ type ConsumeSpec struct {
 	Tag string
 }
 
+// PublishResult is what the broker said about a published message.
+type PublishResult struct {
+	// MessageID is the identifier the message was sent with.
+	MessageID string
+
+	// Confirmed is the broker saying it has taken responsibility for the
+	// message. Without confirms this is false and nothing has been promised —
+	// the message reached the socket, which is not the same thing.
+	Confirmed bool
+
+	// Routed is false when the message was published as mandatory and reached
+	// no queue at all. A message nothing is bound to receive is not an error to
+	// the broker; it is dropped, silently, which is exactly the failure worth
+	// hearing about.
+	//
+	// Meaningless unless the publisher asked for [Mandatory].
+	Routed bool
+
+	// ReturnReason is the broker's explanation when Routed is false.
+	ReturnReason string
+}
+
 // Outbound is a message on its way to the broker.
 type Outbound struct {
 	Body        []byte
@@ -106,6 +128,10 @@ type Outbound struct {
 	// guarantee on its own: a persistent message in a queue that is not durable
 	// still dies with the broker.
 	Persistent bool
+
+	// Mandatory asks the broker to return the message rather than drop it when
+	// no queue is bound to receive it.
+	Mandatory bool
 }
 
 // Delivery is a message as it arrived, before any codec has looked at it.

@@ -297,7 +297,7 @@ func TestABodyThatWillNotDecodeIsNotRetried(t *testing.T) {
 
 	// Published straight at the transport so the body is not what the codec
 	// would have written.
-	err = mq.transport.Publish(ctx, "", "orders", Outbound{
+	_, err = mq.transport.Publish(ctx, "", "orders", Outbound{
 		Body:        []byte("this is not json"),
 		ContentType: JSONContentType,
 		MessageID:   "m-1",
@@ -547,5 +547,89 @@ func TestAnUnknownSchemeSaysWhatToImport(t *testing.T) {
 	// somebody guessing at a registry they cannot see.
 	if got := err.Error(); !strings.Contains(got, "acemq-go-amqp/rabbitmq") {
 		t.Errorf("the error does not say what to import: %v", got)
+	}
+}
+
+// ---- publishing results ----------------------------------------------
+
+func TestAnUnroutableMandatoryMessageIsAnError(t *testing.T) {
+	// The quietest failure in messaging: the publisher succeeds, no queue is
+	// bound, the broker drops the message, and the consumer waits for ever with
+	// nothing anywhere saying why.
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	if err := mq.DeclareExchange(ctx, "events", "topic"); err != nil {
+		t.Fatal(err)
+	}
+
+	pub := NewPublisher[OrderPlaced](mq, "events", "nothing.listens.here", Mandatory[OrderPlaced]())
+	err := pub.Send(ctx, OrderPlaced{OrderID: "o-1"})
+
+	if err == nil {
+		t.Fatal("an unroutable message was published without complaint")
+	}
+	if !strings.Contains(err.Error(), "reached no queue") {
+		t.Errorf("the error does not say what happened: %v", err)
+	}
+}
+
+func TestAnUnroutableMessageIsSilentWithoutMandatory(t *testing.T) {
+	// Not a bug: it is what AMQP does, and what most publishers want. The test
+	// records the difference so that Mandatory has something to be different
+	// from.
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	if err := mq.DeclareExchange(ctx, "events", "topic"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := NewPublisher[OrderPlaced](mq, "events", "nothing.listens.here").
+		Send(ctx, OrderPlaced{OrderID: "o-1"})
+
+	if err != nil {
+		t.Fatalf("publishing without Mandatory reported a routing problem: %v", err)
+	}
+}
+
+func TestTheResultSaysWhereTheMessageWent(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+	declare(t, mq, "orders")
+
+	result, err := NewPublisher[OrderPlaced](mq, "", "orders").
+		SendResult(ctx, OrderPlaced{OrderID: "o-1"}, MessageID("m-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.MessageID != "m-1" {
+		t.Errorf("MessageID = %q", result.MessageID)
+	}
+	if !result.Confirmed {
+		t.Error("the in-memory broker did not confirm a message it already holds")
+	}
+	if !result.Routed {
+		t.Error("Routed is false for a message that reached a queue")
+	}
+}
+
+func TestTheResultReportsAnUnroutableMessage(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	if err := mq.DeclareExchange(ctx, "events", "topic"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _ := NewPublisher[OrderPlaced](mq, "events", "nothing.listens.here").
+		SendResult(ctx, OrderPlaced{OrderID: "o-1"})
+
+	if result.Routed {
+		t.Error("Routed is true for a message no queue received")
+	}
+	if result.ReturnReason == "" {
+		t.Error("nothing explains why it was not routed")
 	}
 }
