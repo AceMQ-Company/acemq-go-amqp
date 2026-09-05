@@ -94,13 +94,21 @@ jobs:
             -v "$RUNNER_TEMP/certs:/certs:ro" \
             -v "$RUNNER_TEMP/certs/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
             rabbitmq:4-alpine
-          # Both listeners, checked from outside. rabbitmq-diagnostics needs
-          # the Erlang cookie and reports a CLI problem as a broker problem,
-          # which is not the question being asked here.
+          # The broker's own word for it.
+          #
+          # A TCP connect is not enough: Docker publishes the port as soon as
+          # the container starts, so a connection succeeds — and is then reset —
+          # for several seconds before RabbitMQ is listening. That produced a
+          # run where every test failed with "connection reset by peer" against
+          # a broker the job had just called ready.
+          #
+          # rabbitmq-diagnostics is no good either: it needs the Erlang cookie
+          # and cannot authenticate to its own node here, so it reports a CLI
+          # problem as a broker problem.
           for i in $(seq 1 60); do
-            if (exec 3<>/dev/tcp/localhost/5671) 2>/dev/null &&
-               (exec 3<>/dev/tcp/localhost/5672) 2>/dev/null; then
-              echo "both listeners are up"
+            if docker logs acemq-tls 2>&1 | grep -q "Server startup complete"; then
+              echo "the broker is up"
+              docker logs acemq-tls 2>&1 | grep -E "started (TCP|TLS) listener"
               exit 0
             fi
             sleep 3
