@@ -1,0 +1,102 @@
+# Build the documentation site and publish it to GitHub Pages.
+#
+# The site is the markdown under docs/ rendered to HTML. There is no generated
+# API reference to fold in: Go already has one at pkg.go.dev, built from the
+# source of every published version, and generating a second copy here would
+# only give the two a chance to disagree. The navigation links out to it.
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+      - '.github/scripts/build-docs-site.sh'
+  workflow_dispatch:
+
+# One deployment at a time; a queued run supersedes a waiting one rather than
+# racing it. In-progress runs are allowed to finish so a half-published site is
+# never left behind.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pandoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pandoc
+
+      - name: Render the pages
+        run: bash .github/scripts/build-docs-site.sh
+
+      - name: Check every link resolves
+        # A published page linking to a 404 is the failure this whole site has
+        # already had once in another repository, and it went unnoticed because
+        # nothing checked. Cheap to check, so it is checked.
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          pages = [f for f in os.listdir("site") if f.endswith(".html")]
+          broken = []
+          for f in pages:
+              for href in re.findall(r'href="([^"]+)"', open("site/" + f).read()):
+                  if href.startswith(("http://", "https://", "#", "mailto:")):
+                      continue
+                  target = href.split("#")[0]
+                  if target and not os.path.exists(os.path.join("site", target)):
+                      broken.append(f"{f} -> {href}")
+          if broken:
+              print("::error::the site links to pages that do not exist:")
+              for b in broken:
+                  print("  " + b)
+              sys.exit(1)
+          print(f"{len(pages)} pages, every internal link resolves")
+          PY
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    # A job's own block replaces the workflow default rather than adding to it,
+    # so contents is repeated here. This is GitHub's own deploy-pages triple.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  notify:
+    needs: deploy
+    # Failures only. A message for every push to main would be noise nobody
+    # reads, and a channel people mute is worse than no channel.
+    #
+    # With SLACK_DELIVERY_WEBHOOK absent this does nothing and succeeds, so it
+    # is inert until the secret is added.
+    if: always() && needs.deploy.result == 'failure'
+    uses: AceMQ-Company/acemq-java-amqp/.github/workflows/slack-notify.yml@main
+    with:
+      status: ${{ needs.deploy.result }}
+      title: "AceMQ for Go documentation build FAILED"
+      message: "The site was not updated, so it still shows the previous version."
+      url: https://acemq-company.github.io/acemq-go-amqp/
+    secrets:
+      # Explicit, not `inherit`. A reusable workflow in another repository does
+      # not receive inherited secrets, so `inherit` here produces a notify job
+      # that goes green while sending nothing at all.
+      SLACK_DELIVERY_WEBHOOK: ${{ secrets.SLACK_DELIVERY_WEBHOOK }}
