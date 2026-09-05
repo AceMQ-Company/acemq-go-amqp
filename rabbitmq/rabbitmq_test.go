@@ -489,3 +489,104 @@ func TestConfirmsCanBeTurnedOff(t *testing.T) {
 		t.Error("Confirmed is true with confirms turned off")
 	}
 }
+
+// ---- topology --------------------------------------------------------
+
+func TestATopologyAppliesToARealBroker(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	prefix := queueName(t)
+
+	topology := acemq.NewTopology().
+		Exchange(prefix+"-x", "topic", acemq.TransientExchange()).
+		Queue(prefix+"-q", acemq.AutoDelete()).
+		Binding(prefix+"-q", prefix+"-x", "order.placed")
+
+	if err := topology.Apply(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+
+	got := make(chan string, 1)
+	sub, err := acemq.Consume(ctx, mq, prefix+"-q",
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			got <- m.Payload.OrderID
+			return acemq.Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := acemq.NewPublisher[OrderPlaced](mq, prefix+"-x", "order.placed").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-got:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the topology was applied but nothing routed through it")
+	}
+}
+
+// TestCheckNoticesDriftOnARealBroker is the one that needs a broker.
+//
+// PRECONDITION_FAILED is the only way AMQP will report drift without the
+// management API, and a failed declaration kills the channel it was made on —
+// which is why the check uses one of its own. If it did not, this test would
+// take the connection down with it and everything after would fail obscurely.
+func TestCheckNoticesDriftOnARealBroker(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	queue := queueName(t)
+
+	// Durable on the broker, transient in the topology.
+	if err := mq.DeclareQueue(ctx, queue); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		other := connect(t)
+		_ = other.DeclareQueue(context.Background(), queue)
+	})
+
+	topology := acemq.NewTopology().Queue(queue, acemq.Transient())
+
+	reports, err := topology.Check(ctx, mq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(reports) == 0 {
+		t.Fatal("the broker's disagreement about durability was not reported")
+	}
+	if !strings.Contains(reports[0].Reason, "PRECONDITION_FAILED") {
+		t.Errorf("the report does not carry the broker's own reason: %v", reports[0])
+	}
+
+	// The connection still works. Checking on the shared channel would have
+	// killed it, and everything after this point would fail for reasons that
+	// looked nothing like the cause.
+	if err := mq.DeclareQueue(ctx, queueName(t)+"-after", acemq.AutoDelete()); err != nil {
+		t.Errorf("the drift check took the connection down with it: %v", err)
+	}
+}
+
+func TestCheckIsQuietWhenTheRealBrokerAgrees(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	queue := queueName(t)
+
+	topology := acemq.NewTopology().Queue(queue, acemq.AutoDelete())
+
+	if err := topology.Apply(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+	reports, err := topology.Check(ctx, mq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(reports) != 0 {
+		t.Errorf("drift reported against a broker just given this topology: %v", reports)
+	}
+}

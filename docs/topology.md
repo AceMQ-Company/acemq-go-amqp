@@ -141,6 +141,89 @@ if err := mq.Bind(ctx, "shipping-orders", "orders-events", "order.cancelled"); e
 The publisher names an event, not a destination. A new consumer is a new queue
 and a new binding, and the publisher never learns about it.
 
+## Declaring it all at once
+
+Call-at-a-time works, and stops working the moment somebody needs to know what
+a service will do to a broker *before* it does it.
+
+```go
+topology := acemq.NewTopology().
+	Exchange("orders-events", "topic").
+	Queue("shipping-orders", acemq.DeadLetterTo("shipping-dead")).
+	Queue("shipping-dead").
+	Binding("shipping-orders", "orders-events", "order.placed").
+	Binding("shipping-orders", "orders-events", "order.cancelled")
+
+if err := topology.Apply(ctx, mq); err != nil {
+	return err
+}
+```
+
+Exchanges, then queues, then bindings — the order a broker needs.
+
+### It is checked before the broker sees it
+
+A binding naming a queue the topology does not declare is refused here rather
+than by the broker:
+
+```
+acemq: binding orders-events -> a-queue-nobody-declared (order.placed) names
+queue "a-queue-nobody-declared", which this topology does not declare
+```
+
+The broker would have accepted it, whenever that queue happened to exist
+already — and the service would then depend on something nothing declares,
+until a fresh environment where it fails at start-up for reasons nobody can see.
+
+### Reading it before applying it
+
+```go
+fmt.Println(topology)
+```
+
+```
+Topology: 1 exchanges, 2 queues, 2 bindings
+  declare exchange orders-events (topic)
+  declare queue shipping-orders (durable, x-dead-letter-exchange=shipping-dead)
+  declare queue shipping-dead (durable)
+  declare binding shipping-orders (from orders-events on order.placed)
+  declare binding shipping-orders (from orders-events on order.cancelled)
+```
+
+A deployment that changes a broker should be something somebody can read first.
+This is a statement of intent, not a diff against the live broker — AMQP cannot
+enumerate what is there without the management API, and a plan that quietly
+guessed would be worse than one honest about what it is.
+
+## Drift
+
+A service and its broker disagreeing about a queue is the failure that shows up
+as messages going somewhere nobody is looking: a dead-letter exchange that was
+changed, a durability that was not.
+
+```go
+reports, err := topology.Check(ctx, mq)
+for _, r := range reports {
+	log.Printf("drift: %s", r)
+}
+```
+
+```
+drift: queue shipping-orders: the broker refused the declaration:
+Exception (406) PRECONDITION_FAILED - inequivalent arg 'x-dead-letter-exchange'
+```
+
+`PRECONDITION_FAILED` is the only way AMQP will report this without the
+management API. Two consequences worth knowing:
+
+- **A failed declaration kills its channel**, so the check uses a channel of its
+  own and throws it away. Doing it on the shared publishing channel would take
+  the connection's publishing down with a question. There is a test that the
+  connection still works afterwards.
+- **A queue that does not exist is created by the check**, because a declaration
+  is the only question the protocol offers. `Check` is safe to run before
+  applying; it is not read-only.
+
 ## Where to declare
 
 At start-up, in the service that owns the queue, before consuming from it.

@@ -513,3 +513,37 @@ func (s *subscription) Close() error {
 	})
 	return s.closeErr
 }
+
+// CheckQueue reports whether the broker already agrees about a queue.
+//
+// AMQP has no way to ask what a queue looks like — the management API is a
+// separate HTTP service. The only question the protocol offers is a
+// declaration, and the broker answers PRECONDITION_FAILED when the queue
+// exists with different settings.
+//
+// A failed declaration kills the channel it was made on, so this uses one of
+// its own and throws it away. Doing it on the shared publishing channel would
+// take the connection's publishing with it, which is a high price for a
+// question.
+//
+// A queue that does not exist is created by this, because a declaration is the
+// only question available. That makes it safe before applying a topology and
+// not a read-only operation.
+func (t *Transport) CheckQueue(_ context.Context, name string, spec acemq.QueueSpec) error {
+	ch, err := t.conn.Channel()
+	if err != nil {
+		return fmt.Errorf("acemq: cannot open a channel to check queue %q: %w", name, err)
+	}
+	defer func() {
+		// Already dead if the declaration failed; closing again is harmless and
+		// closing a survivor is necessary.
+		_ = ch.Close()
+	}()
+
+	_, err = ch.QueueDeclare(
+		name, spec.Durable, spec.AutoDelete, spec.Exclusive, false, amqp.Table(spec.Args))
+	if err != nil {
+		return fmt.Errorf("the broker refused the declaration: %w", err)
+	}
+	return nil
+}

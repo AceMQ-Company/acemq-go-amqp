@@ -16,8 +16,10 @@ package acemq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -87,13 +89,74 @@ type memTransport struct {
 	closed bool
 }
 
-func (t *memTransport) DeclareQueue(_ context.Context, name string, _ QueueSpec) error {
+func (t *memTransport) DeclareQueue(_ context.Context, name string, spec QueueSpec) error {
 	t.broker.mu.Lock()
 	defer t.broker.mu.Unlock()
-	if _, ok := t.broker.queues[name]; !ok {
-		t.broker.queues[name] = newMemQueue(name)
+	existing, ok := t.broker.queues[name]
+	if !ok {
+		q := newMemQueue(name)
+		q.spec = spec
+		t.broker.queues[name] = q
+		return nil
+	}
+	// Redeclaring with different settings is refused, as RabbitMQ refuses it.
+	// A test transport that quietly accepted the change would certify a
+	// deployment that then fails against the real broker.
+	if err := sameQueue(existing.spec, spec); err != nil {
+		return fmt.Errorf(
+			"acemq: cannot declare queue %q: PRECONDITION_FAILED - %s", name, err)
 	}
 	return nil
+}
+
+// CheckQueue reports whether the broker already agrees about a queue.
+func (t *memTransport) CheckQueue(_ context.Context, name string, spec QueueSpec) error {
+	t.broker.mu.Lock()
+	defer t.broker.mu.Unlock()
+
+	existing, ok := t.broker.queues[name]
+	if !ok {
+		q := newMemQueue(name)
+		q.spec = spec
+		t.broker.queues[name] = q
+		return nil
+	}
+	return sameQueue(existing.spec, spec)
+}
+
+// sameQueue compares the settings a broker would object to.
+func sameQueue(existing, wanted QueueSpec) error {
+	var differences []string
+	if existing.Durable != wanted.Durable {
+		differences = append(differences,
+			fmt.Sprintf("durable is %v, wanted %v", existing.Durable, wanted.Durable))
+	}
+	if existing.AutoDelete != wanted.AutoDelete {
+		differences = append(differences,
+			fmt.Sprintf("auto-delete is %v, wanted %v", existing.AutoDelete, wanted.AutoDelete))
+	}
+	if existing.Exclusive != wanted.Exclusive {
+		differences = append(differences,
+			fmt.Sprintf("exclusive is %v, wanted %v", existing.Exclusive, wanted.Exclusive))
+	}
+	for k, want := range wanted.Args {
+		got, present := existing.Args[k]
+		if !present {
+			differences = append(differences, fmt.Sprintf("%s is not set, wanted %v", k, want))
+		} else if fmt.Sprint(got) != fmt.Sprint(want) {
+			differences = append(differences, fmt.Sprintf("%s is %v, wanted %v", k, got, want))
+		}
+	}
+	for k, got := range existing.Args {
+		if _, present := wanted.Args[k]; !present {
+			differences = append(differences, fmt.Sprintf("%s is %v, wanted it unset", k, got))
+		}
+	}
+	if len(differences) == 0 {
+		return nil
+	}
+	sort.Strings(differences)
+	return errors.New(strings.Join(differences, "; "))
 }
 
 func (t *memTransport) DeclareExchange(_ context.Context, name string, spec ExchangeSpec) error {
@@ -248,6 +311,7 @@ type memMsg struct {
 
 type memQueue struct {
 	name string
+	spec QueueSpec
 
 	mu      sync.Mutex
 	notify  *sync.Cond
