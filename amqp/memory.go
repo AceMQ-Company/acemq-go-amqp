@@ -110,18 +110,30 @@ func (t *memTransport) DeclareQueue(_ context.Context, name string, spec QueueSp
 }
 
 // CheckQueue reports whether the broker already agrees about a queue.
+//
+// A queue that is not there agrees with anything, and is left alone. RabbitMQ
+// answers this question with a declaration and so creates what it was asked
+// about; this transport does not need to, and a test broker that quietly grew
+// queues when asked about them would make dry runs look wrong here and right in
+// production.
 func (t *memTransport) CheckQueue(_ context.Context, name string, spec QueueSpec) error {
 	t.broker.mu.Lock()
 	defer t.broker.mu.Unlock()
 
 	existing, ok := t.broker.queues[name]
 	if !ok {
-		q := newMemQueue(name)
-		q.spec = spec
-		t.broker.queues[name] = q
 		return nil
 	}
 	return sameQueue(existing.spec, spec)
+}
+
+// QueueExists reports whether the queue is there, creating nothing.
+func (t *memTransport) QueueExists(_ context.Context, name string) (bool, error) {
+	t.broker.mu.Lock()
+	defer t.broker.mu.Unlock()
+
+	_, ok := t.broker.queues[name]
+	return ok, nil
 }
 
 // sameQueue compares the settings a broker would object to.

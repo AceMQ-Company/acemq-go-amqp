@@ -166,6 +166,100 @@ func (t *Topology) Validate() error {
 	return nil
 }
 
+// ApplyMode is whether applying a topology changes the broker.
+type ApplyMode int
+
+const (
+	// Declare creates what is missing. The ordinary mode.
+	Declare ApplyMode = iota
+
+	// DryRun changes nothing and reports what applying would do.
+	//
+	// It asks the broker about each queue rather than guessing, so a queue that
+	// already exists with different settings is reported as a difference rather
+	// than as something that would be created. Exchanges and bindings cannot be
+	// inspected without the management API, so those are reported as unknown —
+	// a plan that guessed would be worse than one honest about what it cannot
+	// see.
+	DryRun
+)
+
+func (m ApplyMode) String() string {
+	if m == DryRun {
+		return "dry-run"
+	}
+	return "declare"
+}
+
+// ApplyWith applies the topology, or reports what applying it would do.
+//
+//	plan, err := topology.ApplyWith(ctx, mq, acemq.DryRun)
+//	for _, action := range plan {
+//		log.Println(action)
+//	}
+//
+// A deployment that changes a broker should be something somebody can read
+// first, against the broker it is going to change rather than in the abstract.
+func (t *Topology) ApplyWith(ctx context.Context, conn *Conn, mode ApplyMode) ([]PlanAction, error) {
+	if mode != DryRun {
+		if err := t.Apply(ctx, conn); err != nil {
+			return nil, err
+		}
+		return t.Plan()
+	}
+
+	if err := t.Validate(); err != nil {
+		return nil, err
+	}
+
+	checker, canCheck := conn.transport.(DriftChecker)
+	inspector, canInspect := conn.transport.(QueueInspector)
+
+	actions := make([]PlanAction, 0, len(t.exchanges)+len(t.queues)+len(t.bindings))
+	for _, e := range t.exchanges {
+		// Nothing in AMQP reports what an exchange looks like, so this says so
+		// rather than implying the exchange is absent.
+		actions = append(actions, PlanAction{
+			Kind: "exchange", Name: e.Name,
+			Detail: describeExchange(e.Spec) + " — unknown, AMQP cannot report exchanges",
+		})
+	}
+
+	for _, q := range t.queues {
+		detail := describeQueue(q.Spec)
+		switch {
+		case !canCheck || !canInspect:
+			detail += " — unknown, this transport cannot check"
+		default:
+			exists, err := inspector.QueueExists(ctx, q.Name)
+			switch {
+			case err != nil:
+				detail += " — unknown, the broker could not be asked: " + err.Error()
+			case !exists:
+				detail += " — would create"
+			default:
+				// Only now is a declaration safe to make: the queue is there, so
+				// the declaration is a question rather than a change.
+				if err := checker.CheckQueue(ctx, q.Name, q.Spec); err != nil {
+					detail += " — differs: " + err.Error()
+				} else {
+					detail += " — matches"
+				}
+			}
+		}
+		actions = append(actions, PlanAction{Kind: "queue", Name: q.Name, Detail: detail})
+	}
+
+	for _, b := range t.bindings {
+		actions = append(actions, PlanAction{
+			Kind: "binding", Name: b.Queue,
+			Detail: fmt.Sprintf("from %s on %s — unknown, AMQP cannot report bindings",
+				b.Exchange, b.RoutingKey),
+		})
+	}
+	return actions, nil
+}
+
 // Apply declares everything, in the order a broker needs: exchanges, then
 // queues, then the bindings between them.
 //
@@ -261,9 +355,10 @@ func (t *Topology) String() string {
 // without the management API — and a failed declaration kills its channel,
 // which is why each one needs its own.
 //
-// Queues that do not exist are created by this, because a declaration is the
-// only question AMQP can ask. That makes Check safe to run against a broker you
-// are about to apply to, and not a read-only operation.
+// Queues that are not there yet are passed over rather than declared: a queue
+// that does not exist cannot disagree with anything, and creating one as a side
+// effect of asking a question would make Check unsafe to run against a broker
+// somebody is only inspecting.
 func (t *Topology) Check(ctx context.Context, conn *Conn) ([]DriftReport, error) {
 	if err := t.Validate(); err != nil {
 		return nil, err
@@ -274,9 +369,19 @@ func (t *Topology) Check(ctx context.Context, conn *Conn) ([]DriftReport, error)
 		return nil, fmt.Errorf(
 			"acemq: the %T transport cannot check for drift", conn.transport)
 	}
+	inspector, canInspect := conn.transport.(QueueInspector)
 
 	var reports []DriftReport
 	for _, q := range t.queues {
+		if canInspect {
+			exists, err := inspector.QueueExists(ctx, q.Name)
+			if err != nil {
+				return nil, fmt.Errorf("acemq: cannot check queue %q: %w", q.Name, err)
+			}
+			if !exists {
+				continue
+			}
+		}
 		err := checker.CheckQueue(ctx, q.Name, q.Spec)
 		if err != nil {
 			reports = append(reports, DriftReport{
@@ -305,6 +410,20 @@ type DriftChecker interface {
 	// the disagreement when it does not. It must not disturb the connection it
 	// is called on.
 	CheckQueue(ctx context.Context, name string, spec QueueSpec) error
+}
+
+// QueueInspector is a transport that can say whether a queue is there without
+// creating it. Both transports in this module implement it.
+//
+// It exists because CheckQueue cannot answer that question. A declaration is
+// the only thing AMQP offers, and declaring a queue that is missing creates it —
+// so a dry run built on CheckQueue alone would create the very queues it was
+// asked only to describe. A dry run asks this first and checks only what is
+// already there.
+type QueueInspector interface {
+	// QueueExists reports whether the queue is on the broker. It must not
+	// create it, and must not disturb the connection it is called on.
+	QueueExists(ctx context.Context, name string) (bool, error)
 }
 
 func describeExchange(s ExchangeSpec) string {

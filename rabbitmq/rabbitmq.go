@@ -742,7 +742,8 @@ func (s *subscription) Close() error {
 //
 // A queue that does not exist is created by this, because a declaration is the
 // only question available. That makes it safe before applying a topology and
-// not a read-only operation.
+// not a read-only operation — which is why the library asks QueueExists first
+// and only calls this for queues that are already there.
 func (t *Transport) CheckQueue(_ context.Context, name string, spec acemq.QueueSpec) error {
 	ch, err := t.conn.Channel()
 	if err != nil {
@@ -760,6 +761,32 @@ func (t *Transport) CheckQueue(_ context.Context, name string, spec acemq.QueueS
 		return fmt.Errorf("the broker refused the declaration: %w", err)
 	}
 	return nil
+}
+
+// QueueExists reports whether a queue is on the broker, creating nothing.
+//
+// A passive declare is the read-only half of the question: the broker answers
+// NOT_FOUND for a queue that is not there instead of creating it. It closes the
+// channel doing so, which is why this asks on a throwaway one rather than
+// taking the connection's publishing down as the price of a question.
+func (t *Transport) QueueExists(_ context.Context, name string) (bool, error) {
+	ch, err := t.conn.Channel()
+	if err != nil {
+		return false, fmt.Errorf("acemq: cannot open a channel to look for queue %q: %w", name, err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	if _, err := ch.QueueDeclarePassive(name, false, false, false, false, nil); err != nil {
+		var brokerErr *amqp.Error
+		if errors.As(err, &brokerErr) && brokerErr.Code == amqp.NotFound {
+			return false, nil
+		}
+		// Anything else is a real problem — a closed connection, a permission
+		// the user does not have — and reporting it as "no such queue" would
+		// turn it into a plan that says the queue would be created.
+		return false, fmt.Errorf("acemq: cannot look for queue %q: %w", name, err)
+	}
+	return true, nil
 }
 
 // recover reconnects when the connection drops, and puts everything back.

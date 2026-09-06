@@ -272,3 +272,124 @@ func TestRedeclaringWithTheSameSettingsIsFine(t *testing.T) {
 		t.Fatalf("an identical redeclaration was refused: %v", err)
 	}
 }
+
+// ---- dry run ---------------------------------------------------------
+
+// TestADryRunChangesNothing is the property the mode exists for: somebody can
+// read what a deployment would do to a broker before it does it.
+func TestADryRunChangesNothing(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	actions, err := aTopology().ApplyWith(ctx, mq, DryRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 5 {
+		t.Errorf("the plan has %d actions, want 5", len(actions))
+	}
+	for _, a := range actions {
+		if a.Kind == "queue" && !strings.Contains(a.Detail, "would create") {
+			t.Errorf("queue %s reads %q, want it to be missing", a.Name, a.Detail)
+		}
+	}
+
+	// Nothing was created, so consuming from a queue it named still fails.
+	_, err = Consume(ctx, mq, "shipping-orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack { return Accept() })
+	if err == nil {
+		t.Error("the dry run declared the queue after all")
+	}
+}
+
+func TestADryRunSaysWhichQueuesAlreadyMatch(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	if err := aTopology().Apply(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+
+	actions, err := aTopology().ApplyWith(ctx, mq, DryRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, a := range actions {
+		if a.Kind != "queue" {
+			continue
+		}
+		if !strings.Contains(a.Detail, "matches") {
+			t.Errorf("queue %s reads %q, want it to match", a.Name, a.Detail)
+		}
+	}
+}
+
+func TestADryRunReportsAQueueThatDiffers(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	if err := mq.DeclareQueue(ctx, "shipping-orders", DeadLetterTo("somewhere-else")); err != nil {
+		t.Fatal(err)
+	}
+
+	actions, err := aTopology().ApplyWith(ctx, mq, DryRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, a := range actions {
+		if a.Name == "shipping-orders" && strings.Contains(a.Detail, "differs") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the difference was not reported: %v", actions)
+	}
+}
+
+// TestADryRunIsHonestAboutWhatItCannotSee matters more than it looks.
+//
+// AMQP cannot report an exchange or a binding without the management API, so a
+// plan that showed them as "would create" would be guessing — and a plan that
+// guesses is worse than one that says it does not know.
+func TestADryRunIsHonestAboutWhatItCannotSee(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	actions, err := aTopology().ApplyWith(ctx, mq, DryRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, a := range actions {
+		if a.Kind == "exchange" || a.Kind == "binding" {
+			if !strings.Contains(a.Detail, "unknown") {
+				t.Errorf("%s %s claims to know its state: %q", a.Kind, a.Name, a.Detail)
+			}
+		}
+	}
+}
+
+func TestApplyWithDeclareActuallyDeclares(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	if _, err := aTopology().ApplyWith(ctx, mq, Declare); err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := Consume(ctx, mq, "shipping-orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack { return Accept() })
+	if err != nil {
+		t.Fatalf("Declare did not declare: %v", err)
+	}
+	_ = sub.Close()
+}
+
+func TestApplyModeNamesItself(t *testing.T) {
+	if DryRun.String() != "dry-run" || Declare.String() != "declare" {
+		t.Errorf("modes read as %q and %q", DryRun, Declare)
+	}
+}

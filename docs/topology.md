@@ -195,6 +195,43 @@ This is a statement of intent, not a diff against the live broker — AMQP canno
 enumerate what is there without the management API, and a plan that quietly
 guessed would be worse than one honest about what it is.
 
+### Reading it against the broker it will change
+
+`ApplyWith` takes a mode. `DryRun` asks the broker about each queue and changes
+nothing:
+
+```go
+plan, err := topology.ApplyWith(ctx, mq, acemq.DryRun)
+for _, action := range plan {
+	log.Println(action)
+}
+```
+
+```
+exchange orders-events: topic — unknown, AMQP cannot report exchanges
+queue shipping-orders: durable, x-dead-letter-exchange=shipping-dead — differs:
+  the broker refused the declaration: Exception (406) PRECONDITION_FAILED
+queue shipping-dead: durable — would create
+binding shipping-orders: from orders-events on order.placed — unknown, AMQP
+  cannot report bindings
+```
+
+Three things are worth knowing about that output:
+
+- **Queues are asked about, not declared.** A passive declare answers
+  `NOT_FOUND` for a queue that is not there rather than creating it, so a dry
+  run never creates what it describes. There is a test against a real broker
+  that the queue is still missing afterwards.
+- **Exchanges and bindings say "unknown".** AMQP has no way to read them back,
+  and "would create" about something that already exists is the kind of
+  plausible-looking output that stops being read.
+- **`Declare` is the ordinary mode**, and `Apply` is the same thing without the
+  plan.
+
+A transport that cannot be asked — a custom one that implements neither
+`DriftChecker` nor `QueueInspector` — reports every queue as unknown rather than
+pretending.
+
 ## Drift
 
 A service and its broker disagreeing about a queue is the failure that shows up
@@ -220,9 +257,10 @@ management API. Two consequences worth knowing:
   own and throws it away. Doing it on the shared publishing channel would take
   the connection's publishing down with a question. There is a test that the
   connection still works afterwards.
-- **A queue that does not exist is created by the check**, because a declaration
-  is the only question the protocol offers. `Check` is safe to run before
-  applying; it is not read-only.
+- **A queue that is not there is passed over**, not declared. A queue that does
+  not exist cannot disagree with anything, and a check that created one as a
+  side effect of asking would not be safe to run against a broker somebody is
+  only inspecting.
 
 ## Where to declare
 

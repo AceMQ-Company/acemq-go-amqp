@@ -27,6 +27,7 @@ import (
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
 	"github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
+	amqp091 "github.com/rabbitmq/amqp091-go"
 )
 
 // These tests need a broker. Point ACEMQ_TEST_AMQP_URL at one:
@@ -69,6 +70,40 @@ func queueName(t *testing.T) string {
 	t.Helper()
 	name := "acemq-go-test-" + strings.ToLower(t.Name())
 	return strings.NewReplacer("/", "-", " ", "-").Replace(name)
+}
+
+// removeAtEnd deletes what a test left on the broker, so the test can be run
+// twice. A queue that survives a run makes the next one assert against the
+// leftovers of the last, which is a failure that looks like a bug in the
+// library.
+func removeAtEnd(t *testing.T, queues []string, exchanges []string) {
+	t.Helper()
+	t.Cleanup(func() {
+		conn, err := amqp091.Dial(brokerURL(t))
+		if err != nil {
+			t.Logf("cannot clean up: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		ch, err := conn.Channel()
+		if err != nil {
+			t.Logf("cannot clean up: %v", err)
+			return
+		}
+		defer func() { _ = ch.Close() }()
+		for _, q := range queues {
+			if _, err := ch.QueueDelete(q, false, false, false); err != nil {
+				t.Logf("cannot delete queue %s: %v", q, err)
+				return
+			}
+		}
+		for _, e := range exchanges {
+			if err := ch.ExchangeDelete(e, false, false); err != nil {
+				t.Logf("cannot delete exchange %s: %v", e, err)
+				return
+			}
+		}
+	})
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -695,5 +730,84 @@ func TestTheConsumerComesBackAfterTheBrokerRestarts(t *testing.T) {
 	}
 	if !slices.Contains(events, "recovered") {
 		t.Errorf("nothing reported the recovery: %v", events)
+	}
+}
+
+// TestADryRunAgainstARealBrokerCreatesNothing is the claim that has to hold on
+// a broker rather than in a test double.
+//
+// A passive declare is the only read-only question AMQP offers, and it closes
+// the channel it is asked on when the queue is missing. Doing that wrong would
+// either create the queues the plan describes or take the connection down
+// while describing them, and both would show up here.
+func TestADryRunAgainstARealBrokerCreatesNothing(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	queue := queueName(t)
+
+	removeAtEnd(t, []string{queue}, []string{queue + "-events"})
+
+	topology := acemq.NewTopology().
+		Exchange(queue+"-events", "topic").
+		Queue(queue).
+		Binding(queue, queue+"-events", "#")
+
+	plan, err := topology.ApplyWith(ctx, mq, acemq.DryRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range plan {
+		if a.Kind == "queue" && !strings.Contains(a.Detail, "would create") {
+			t.Errorf("queue %s reads %q, want it to be missing", a.Name, a.Detail)
+		}
+	}
+
+	// The queue is still not there: consuming from it is refused.
+	if _, err := acemq.Consume(ctx, mq, queue,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack { return acemq.Accept() }); err == nil {
+		t.Error("the dry run created the queue")
+	}
+
+	// And the connection survived being asked, which is the other half of it.
+	if err := topology.Apply(ctx, mq); err != nil {
+		t.Fatalf("the connection did not survive the dry run: %v", err)
+	}
+
+	plan, err = topology.ApplyWith(ctx, mq, acemq.DryRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range plan {
+		if a.Kind == "queue" && !strings.Contains(a.Detail, "matches") {
+			t.Errorf("after applying, queue %s reads %q", a.Name, a.Detail)
+		}
+	}
+}
+
+func TestADryRunReportsARealBrokersDrift(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	queue := queueName(t)
+
+	removeAtEnd(t, []string{queue}, nil)
+
+	// Durable on the broker, transient in the topology.
+	if err := mq.DeclareQueue(ctx, queue); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err := acemq.NewTopology().Queue(queue, acemq.Transient()).ApplyWith(ctx, mq, acemq.DryRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, a := range plan {
+		if a.Name == queue && strings.Contains(a.Detail, "differs") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the difference was not reported: %v", plan)
 	}
 }
