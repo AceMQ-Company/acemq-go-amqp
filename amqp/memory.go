@@ -508,3 +508,63 @@ func copyHeaders(h map[string]any) map[string]any {
 	}
 	return out
 }
+
+// Supports says what the in-memory transport can do.
+//
+// Deliberately less than RabbitMQ. A test transport that claimed more would let
+// code pass here and fail against a broker, which is the failure this whole
+// transport is written to avoid.
+func (t *memTransport) Supports(c Capability) bool {
+	switch c {
+	case CapabilityPublisherConfirms, CapabilityDeadLettering:
+		return true
+	default:
+		return false
+	}
+}
+
+// Pull fetches one message without a consumer.
+func (t *memTransport) Pull(_ context.Context, queue string) (Delivery, bool, error) {
+	t.broker.mu.Lock()
+	q, ok := t.broker.queues[queue]
+	t.broker.mu.Unlock()
+	if !ok {
+		return Delivery{}, false, fmt.Errorf("acemq: no queue named %q has been declared", queue)
+	}
+
+	msg, found := q.tryPop()
+	if !found {
+		return Delivery{}, false, nil
+	}
+
+	settled := &sync.Once{}
+	return Delivery{
+		Body:        msg.body,
+		ContentType: msg.contentType,
+		RoutingKey:  msg.routingKey,
+		MessageID:   msg.messageID,
+		Headers:     copyHeaders(msg.headers),
+		Redelivered: msg.redelivered,
+		Ack:         func() error { settled.Do(func() {}); return nil },
+		Nack: func(requeue bool) error {
+			settled.Do(func() {
+				if requeue {
+					q.requeue(msg)
+				}
+			})
+			return nil
+		},
+	}, true, nil
+}
+
+// tryPop takes a message if one is waiting, and does not wait if none is.
+func (q *memQueue) tryPop() (memMsg, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.pending) == 0 {
+		return memMsg{}, false
+	}
+	m := q.pending[0]
+	q.pending = q.pending[1:]
+	return m, true
+}

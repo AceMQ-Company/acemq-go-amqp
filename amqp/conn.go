@@ -31,6 +31,8 @@ type Conn struct {
 	retry     RetryPolicy
 	prefetch  int
 	observer  Observer
+	onPublish []PublishInterceptor
+	onConsume []ConsumeInterceptor
 
 	mu     sync.Mutex
 	closed bool
@@ -43,12 +45,14 @@ type Conn struct {
 // [WithSecurity] has to be known before the transport is dialled — by the time
 // a *Conn exists, the handshake has already happened.
 type connConfig struct {
-	codec    Codec
-	origin   string
-	retry    RetryPolicy
-	prefetch int
-	security *security.Options
-	observer Observer
+	codec               Codec
+	origin              string
+	retry               RetryPolicy
+	prefetch            int
+	security            *security.Options
+	observer            Observer
+	publishInterceptors []PublishInterceptor
+	consumeInterceptors []ConsumeInterceptor
 }
 
 func defaultConfig() connConfig {
@@ -191,6 +195,8 @@ func newConn(transport Transport, cfg connConfig) *Conn {
 		retry:     cfg.retry,
 		prefetch:  cfg.prefetch,
 		observer:  cfg.observer,
+		onPublish: cfg.publishInterceptors,
+		onConsume: cfg.consumeInterceptors,
 	}
 }
 

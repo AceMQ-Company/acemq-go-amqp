@@ -130,3 +130,88 @@ func init() {
 	RegisterCodec("bytes", func() Codec { return BytesCodec{} })
 	RegisterCodec("string", func() Codec { return StringCodec{} })
 }
+
+// CompositeCodec picks a codec by the message's content type.
+//
+// For a queue that carries more than one format — during a migration, or where
+// several producers were written at different times:
+//
+//	codec := acemq.NewCompositeCodec(acemq.JSONCodec{}, yaml.Codec{})
+//	mq, err := acemq.Connect(ctx, url, acemq.WithCodec(codec))
+//
+// The first codec is what it writes; all of them are offered a message to read,
+// in order, and the first that says it can decode does. Order therefore matters
+// when two overlap — put the more specific first, since [BytesCodec] answers for
+// everything and would win from anywhere in the list.
+type CompositeCodec struct {
+	codecs []Codec
+}
+
+// NewCompositeCodec combines codecs. The first is used for encoding.
+func NewCompositeCodec(codecs ...Codec) *CompositeCodec {
+	return &CompositeCodec{codecs: codecs}
+}
+
+// ContentType is the first codec's, since that is what gets written.
+func (c *CompositeCodec) ContentType() string {
+	if len(c.codecs) == 0 {
+		return ""
+	}
+	return c.codecs[0].ContentType()
+}
+
+// Encode uses the first codec.
+func (c *CompositeCodec) Encode(payload any) ([]byte, error) {
+	if len(c.codecs) == 0 {
+		return nil, Fatalf("acemq: this CompositeCodec has no codecs in it")
+	}
+	return c.codecs[0].Encode(payload)
+}
+
+// Decode uses the first codec that will accept the content type.
+func (c *CompositeCodec) Decode(body []byte, dst any) error {
+	return Fatalf(
+		"acemq: CompositeCodec.Decode needs the content type; " +
+			"it is only usable through a consumer, which passes one")
+}
+
+// DecodeAs reads a body using whichever codec claims the content type.
+//
+// The consumer calls this rather than Decode, because choosing needs the
+// content type and the Codec interface does not carry one into Decode.
+func (c *CompositeCodec) DecodeAs(contentType string, body []byte, dst any) error {
+	for _, codec := range c.codecs {
+		if codec.CanDecode(contentType) {
+			return codec.Decode(body, dst)
+		}
+	}
+	return Fatalf(
+		"acemq: no codec in this CompositeCodec will read %q; it holds %s",
+		contentType, c.describe())
+}
+
+// CanDecode is true when any codec in the set will take it.
+func (c *CompositeCodec) CanDecode(contentType string) bool {
+	for _, codec := range c.codecs {
+		if codec.CanDecode(contentType) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *CompositeCodec) describe() string {
+	names := make([]string, 0, len(c.codecs))
+	for _, codec := range c.codecs {
+		names = append(names, codec.ContentType())
+	}
+	return strings.Join(names, ", ")
+}
+
+// contentTypeDecoder is a codec that needs the content type to choose.
+//
+// The consumer looks for it so a CompositeCodec works without every codec
+// having to take a content type it does not need.
+type contentTypeDecoder interface {
+	DecodeAs(contentType string, body []byte, dst any) error
+}

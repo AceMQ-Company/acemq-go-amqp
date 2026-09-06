@@ -16,6 +16,7 @@ package acemq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -116,13 +117,35 @@ func (p *Publisher[T]) SendEnvelope(ctx context.Context, payload T, env Envelope
 }
 
 func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (PublishResult, error) {
+	exchange, routingKey := p.exchange, p.routingKey
+
+	// Before encoding, so an interceptor can change the payload as well as the
+	// envelope, and can stop the publish entirely.
+	if len(p.conn.onPublish) > 0 {
+		pc := &PublishContext{
+			Exchange:   exchange,
+			RoutingKey: routingKey,
+			Envelope:   &env,
+			Payload:    payload,
+		}
+		for _, intercept := range p.conn.onPublish {
+			if err := intercept(ctx, pc); err != nil {
+				return PublishResult{}, err
+			}
+		}
+		exchange, routingKey = pc.Exchange, pc.RoutingKey
+		if changed, ok := pc.Payload.(T); ok {
+			payload = changed
+		}
+	}
+
 	body, err := p.codec.Encode(payload)
 	if err != nil {
 		return PublishResult{}, fmt.Errorf(
 			"acemq: cannot encode a %T for %q: %w", payload, p.routingKey, err)
 	}
 
-	result, err := p.conn.transport.Publish(ctx, p.exchange, p.routingKey, Outbound{
+	result, err := p.conn.transport.Publish(ctx, exchange, routingKey, Outbound{
 		Body:        body,
 		ContentType: p.codec.ContentType(),
 		MessageID:   env.ID,
@@ -130,7 +153,7 @@ func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (Pu
 		Persistent:  p.persistent,
 		Mandatory:   p.mandatory,
 	})
-	labels := map[string]string{"exchange": p.exchange, "key": p.routingKey}
+	labels := map[string]string{"exchange": exchange, "key": routingKey}
 	if err != nil {
 		p.conn.observer.Count(MetricPublishFailed, 1, labels)
 		return result, err
@@ -146,9 +169,13 @@ func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (Pu
 		if reason == "" {
 			reason = "no queue is bound to receive it"
 		}
-		return result, fmt.Errorf(
-			"acemq: message %s to exchange %q with key %q reached no queue (%s); "+
-				"the broker dropped it", env.ID, p.exchange, p.routingKey, reason)
+		return result, &PublishFailedError{
+			MessageID:  env.ID,
+			Exchange:   exchange,
+			RoutingKey: routingKey,
+			Unroutable: true,
+			Err:        errors.New(reason),
+		}
 	}
 	return result, nil
 }

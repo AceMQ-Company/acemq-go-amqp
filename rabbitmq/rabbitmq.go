@@ -33,6 +33,7 @@ package rabbitmq
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	neturl "net/url"
@@ -151,10 +152,53 @@ type Config struct {
 	// process", so it is worth doing only where losing a message costs less
 	// than the round trip.
 	WithoutConfirms bool
+
+	// WithoutRecovery stops the transport reconnecting when the connection
+	// drops.
+	//
+	// Recovery is on by default because the alternative is a service that
+	// silently stops consuming and says nothing: the delivery channel closes,
+	// the consumer goroutine ends, and the object still looks alive. Turn it
+	// off only where something outside the process is expected to restart it.
+	WithoutRecovery bool
+
+	// RecoveryDelay is how long to wait between attempts to reconnect. One
+	// second by default, doubling to at most thirty.
+	RecoveryDelay time.Duration
+
+	// OnRecovery is told about every connection loss and every attempt to come
+	// back, so a service can log or alert on it. Recovery that nobody can see
+	// is only half an improvement on dying quietly.
+	OnRecovery func(RecoveryEvent)
+}
+
+// RecoveryEvent is something that happened to the connection.
+type RecoveryEvent struct {
+	// Kind is "lost", "retrying", "recovered" or "gave-up".
+	Kind string
+
+	// Attempt counts from 1 for each reconnection.
+	Attempt int
+
+	// Err is why the connection went, or why an attempt failed.
+	Err error
+}
+
+func (e RecoveryEvent) String() string {
+	if e.Err == nil {
+		return fmt.Sprintf("connection %s (attempt %d)", e.Kind, e.Attempt)
+	}
+	return fmt.Sprintf("connection %s (attempt %d): %v", e.Kind, e.Attempt, e.Err)
 }
 
 // Transport is a connection to a RabbitMQ broker.
 type Transport struct {
+	// url and cfg are kept so the connection can be made again. A transport
+	// that cannot redial is a transport that dies with the first network
+	// hiccup.
+	url string
+	cfg Config
+
 	conn *amqp.Connection
 
 	// One channel for publishing and topology, guarded by a mutex. An AMQP
@@ -172,6 +216,71 @@ type Transport struct {
 	subsMu sync.Mutex
 	subs   []*subscription
 	closed bool
+
+	// The topology this transport declared, replayed after a reconnection.
+	// The broker may have restarted and lost everything that was not durable,
+	// and a consumer reattached to a queue that no longer exists receives
+	// nothing for ever.
+	topoMu    sync.Mutex
+	queues    []queueDecl
+	exchanges []exchangeDecl
+	binds     []bindDecl
+
+	recovering sync.WaitGroup
+	stopRecov  chan struct{}
+	recovOnce  sync.Once
+
+	// blocked is the broker's last connection.blocked, if it has not been
+	// followed by an unblock. Publishing while blocked would hang rather than
+	// fail, which looks identical to a wedged process.
+	blockedMu sync.RWMutex
+	blocked   string
+}
+
+// watchBlocked records the broker asking publishers to stop.
+//
+// RabbitMQ sends connection.blocked when it is low on memory or disk. Every
+// publish then blocks until it unblocks, so a publisher that ignores this looks
+// exactly like one that has hung — and the usual response, restarting the
+// service, does not help.
+func (t *Transport) watchBlocked(blockings <-chan amqp.Blocking) {
+	for b := range blockings {
+		t.blockedMu.Lock()
+		if b.Active {
+			t.blocked = b.Reason
+		} else {
+			t.blocked = ""
+		}
+		t.blockedMu.Unlock()
+
+		if b.Active {
+			t.report(RecoveryEvent{Kind: "blocked", Err: &acemq.ConnectionBlockedError{Reason: b.Reason}})
+		} else {
+			t.report(RecoveryEvent{Kind: "unblocked"})
+		}
+	}
+}
+
+// BlockedReason is the broker's reason for blocking this connection, or empty
+// when it is not blocked.
+func (t *Transport) BlockedReason() string {
+	t.blockedMu.RLock()
+	defer t.blockedMu.RUnlock()
+	return t.blocked
+}
+
+type queueDecl struct {
+	name string
+	spec acemq.QueueSpec
+}
+
+type exchangeDecl struct {
+	name string
+	spec acemq.ExchangeSpec
+}
+
+type bindDecl struct {
+	queue, exchange, routingKey string
 }
 
 // Dial opens a connection to a broker.
@@ -228,7 +337,7 @@ func Dial(ctx context.Context, url string, cfg ...Config) (*Transport, error) {
 	// returns nil means the bytes reached the socket, which is not the same as
 	// the broker having taken responsibility for them — and the difference is
 	// only ever noticed after messages have been lost.
-	transport := &Transport{conn: conn, channel: ch}
+	transport := &Transport{url: url, cfg: c, conn: conn, channel: ch, stopRecov: make(chan struct{})}
 	if !c.WithoutConfirms {
 		if err := ch.Confirm(false); err != nil {
 			_ = ch.Close()
@@ -237,6 +346,13 @@ func Dial(ctx context.Context, url string, cfg ...Config) (*Transport, error) {
 		}
 		transport.confirming = true
 		transport.returns = ch.NotifyReturn(make(chan amqp.Return, 64))
+	}
+
+	go transport.watchBlocked(conn.NotifyBlocked(make(chan amqp.Blocking, 4)))
+
+	if !c.WithoutRecovery {
+		transport.recovering.Add(1)
+		go transport.recover(conn.NotifyClose(make(chan *amqp.Error, 1)))
 	}
 	return transport, nil
 }
@@ -256,6 +372,7 @@ func (t *Transport) DeclareQueue(_ context.Context, name string, spec acemq.Queu
 	if err != nil {
 		return fmt.Errorf("acemq: cannot declare queue %q: %w", name, err)
 	}
+	t.remember(func() { t.queues = append(t.queues, queueDecl{name: name, spec: spec}) })
 	return nil
 }
 
@@ -274,6 +391,8 @@ func (t *Transport) DeclareExchange(_ context.Context, name string, spec acemq.E
 	if err != nil {
 		return fmt.Errorf("acemq: cannot declare exchange %q: %w", name, err)
 	}
+	spec.Kind = kind
+	t.remember(func() { t.exchanges = append(t.exchanges, exchangeDecl{name: name, spec: spec}) })
 	return nil
 }
 
@@ -285,7 +404,17 @@ func (t *Transport) Bind(_ context.Context, queue, exchange, routingKey string) 
 	if err := t.channel.QueueBind(queue, routingKey, exchange, false, nil); err != nil {
 		return fmt.Errorf("acemq: cannot bind %q to %q: %w", queue, exchange, err)
 	}
+	t.remember(func() {
+		t.binds = append(t.binds, bindDecl{queue: queue, exchange: exchange, routingKey: routingKey})
+	})
 	return nil
+}
+
+// remember records a declaration under the topology lock.
+func (t *Transport) remember(record func()) {
+	t.topoMu.Lock()
+	defer t.topoMu.Unlock()
+	record()
 }
 
 // Publish sends one message.
@@ -306,6 +435,13 @@ func (t *Transport) Publish(
 	}
 	result := acemq.PublishResult{MessageID: msg.MessageID, Routed: true}
 
+	// Refused rather than blocked. A publish that hangs indefinitely is
+	// indistinguishable from a wedged process, and a service that knows it can
+	// shed load, buffer, or fail the request instead.
+	if reason := t.BlockedReason(); reason != "" {
+		return result, &acemq.PublishingPausedError{Reason: reason}
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -313,8 +449,8 @@ func (t *Transport) Publish(
 		err := t.channel.PublishWithContext(
 			ctx, exchange, routingKey, msg.Mandatory, false, publishing)
 		if err != nil {
-			return result, fmt.Errorf(
-				"acemq: cannot publish to %q with key %q: %w", exchange, routingKey, err)
+			return result, &acemq.PublishFailedError{
+				MessageID: msg.MessageID, Exchange: exchange, RoutingKey: routingKey, Err: err}
 		}
 		// Nothing was promised, so nothing is claimed. Routed stays true
 		// because without a confirm there is no moment at which a return is
@@ -325,8 +461,8 @@ func (t *Transport) Publish(
 	confirmation, err := t.channel.PublishWithDeferredConfirmWithContext(
 		ctx, exchange, routingKey, msg.Mandatory, false, publishing)
 	if err != nil {
-		return result, fmt.Errorf(
-			"acemq: cannot publish to %q with key %q: %w", exchange, routingKey, err)
+		return result, &acemq.PublishFailedError{
+			MessageID: msg.MessageID, Exchange: exchange, RoutingKey: routingKey, Err: err}
 	}
 
 	acked, err := confirmation.WaitContext(ctx)
@@ -337,9 +473,9 @@ func (t *Transport) Publish(
 	if !acked {
 		// A nack is the broker saying it could not take the message. Retrying
 		// is the caller's decision; losing it quietly is not on offer.
-		return result, fmt.Errorf(
-			"acemq: the broker refused message %s published to %q with key %q",
-			msg.MessageID, exchange, routingKey)
+		return result, &acemq.PublishFailedError{
+			MessageID: msg.MessageID, Exchange: exchange, RoutingKey: routingKey,
+			Err: errors.New("the broker refused it")}
 	}
 	result.Confirmed = true
 
@@ -429,7 +565,13 @@ func (t *Transport) Consume(
 		return nil, fmt.Errorf("acemq: cannot consume from %q: %w", queue, err)
 	}
 
-	sub := &subscription{channel: ch, tag: tag}
+	sub := &subscription{
+		queue:   queue,
+		spec:    spec,
+		deliver: deliver,
+		channel: ch,
+		tag:     tag,
+	}
 	sub.wg.Add(1)
 	go sub.run(deliveries, deliver)
 
@@ -451,9 +593,14 @@ func (t *Transport) Close() error {
 	t.subs = nil
 	t.subsMu.Unlock()
 
+	// Stopped before the connection goes, so the recovery loop sees a
+	// deliberate close rather than treating it as an outage to reconnect from.
+	t.recovOnce.Do(func() { close(t.stopRecov) })
+
 	for _, sub := range subs {
 		_ = sub.Close()
 	}
+	t.recovering.Wait()
 
 	t.mu.Lock()
 	if t.channel != nil {
@@ -465,11 +612,66 @@ func (t *Transport) Close() error {
 }
 
 type subscription struct {
-	channel   *amqp.Channel
-	tag       string
+	// Everything needed to set this consumer up again on a new connection.
+	queue   string
+	spec    acemq.ConsumeSpec
+	deliver func(acemq.Delivery)
+
+	mu      sync.Mutex
+	channel *amqp.Channel
+	tag     string
+
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 	closeErr  error
+	closed    bool
+}
+
+// reattach consumes again on a freshly reconnected transport.
+//
+// The old channel is gone with the connection, so there is nothing to close;
+// the goroutine reading its deliveries has already ended, because the client
+// closes that channel when the connection drops.
+func (s *subscription) reattach(_ context.Context, t *Transport) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	queue, spec, deliver, tag := s.queue, s.spec, s.deliver, s.tag
+	s.mu.Unlock()
+
+	t.mu.Lock()
+	conn := t.conn
+	t.mu.Unlock()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		return fmt.Errorf("acemq: cannot reopen a channel for %q after reconnecting: %w", queue, err)
+	}
+
+	prefetch := spec.Prefetch
+	if prefetch <= 0 {
+		prefetch = 20
+	}
+	if err := ch.Qos(prefetch, 0, false); err != nil {
+		_ = ch.Close()
+		return fmt.Errorf("acemq: cannot set prefetch on %q after reconnecting: %w", queue, err)
+	}
+
+	deliveries, err := ch.Consume(queue, tag, false, false, false, false, nil)
+	if err != nil {
+		_ = ch.Close()
+		return fmt.Errorf("acemq: cannot consume from %q after reconnecting: %w", queue, err)
+	}
+
+	s.mu.Lock()
+	s.channel = ch
+	s.mu.Unlock()
+
+	s.wg.Add(1)
+	go s.run(deliveries, deliver)
+	return nil
 }
 
 func (s *subscription) run(deliveries <-chan amqp.Delivery, deliver func(acemq.Delivery)) {
@@ -501,13 +703,25 @@ func (s *subscription) run(deliveries <-chan amqp.Delivery, deliver func(acemq.D
 // further deliveries once this returns.
 func (s *subscription) Close() error {
 	s.closeOnce.Do(func() {
-		if err := s.channel.Cancel(s.tag, false); err != nil {
-			// The channel may already be gone, in which case the loop has
-			// ended anyway and there is nothing to report.
+		s.mu.Lock()
+		s.closed = true
+		ch, tag := s.channel, s.tag
+		s.mu.Unlock()
+
+		if err := ch.Cancel(tag, false); err != nil {
+			// The channel may already be gone — a connection that dropped
+			// takes it — in which case the loop has ended anyway and there is
+			// nothing to report.
 			s.closeErr = nil
 		}
 		s.wg.Wait()
-		if err := s.channel.Close(); err != nil {
+
+		// Read again: a recovery may have replaced the channel between the
+		// cancel and the wait.
+		s.mu.Lock()
+		current := s.channel
+		s.mu.Unlock()
+		if err := current.Close(); err != nil {
 			s.closeErr = err
 		}
 	})
@@ -546,4 +760,227 @@ func (t *Transport) CheckQueue(_ context.Context, name string, spec acemq.QueueS
 		return fmt.Errorf("the broker refused the declaration: %w", err)
 	}
 	return nil
+}
+
+// recover reconnects when the connection drops, and puts everything back.
+//
+// Without this a dropped connection is the quietest failure in the library: the
+// delivery channel closes, every consumer goroutine ends, and the Consumer
+// objects still look alive. The service consumes nothing, for ever, and says
+// nothing about it. That is the failure this whole library exists to argue
+// against, so leaving it in the transport would have been indefensible.
+func (t *Transport) recover(closed chan *amqp.Error) {
+	defer t.recovering.Done()
+
+	for {
+		var reason *amqp.Error
+		select {
+		case reason = <-closed:
+		case <-t.stopRecov:
+			return
+		}
+
+		t.subsMu.Lock()
+		deliberate := t.closed
+		t.subsMu.Unlock()
+		if deliberate || reason == nil {
+			// Closed on purpose. Nothing to recover from.
+			return
+		}
+
+		t.report(RecoveryEvent{Kind: "lost", Err: reason})
+
+		next, err := t.reconnect()
+		if err != nil {
+			t.report(RecoveryEvent{Kind: "gave-up", Err: err})
+			return
+		}
+		closed = next
+	}
+}
+
+// reconnect dials until it succeeds, rebuilds the topology and restarts every
+// consumer. It returns the close channel of the new connection.
+func (t *Transport) reconnect() (chan *amqp.Error, error) {
+	delay := t.cfg.RecoveryDelay
+	if delay <= 0 {
+		delay = time.Second
+	}
+	const maxDelay = 30 * time.Second
+
+	for attempt := 1; ; attempt++ {
+		select {
+		case <-t.stopRecov:
+			return nil, errors.New("acemq: the transport was closed while reconnecting")
+		case <-time.After(delay):
+		}
+
+		t.report(RecoveryEvent{Kind: "retrying", Attempt: attempt})
+
+		closed, err := t.reconnectOnce()
+		if err == nil {
+			t.report(RecoveryEvent{Kind: "recovered", Attempt: attempt})
+			return closed, nil
+		}
+		t.report(RecoveryEvent{Kind: "retrying", Attempt: attempt, Err: err})
+
+		// Backed off rather than hammering a broker that is probably still
+		// starting up, and capped so recovery after a long outage is not
+		// half an hour late.
+		if delay < maxDelay {
+			delay *= 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+	}
+}
+
+func (t *Transport) reconnectOnce() (chan *amqp.Error, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	fresh, err := Dial(ctx, t.url, Config{
+		Security:        t.cfg.Security,
+		TLS:             t.cfg.TLS,
+		Name:            t.cfg.Name,
+		WithoutConfirms: t.cfg.WithoutConfirms,
+		// The replacement must not start a recovery loop of its own; this one
+		// takes over its connection and keeps watching.
+		WithoutRecovery: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	t.mu.Lock()
+	t.conn = fresh.conn
+	t.channel = fresh.channel
+	t.returns = fresh.returns
+	t.confirming = fresh.confirming
+	t.mu.Unlock()
+
+	if err := t.redeclare(ctx); err != nil {
+		_ = fresh.conn.Close()
+		return nil, err
+	}
+	if err := t.restartConsumers(ctx); err != nil {
+		_ = fresh.conn.Close()
+		return nil, err
+	}
+
+	return fresh.conn.NotifyClose(make(chan *amqp.Error, 1)), nil
+}
+
+// redeclare puts the topology back.
+//
+// A broker that restarted has lost everything that was not durable, and a
+// consumer reattached to a queue that no longer exists receives nothing for
+// ever — which looks exactly like a quiet queue.
+func (t *Transport) redeclare(ctx context.Context) error {
+	t.topoMu.Lock()
+	exchanges := append([]exchangeDecl(nil), t.exchanges...)
+	queues := append([]queueDecl(nil), t.queues...)
+	binds := append([]bindDecl(nil), t.binds...)
+	t.topoMu.Unlock()
+
+	// Declared through the channel directly, because the public methods record
+	// what they declare and would grow these lists on every recovery.
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for _, e := range exchanges {
+		kind := e.spec.Kind
+		if kind == "" {
+			kind = "direct"
+		}
+		err := t.channel.ExchangeDeclare(
+			e.name, kind, e.spec.Durable, e.spec.AutoDelete, false, false, amqp.Table(e.spec.Args))
+		if err != nil {
+			return fmt.Errorf("acemq: cannot redeclare exchange %q after reconnecting: %w", e.name, err)
+		}
+	}
+	for _, q := range queues {
+		_, err := t.channel.QueueDeclare(
+			q.name, q.spec.Durable, q.spec.AutoDelete, q.spec.Exclusive, false, amqp.Table(q.spec.Args))
+		if err != nil {
+			return fmt.Errorf("acemq: cannot redeclare queue %q after reconnecting: %w", q.name, err)
+		}
+	}
+	for _, b := range binds {
+		if err := t.channel.QueueBind(b.queue, b.routingKey, b.exchange, false, nil); err != nil {
+			return fmt.Errorf("acemq: cannot rebind %q after reconnecting: %w", b.queue, err)
+		}
+	}
+	_ = ctx
+	return nil
+}
+
+// restartConsumers reattaches every subscription to the new connection.
+func (t *Transport) restartConsumers(ctx context.Context) error {
+	t.subsMu.Lock()
+	subs := append([]*subscription(nil), t.subs...)
+	t.subsMu.Unlock()
+
+	for _, sub := range subs {
+		if err := sub.reattach(ctx, t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *Transport) report(event RecoveryEvent) {
+	if t.cfg.OnRecovery != nil {
+		t.cfg.OnRecovery(event)
+	}
+}
+
+// Supports says what this transport can do against RabbitMQ.
+//
+// Delayed delivery needs a plugin, and asking the broker whether it has one
+// costs a management-API call this transport does not make, so it is reported
+// as absent. Better to say no and be wrong than to say yes and have messages
+// arrive immediately.
+func (t *Transport) Supports(c acemq.Capability) bool {
+	switch c {
+	case acemq.CapabilityPublisherConfirms:
+		return t.confirming
+	case acemq.CapabilityRecovery:
+		return !t.cfg.WithoutRecovery
+	case acemq.CapabilityDeadLettering,
+		acemq.CapabilityQuorumQueues,
+		acemq.CapabilityStreams,
+		acemq.CapabilityPriority:
+		return true
+	default:
+		return false
+	}
+}
+
+// Pull fetches one message with basic.get, without starting a consumer.
+func (t *Transport) Pull(_ context.Context, queue string) (acemq.Delivery, bool, error) {
+	t.mu.Lock()
+	ch := t.channel
+	t.mu.Unlock()
+
+	msg, found, err := ch.Get(queue, false)
+	if err != nil {
+		return acemq.Delivery{}, false, acemq.Transportf(err, "cannot pull from %q", queue)
+	}
+	if !found {
+		return acemq.Delivery{}, false, nil
+	}
+
+	delivery := msg
+	return acemq.Delivery{
+		Body:        delivery.Body,
+		ContentType: delivery.ContentType,
+		RoutingKey:  delivery.RoutingKey,
+		MessageID:   delivery.MessageId,
+		Headers:     map[string]any(delivery.Headers),
+		Redelivered: delivery.Redelivered,
+		Ack:         func() error { return delivery.Ack(false) },
+		Nack:        func(requeue bool) error { return delivery.Nack(false, requeue) },
+	}, true, nil
 }

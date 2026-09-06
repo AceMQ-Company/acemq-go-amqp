@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -588,5 +590,110 @@ func TestCheckIsQuietWhenTheRealBrokerAgrees(t *testing.T) {
 
 	if len(reports) != 0 {
 		t.Errorf("drift reported against a broker just given this topology: %v", reports)
+	}
+}
+
+// ---- connection recovery ---------------------------------------------
+
+// TestTheConsumerComesBackAfterTheBrokerRestarts is the test that needed
+// writing most.
+//
+// Before recovery existed, a dropped connection was the quietest failure in the
+// library: the delivery channel closed, the consumer goroutine ended, and the
+// Consumer object still looked alive. The service consumed nothing, for ever,
+// and said nothing about it.
+//
+// It needs a broker it is allowed to restart, which is not the shared one, so
+// it runs only when ACEMQ_TEST_RESTARTABLE_CONTAINER names one.
+func TestTheConsumerComesBackAfterTheBrokerRestarts(t *testing.T) {
+	container := os.Getenv("ACEMQ_TEST_RESTARTABLE_CONTAINER")
+	url := os.Getenv("ACEMQ_TEST_RESTARTABLE_URL")
+	if container == "" || url == "" {
+		t.Skip("ACEMQ_TEST_RESTARTABLE_CONTAINER and _URL are not set; skipping the recovery test")
+	}
+
+	ctx := context.Background()
+
+	var eventsMu sync.Mutex
+	var events []string
+	transport, err := rabbitmq.Dial(ctx, url, rabbitmq.Config{
+		RecoveryDelay: 500 * time.Millisecond,
+		OnRecovery: func(e rabbitmq.RecoveryEvent) {
+			eventsMu.Lock()
+			events = append(events, e.Kind)
+			eventsMu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mq, err := acemq.NewConn(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mq.Close()
+
+	queue := queueName(t)
+	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	received := 0
+	sub, err := acemq.Consume(ctx, mq, queue,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			mu.Lock()
+			received++
+			mu.Unlock()
+			return acemq.Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	pub := acemq.NewPublisher[OrderPlaced](mq, "", queue)
+	if err := pub.Send(ctx, OrderPlaced{OrderID: "before"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first message", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return received == 1
+	})
+
+	// Take the broker away and bring it back.
+	if out, err := exec.Command("docker", "restart", container).CombinedOutput(); err != nil {
+		t.Fatalf("cannot restart the broker: %v: %s", err, out)
+	}
+
+	// Publishing has to work again, which means the connection, the channel,
+	// the queue and the consumer all came back.
+	deadline := time.Now().Add(90 * time.Second)
+	var sendErr error
+	for time.Now().Before(deadline) {
+		if sendErr = pub.Send(ctx, OrderPlaced{OrderID: "after"}); sendErr == nil {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if sendErr != nil {
+		t.Fatalf("publishing never recovered: %v", sendErr)
+	}
+
+	waitFor(t, "a message consumed after the restart", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return received >= 2
+	})
+
+	// And the application was told, rather than having to notice.
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	if !slices.Contains(events, "lost") {
+		t.Errorf("nothing reported the connection being lost: %v", events)
+	}
+	if !slices.Contains(events, "recovered") {
+		t.Errorf("nothing reported the recovery: %v", events)
 	}
 }

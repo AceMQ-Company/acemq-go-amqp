@@ -196,8 +196,29 @@ func handleDelivery[T any](
 	observer.Gauge(MetricInFlight, c.inFlight(1), labels)
 	defer observer.Gauge(MetricInFlight, c.inFlight(-1), labels)
 
+	if len(c.conn.onConsume) > 0 {
+		cc := &ConsumeContext{
+			Queue:       c.queue,
+			Envelope:    &env,
+			Body:        d.Body,
+			ContentType: d.ContentType,
+			Redelivered: d.Redelivered,
+		}
+		for _, intercept := range c.conn.onConsume {
+			if err := intercept(ctx, cc); err != nil {
+				// Refused before the handler ran. Dead-lettered rather than
+				// retried, because an interceptor that says no will say no
+				// again to the same message.
+				observer.Count(MetricRejected, 1, labels)
+				c.forget(env.ID)
+				c.nack(d, false)
+				return
+			}
+		}
+	}
+
 	var payload T
-	if err := cfg.codec.Decode(d.Body, &payload); err != nil {
+	if err := decodeWith(cfg.codec, d.ContentType, d.Body, &payload); err != nil {
 		// A body that will not decode decodes no better next time, so this is
 		// dead-lettered rather than retried.
 		observer.Count(MetricRejected, 1, labels)
@@ -267,6 +288,14 @@ func handleDelivery[T any](
 		}
 		c.nack(d, true)
 	}
+}
+
+// decodeWith reads a body, letting a codec that chooses by content type see it.
+func decodeWith(codec Codec, contentType string, body []byte, dst any) error {
+	if chooser, ok := codec.(contentTypeDecoder); ok {
+		return chooser.DecodeAs(contentType, body, dst)
+	}
+	return codec.Decode(body, dst)
 }
 
 // callHandler runs the handler, turning a panic into a rejection rather than
