@@ -86,12 +86,19 @@ jobs:
         # fails with "module found, but does not contain package", which reads
         # like the package is missing from the release rather than like a tag
         # nobody pushed. 0.1.0 shipped without them.
+        #
+        # Asked of the remote rather than the checkout. The release checkout is
+        # shallow and carries the tag being released and nothing else, so a
+        # local rev-parse reports every nested tag as missing however carefully
+        # they were pushed -- and `git fetch --tags` failing under `bash -e`
+        # took the step down before it could say so. 0.1.2 failed here with the
+        # tags all present and the release itself perfectly good.
         run: |
           version="${GITHUB_REF_NAME}"
-          git fetch --tags --quiet
+          tags="$(git ls-remote --tags origin | sed -e 's#.*refs/tags/##' -e 's#\^{}$##')"
           missing=""
           for module in codec/yaml codec/toml codec/protobuf codec/avro; do
-            if ! git rev-parse -q --verify "refs/tags/$module/$version" >/dev/null; then
+            if ! printf '%s\n' "$tags" | grep -qx "$module/$version"; then
               missing="$missing $module/$version"
             fi
           done
