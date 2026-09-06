@@ -5,6 +5,12 @@
 # practice — the proxy caches it for ever — so the checks that matter have to
 # run before anybody depends on it, and this fails loudly rather than leaving a
 # broken version resolvable.
+#
+# Before pushing a tag, run ./scripts/release-preflight.sh <version>. Every
+# check below also runs there, where a failure costs nothing. A failure here
+# costs a version: the proxy caches a tag for ever, so a release that fails its
+# own checks cannot be corrected in place -- 0.1.1, 0.1.2 and 0.1.3 were each
+# spent finding out what the preflight now says in five seconds.
 name: release
 
 on:
