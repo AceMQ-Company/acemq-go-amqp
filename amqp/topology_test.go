@@ -393,3 +393,57 @@ func TestApplyModeNamesItself(t *testing.T) {
 		t.Errorf("modes read as %q and %q", DryRun, Declare)
 	}
 }
+
+// ---- queue admin -----------------------------------------------------
+
+func TestCountingAndDeletingAQueue(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	if err := mq.DeclareQueue(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := mq.MessageCount(ctx, "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("a fresh queue holds %d messages", count)
+	}
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err = mq.MessageCount(ctx, "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Errorf("after one publish the queue holds %d", count)
+	}
+
+	if err := mq.DeleteQueue(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+
+	exists, err := mq.QueueExists(ctx, "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Error("the queue is still there after being deleted")
+	}
+}
+
+// Cleaning up after a test should not depend on knowing what ran.
+func TestDeletingAQueueThatIsNotThereIsFine(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	if err := mq.DeleteQueue(ctx, "never-existed"); err != nil {
+		t.Errorf("deleting a queue that does not exist failed: %v", err)
+	}
+}

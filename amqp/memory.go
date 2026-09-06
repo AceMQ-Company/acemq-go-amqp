@@ -127,6 +127,35 @@ func (t *memTransport) CheckQueue(_ context.Context, name string, spec QueueSpec
 	return sameQueue(existing.spec, spec)
 }
 
+// MessageCount is how many messages are waiting on a queue.
+func (t *memTransport) MessageCount(_ context.Context, name string) (int64, error) {
+	t.broker.mu.Lock()
+	defer t.broker.mu.Unlock()
+
+	q, ok := t.broker.queues[name]
+	if !ok {
+		return 0, Fatalf("acemq: no queue %q", name)
+	}
+	return int64(q.depth()), nil
+}
+
+// DeleteQueue removes a queue and everything on it.
+func (t *memTransport) DeleteQueue(_ context.Context, name string) error {
+	t.broker.mu.Lock()
+	defer t.broker.mu.Unlock()
+
+	if _, ok := t.broker.queues[name]; !ok {
+		// Deleting what is not there is the outcome the caller wanted, and a
+		// broker asked the same way says the same thing.
+		return nil
+	}
+	// Consumers already attached keep their subscription object and simply stop
+	// being given anything, where a broker would cancel them. Close them before
+	// deleting the queue if that difference matters to the test.
+	delete(t.broker.queues, name)
+	return nil
+}
+
 // QueueExists reports whether the queue is there, creating nothing.
 func (t *memTransport) QueueExists(_ context.Context, name string) (bool, error) {
 	t.broker.mu.Lock()

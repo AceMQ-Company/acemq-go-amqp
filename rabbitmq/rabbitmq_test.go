@@ -811,3 +811,51 @@ func TestADryRunReportsARealBrokersDrift(t *testing.T) {
 		t.Errorf("the difference was not reported: %v", plan)
 	}
 }
+
+func TestCountingAndDeletingAQueueOnARealBroker(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	queue := queueName(t)
+	removeAtEnd(t, []string{queue}, nil)
+
+	if err := mq.DeclareQueue(ctx, queue); err != nil {
+		t.Fatal(err)
+	}
+	if err := acemq.NewPublisher[OrderPlaced](mq, "", queue).
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The broker counts what it has, which takes a moment to settle after a
+	// confirm.
+	var count int64
+	waitFor(t, "the message to be counted", func() bool {
+		got, err := mq.MessageCount(ctx, queue)
+		if err != nil {
+			t.Fatal(err)
+		}
+		count = got
+		return count == 1
+	})
+
+	if err := mq.DeleteQueue(ctx, queue); err != nil {
+		t.Fatal(err)
+	}
+
+	// And the connection still works afterwards: both of these ask on a channel
+	// of their own, because the broker closes the channel it answers NOT_FOUND
+	// on.
+	exists, err := mq.QueueExists(ctx, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Error("the queue is still there after being deleted")
+	}
+	if err := mq.DeleteQueue(ctx, queue); err != nil {
+		t.Errorf("deleting it a second time failed: %v", err)
+	}
+	if err := mq.DeclareQueue(ctx, queue); err != nil {
+		t.Fatalf("the connection did not survive: %v", err)
+	}
+}

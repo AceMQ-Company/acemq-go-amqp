@@ -262,6 +262,27 @@ management API. Two consequences worth knowing:
   side effect of asking would not be safe to run against a broker somebody is
   only inspecting.
 
+## Asking about a queue, and removing one
+
+```go
+count, err := mq.MessageCount(ctx, "shipping-orders")
+exists, err := mq.QueueExists(ctx, "shipping-orders")
+err := mq.DeleteQueue(ctx, "shipping-orders")
+```
+
+`MessageCount` is a number for a dashboard or a test, not a decision to make in
+a handler: it is a snapshot of a queue that is still moving, and by the time it
+is read somewhere else it is already wrong.
+
+`QueueExists` creates nothing — it is a passive declare, which is the only
+read-only question AMQP offers.
+
+`DeleteQueue` takes the messages with it, so it is for tests and for tools. A
+service that deletes queues has usually confused a queue with a session.
+Deleting one that is not there is not an error: the caller asked for it to be
+gone and it is, which is what makes cleaning up after a test something other
+than guessing what ran.
+
 ## Where to declare
 
 At start-up, in the service that owns the queue, before consuming from it.

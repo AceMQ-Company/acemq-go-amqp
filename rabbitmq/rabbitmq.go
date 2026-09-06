@@ -763,6 +763,47 @@ func (t *Transport) CheckQueue(_ context.Context, name string, spec acemq.QueueS
 	return nil
 }
 
+// MessageCount is how many messages are waiting on a queue.
+//
+// A passive declare answers it, which is also the only reason this cannot be
+// asked about a queue that does not exist: the broker replies NOT_FOUND and
+// closes the channel, so this uses one of its own.
+func (t *Transport) MessageCount(_ context.Context, name string) (int64, error) {
+	ch, err := t.conn.Channel()
+	if err != nil {
+		return 0, fmt.Errorf("acemq: cannot open a channel to count queue %q: %w", name, err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	q, err := ch.QueueDeclarePassive(name, false, false, false, false, nil)
+	if err != nil {
+		return 0, fmt.Errorf("acemq: cannot count queue %q: %w", name, err)
+	}
+	return int64(q.Messages), nil
+}
+
+// DeleteQueue removes a queue and every message still on it.
+//
+// Deleting a queue that is not there is not an error: the caller asked for it to
+// be gone and it is. Anything else would make cleaning up after a test a matter
+// of guessing what ran.
+func (t *Transport) DeleteQueue(_ context.Context, name string) error {
+	ch, err := t.conn.Channel()
+	if err != nil {
+		return fmt.Errorf("acemq: cannot open a channel to delete queue %q: %w", name, err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	if _, err := ch.QueueDelete(name, false, false, false); err != nil {
+		var brokerErr *amqp.Error
+		if errors.As(err, &brokerErr) && brokerErr.Code == amqp.NotFound {
+			return nil
+		}
+		return fmt.Errorf("acemq: cannot delete queue %q: %w", name, err)
+	}
+	return nil
+}
+
 // QueueExists reports whether a queue is on the broker, creating nothing.
 //
 // A passive declare is the read-only half of the question: the broker answers

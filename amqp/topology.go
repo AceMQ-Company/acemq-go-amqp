@@ -462,3 +462,51 @@ func describeQueue(s QueueSpec) string {
 	}
 	return strings.Join(parts, ", ")
 }
+
+// QueueAdmin is a transport that can report on and remove queues.
+//
+// Separate from Transport because not every transport has an answer: the
+// question "how many messages are waiting" means nothing to a transport that
+// does not hold them. Both transports in this module implement it.
+type QueueAdmin interface {
+	// MessageCount is how many messages are waiting on a queue.
+	MessageCount(ctx context.Context, name string) (int64, error)
+
+	// DeleteQueue removes a queue and everything on it.
+	DeleteQueue(ctx context.Context, name string) error
+}
+
+// MessageCount is how many messages are waiting on a queue.
+//
+// A number for a dashboard or a test, not a decision to make in a handler: it
+// is a snapshot of a queue that is still moving, and by the time it is read
+// somewhere else it is already wrong.
+func (c *Conn) MessageCount(ctx context.Context, queue string) (int64, error) {
+	admin, ok := c.transport.(QueueAdmin)
+	if !ok {
+		return 0, Fatalf("acemq: the %T transport cannot count messages", c.transport)
+	}
+	return admin.MessageCount(ctx, queue)
+}
+
+// DeleteQueue removes a queue and every message still on it.
+//
+// For tests and for tools. A service that deletes queues is usually a service
+// that has confused a queue with a session — the messages go with it, including
+// the ones somebody was about to be paid for.
+func (c *Conn) DeleteQueue(ctx context.Context, queue string) error {
+	admin, ok := c.transport.(QueueAdmin)
+	if !ok {
+		return Fatalf("acemq: the %T transport cannot delete queues", c.transport)
+	}
+	return admin.DeleteQueue(ctx, queue)
+}
+
+// QueueExists reports whether a queue is on the broker, creating nothing.
+func (c *Conn) QueueExists(ctx context.Context, queue string) (bool, error) {
+	inspector, ok := c.transport.(QueueInspector)
+	if !ok {
+		return false, Fatalf("acemq: the %T transport cannot look for queues", c.transport)
+	}
+	return inspector.QueueExists(ctx, queue)
+}
