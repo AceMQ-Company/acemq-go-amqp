@@ -80,6 +80,31 @@ jobs:
             (cd "$module" && go build ./... && go vet ./...)
           done
 
+      - name: Check every nested module has been tagged
+        # A nested module is published by its own path-prefixed tag; the root
+        # tag does not carry it. Without these, `go get .../codec/yaml@v0.1.0`
+        # fails with "module found, but does not contain package", which reads
+        # like the package is missing from the release rather than like a tag
+        # nobody pushed. 0.1.0 shipped without them.
+        run: |
+          version="${GITHUB_REF_NAME}"
+          git fetch --tags --quiet
+          missing=""
+          for module in codec/yaml codec/toml codec/protobuf codec/avro; do
+            if ! git rev-parse -q --verify "refs/tags/$module/$version" >/dev/null; then
+              missing="$missing $module/$version"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::these module tags are missing, so those formats cannot be consumed:$missing"
+            echo "Tag them at this commit and push:"
+            for tag in $missing; do
+              echo "  git tag -a $tag $version^{} -m '...'"
+            done
+            exit 1
+          fi
+          echo "every nested module is tagged"
+
       - name: Check the codec modules require a released parent
         # A replace directive is ignored by anyone importing the module, so a
         # codec whose go.mod points at ../.. resolves the parent by its require
