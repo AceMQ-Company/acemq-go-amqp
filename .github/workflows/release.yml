@@ -1,0 +1,162 @@
+# Verify a tag before it becomes a release.
+#
+# Go publishes by tag: there is no artifact to upload, and pkg.go.dev and the
+# module proxy pick a version up on their own. That makes a tag irreversible in
+# practice — the proxy caches it for ever — so the checks that matter have to
+# run before anybody depends on it, and this fails loudly rather than leaving a
+# broken version resolvable.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # The version the module claims to support, not the newest. Releasing
+          # something that only builds on a newer toolchain would break the
+          # promise the API design rests on.
+          go-version: '1.23'
+
+      - name: Check the tag is a 0.1.x version
+        # The line stays on 0.1.x until that is deliberately changed. Without
+        # this a mistyped tag becomes a version nobody can withdraw.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          case "$version" in
+            0.1.*) echo "releasing $version" ;;
+            *)
+              echo "::error::this library releases 0.1.x only; '$version' needs the guard in release.yml lifted first"
+              exit 1
+              ;;
+          esac
+
+      - name: Check the module targets the Go it claims
+        run: |
+          declared=$(grep -E "^go [0-9]" go.mod | awk '{print $2}')
+          if [ "$declared" != "1.23" ]; then
+            echo "::error::go.mod says go $declared; this module targets 1.23"
+            exit 1
+          fi
+
+      - name: Check the version constant matches the tag
+        # A released library that reports "dev" tells an operator nothing about
+        # what is running.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          declared=$(grep -oE 'Version = "[^"]+"' amqp/interceptors.go | cut -d'"' -f2)
+          if [ "$declared" != "$version" ]; then
+            echo "::error::the tag is $version but acemq.Version is \"$declared\""
+            exit 1
+          fi
+          echo "acemq.Version is $declared"
+
+      - name: Build, vet and test
+        run: |
+          gofmt -l . | tee /tmp/unformatted
+          test ! -s /tmp/unformatted
+          go build ./...
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Build every codec module
+        # Each is a module of its own, so nothing in the root build covers
+        # them. A release that leaves one broken is a release nobody can use
+        # that format from.
+        run: |
+          for module in codec/yaml codec/toml codec/protobuf codec/avro; do
+            echo "--- $module"
+            (cd "$module" && go build ./... && go vet ./...)
+          done
+
+      - name: Check the codec modules require a released parent
+        # A replace directive is ignored by anyone importing the module, so a
+        # codec whose go.mod points at ../.. resolves the parent by its require
+        # version. That version has to exist, or `go get` on the codec fails
+        # with something that reads like a proxy problem.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          failed=0
+          for module in codec/yaml codec/toml codec/protobuf codec/avro patterns/sqltest; do
+            required=$(grep -oE 'github.com/AceMQ-Company/acemq-go-amqp v[0-9][^ ]*' "$module/go.mod" | awk '{print $2}')
+            if [ "$required" != "v$version" ]; then
+              echo "::error::$module requires the parent at $required; the tag is v$version"
+              failed=1
+            fi
+          done
+          test "$failed" -eq 0
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Generate development certificates
+        run: go run ./cmd/acemq-certs --out "$RUNNER_TEMP/certs" --broker localhost --days 1
+
+      - name: Start a broker serving them
+        run: |
+          chmod 644 "$RUNNER_TEMP"/certs/*.key
+          docker run -d --name acemq-tls \
+            -e HOME=/tmp \
+            -p 5671:5671 -p 5672:5672 \
+            -v "$RUNNER_TEMP/certs:/certs:ro" \
+            -v "$RUNNER_TEMP/certs/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+            rabbitmq:4-alpine
+          for i in $(seq 1 60); do
+            if docker logs acemq-tls 2>&1 | grep -q "Server startup complete"; then
+              echo "the broker is up"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::the broker never became ready"
+          docker logs acemq-tls
+          exit 1
+
+      - name: Test against it
+        env:
+          ACEMQ_TEST_AMQPS_URL: amqps://guest:guest@localhost:5671/
+          ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
+          ACEMQ_TEST_CA: ${{ runner.temp }}/certs/ca.crt
+        run: go test -race -count=1 -v ./rabbitmq/
+
+      - name: Check nothing skipped
+        env:
+          ACEMQ_TEST_AMQPS_URL: amqps://guest:guest@localhost:5671/
+          ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
+          ACEMQ_TEST_CA: ${{ runner.temp }}/certs/ca.crt
+        run: |
+          output=$(go test -count=1 -v ./rabbitmq/ 2>&1)
+          if echo "$output" | grep -q -- "--- SKIP"; then
+            echo "::error::a broker test skipped during a release"
+            echo "$output" | grep -- "--- SKIP"
+            exit 1
+          fi
+
+  notify:
+    needs: [verify, integration]
+    if: always() && (needs.verify.result == 'failure' || needs.integration.result == 'failure')
+    uses: AceMQ-Company/acemq-java-amqp/.github/workflows/slack-notify.yml@main
+    with:
+      status: failure
+      title: "AceMQ for Go release FAILED"
+      message: "The tag is pushed but did not verify. The module proxy may already be serving it."
+      url: https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp
+    secrets:
+      SLACK_DELIVERY_WEBHOOK: ${{ secrets.SLACK_DELIVERY_WEBHOOK }}

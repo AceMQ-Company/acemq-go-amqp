@@ -80,7 +80,13 @@ unless you say otherwise — on every path, including the insecure one. See
 
 **A core with no dependencies.** Nothing outside the standard library, including
 the UUIDs. The AMQP client lives behind a transport registry in a subpackage, so
-a program that only uses `memory://` never compiles it in.
+a program that only uses `memory://` never compiles it in, and every format
+beyond JSON is a module of its own.
+
+**Connections that come back.** A dropped connection is redialled, the topology
+redeclared and every consumer reattached — because the alternative is a service
+that silently stops consuming and says nothing. See
+[retries and redelivery](reliability.md).
 
 ## The layout
 
@@ -91,7 +97,10 @@ The module is a package per concern, with nothing at its root:
 | `.../acemq-go-amqp/amqp` | envelopes, codecs, publishing, consuming, retry, the in-memory transport |
 | `.../acemq-go-amqp/rabbitmq` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go` |
 | `.../acemq-go-amqp/security` | TLS modes, trusted authorities, credentials |
-| `.../acemq-go-amqp/patterns` | request-reply, idempotency, outbox, ordering, pipelines, replay |
+| `.../acemq-go-amqp/patterns` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, streams, consumer groups, schema registry, SQL stores |
+| `.../acemq-go-amqp/actuator` | metrics, health and info over HTTP |
+| `.../acemq-go-amqp/crypto` | encrypted message bodies |
+| `.../acemq-go-amqp/codec/...` | XML, YAML, TOML, Protocol Buffers, Avro — a module each |
 | `.../acemq-go-amqp/devcerts` | development certificates, behind the `acemq-certs` command |
 
 The package in `amqp/` is named `acemq`, so the import carries the name:

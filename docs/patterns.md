@@ -211,3 +211,122 @@ second answer, for a queue somebody is still writing to.
 
 Bodies are read as bytes, not through the connection's codec. A body that will
 not decode is exactly the kind that ends up in a dead-letter queue.
+
+## Routing slips
+
+An itinerary the message carries, instead of a central orchestrator:
+
+```go
+slip := patterns.NewRoutingSlip().
+	Then("orders-events", "order.validate", "validate").
+	Then("orders-events", "order.charge", "charge").
+	Then("orders-events", "order.ship", "ship")
+
+err := patterns.Start(ctx, mq, slip, order)
+```
+
+Each service does its part and the message goes to the next stop:
+
+```go
+sub, err := acemq.Consume(ctx, mq, "charge-queue",
+	patterns.FollowSlip(mq, func(ctx context.Context, m acemq.Message[Order]) (Order, error) {
+		return charge(ctx, m.Payload)
+	}))
+```
+
+The route is decided once, by whoever started the work, and travels with the
+message rather than living in a component every service has to talk to.
+
+**What it costs:** no single place knows the whole route at runtime, so a route
+that is wrong is discovered one hop at a time. Worth it when the steps vary per
+message; not worth it when every message goes the same way, where a fixed chain
+of consumers is simpler to follow.
+
+## Consumer groups
+
+```go
+group, err := patterns.NewConsumerGroup(ctx, mq, "orders", 4, handle)
+defer group.Close()
+```
+
+Several consumers over one queue, stopped together.
+
+**Concurrency or a group?** `acemq.Concurrency` runs several handlers on one
+consumer and one channel. A group runs several consumers, each with its own
+channel and prefetch. Use a group when handlers are slow enough that one
+channel's prefetch is the limit, or when a fair share across processes matters —
+the broker round-robins between consumers, so four here compete evenly with four
+in another instance.
+
+A group that cannot start closes what it already started, because a half-started
+group holds messages nothing is going to handle.
+
+## Schema registry
+
+```go
+registry := patterns.NewInMemorySchemaRegistry()
+schema, err := registry.Register(ctx, "order.placed", "avro", definition)
+```
+
+Messages carry a small identifier and consumers look the schema up, which is
+what lets a producer add a field without every consumer being redeployed the
+same afternoon. The [Avro codec](serialization.md) uses it directly.
+
+Definitions are fingerprinted, so a service registering on start-up does not add
+a version per restart. A lookup that finds nothing returns `ErrSchemaNotFound`
+rather than a zero value — a consumer that cannot find its schema has a real
+problem and must not carry on with an empty definition.
+
+`NewInMemorySchemaRegistry` shares nothing between processes, which is the whole
+point of a registry. Use the SQL one, or Confluent's, for anything real.
+
+## Stores that survive a restart
+
+The in-memory idempotency store and outbox are for tests and for one worker.
+The SQL ones are the point:
+
+```go
+tx, _ := db.BeginTx(ctx, nil)
+placeOrder(ctx, tx, order)
+
+record, _ := patterns.Record(mq, "orders-events", "order.placed", event)
+patterns.NewSQLOutboxStore(tx, patterns.PostgresDialect).Add(ctx, record)
+
+tx.Commit()
+```
+
+They take anything with `ExecContext` and `QueryContext`, so `*sql.Tx` satisfies
+them and **the record commits with the work**. There is a test that rolls a
+transaction back and proves neither the order nor the message survived.
+
+`Schema()` returns the DDL rather than running it. A library that runs
+migrations against your database on start-up is a library fighting your
+migration tool — put it in a migration.
+
+Dialects cover Postgres, MySQL and SQLite: placeholder syntax and the spelling
+of "insert unless it is already there" genuinely differ, and getting either
+wrong fails at runtime on one database and not another.
+
+## Streams
+
+A stream keeps its messages after they are read, so several consumers can each
+read from their own position:
+
+```go
+err := patterns.DeclareStream(ctx, mq, "events", patterns.StreamRetention{
+	MaxAge: 7 * 24 * time.Hour,
+})
+
+sub, err := patterns.ReadStream(ctx, mq, "events", handle,
+	patterns.StreamOptions{Offset: patterns.FromFirst(), Prefetch: 100})
+```
+
+**It is not a queue with a longer memory.** Acknowledging advances this
+consumer's position rather than removing anything, and rejecting dead-letters
+nothing, because there is nothing to remove it from. A message that cannot be
+handled has to be dealt with by the handler — logged, copied elsewhere, counted
+— and the stream moves on regardless. Nothing is lost, and nothing is retried
+for you.
+
+Retention is unbounded by default, which for a stream means "until the disk is
+full". Set `MaxAge` or `MaxBytes` on anything that runs for long.

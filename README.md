@@ -108,7 +108,10 @@ A package per concern, with nothing at the module root:
 | `amqp/` | envelopes, codecs, publishing, consuming, retry, the in-memory transport. No dependencies outside the standard library. Named `acemq`. |
 | `rabbitmq/` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go`. |
 | `security/` | TLS modes, trusted authorities, credentials. No dependencies either. |
-| `patterns/` | request-reply, idempotency, outbox, ordering, pipelines, replay. |
+| `patterns/` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, streams, consumer groups, schema registry, SQL-backed stores. |
+| `actuator/` | metrics, health and info over HTTP, on the same paths as Java and .NET. |
+| `crypto/` | encrypted message bodies, AES-GCM. Standard library only. |
+| `codec/xml`, `codec/yaml`, `codec/toml`, `codec/protobuf`, `codec/avro` | one module each, so the core keeps its single dependency. |
 | `devcerts/` | development certificates, behind `cmd/acemq-certs`. |
 
 ## Security
@@ -134,6 +137,22 @@ acemq-certs --out certs --broker localhost --days 30
 ```
 
 Full detail in [the security guide](https://acemq.org/acemq-go-amqp/security.html).
+
+## Connections that come back
+
+A dropped connection is redialled with a capped backoff, the topology this
+transport declared is redeclared, and every consumer is reattached. Without it a
+dropped connection is the quietest failure there is: the delivery channel
+closes, the consumer goroutines end, and the objects still look alive while the
+service consumes nothing for ever.
+
+```go
+transport, err := rabbitmq.Dial(ctx, url, rabbitmq.Config{
+	OnRecovery: func(e rabbitmq.RecoveryEvent) { log.Printf("acemq: %s", e) },
+})
+```
+
+Verified against a real broker restart.
 
 ## Retry, and the attempt counter
 

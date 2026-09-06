@@ -76,6 +76,15 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
+      - name: Build and test every codec module
+        # Each is a module of its own, so nothing in the root build covers
+        # them. A codec left broken is a format nobody can use.
+        run: |
+          for module in codec/yaml codec/toml codec/protobuf codec/avro; do
+            echo "--- $module"
+            (cd "$module" && go build ./... && go vet ./... && go test -count=1 ./...)
+          done
+
       - name: Test the database-backed stores
         # A module of its own, and only this job can build it: the pure-Go
         # SQLite driver needs a newer Go than the library targets, and raising

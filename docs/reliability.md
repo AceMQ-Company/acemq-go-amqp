@@ -106,6 +106,63 @@ This library takes the honest cost rather than the invisible one, and says so
 here so it can be planned for: use short delays with a high attempt count, or
 raise the prefetch, or move long waits to a delay queue in the broker.
 
+## When the connection drops
+
+On by default. Without it a dropped connection is the quietest failure there is:
+the delivery channel closes, every consumer goroutine ends, and the `Consumer`
+objects still look alive. The service consumes nothing, for ever, and says
+nothing about it — you find out from a queue-depth graph.
+
+The transport watches for the close, redials with a capped backoff, **redeclares
+the topology it created** and reattaches every consumer. Redeclaring matters: a
+broker that restarted has lost anything not durable, and a consumer reattached
+to a queue that no longer exists receives nothing for ever, which looks exactly
+like a quiet queue.
+
+```go
+transport, err := rabbitmq.Dial(ctx, url, rabbitmq.Config{
+	RecoveryDelay: time.Second,
+	OnRecovery: func(e rabbitmq.RecoveryEvent) {
+		log.Printf("acemq: %s", e)
+	},
+})
+mq, err := acemq.NewConn(transport)
+```
+
+`OnRecovery` reports every loss and every attempt — `lost`, `retrying`,
+`recovered`, `gave-up`, `blocked`, `unblocked`. Recovery nobody can see is only
+half an improvement on dying quietly.
+
+Verified against a real broker restart: the consumer resumed in eight seconds.
+
+`rabbitmq.Config{WithoutRecovery: true}` turns it off, for where something
+outside the process is expected to restart it.
+
+### Messages in flight
+
+Anything unacknowledged when the connection went is redelivered by the broker,
+marked as a redelivery — so the attempt counter keeps counting and a message
+that was already failing does not get a fresh set of attempts.
+
+## When the broker runs out of room
+
+RabbitMQ sends `connection.blocked` when it is low on memory or disk, and every
+publish on that connection then blocks until it unblocks. A publisher that does
+not know this looks exactly like one that has hung, and restarting the service
+does not help.
+
+Publishing while blocked returns an error instead:
+
+```go
+if acemq.IsBlocked(err) {
+	// shed load, buffer, or fail the request
+}
+```
+
+That is a deliberate choice: a service that knows can do something, where one
+piling up goroutines against a broker that has already said it cannot take any
+more can only get worse.
+
 ## Publisher confirms
 
 On by default. Without them a `Send` that returns nil means the bytes reached

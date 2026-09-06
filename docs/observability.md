@@ -101,20 +101,38 @@ Checks run at once rather than in turn, so a slow one does not add its latency t
 the others. A check that ignores its context can still hang the whole report,
 which is why the interface says not to.
 
-### There is no built-in endpoint
-
-The Java and .NET libraries ship actuator-style HTTP endpoints. This one does
-not: Go services differ too much in how they serve HTTP for a library to pick,
-and `net/http` makes it three lines.
+## The HTTP endpoints
 
 ```go
-http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-	report := acemq.AggregateHealth(r.Context(), acemq.ConnHealth{Conn: mq})
-	if report.Status == acemq.HealthDown {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}
-	_ = json.NewEncoder(w).Encode(report)
-})
+import "github.com/AceMQ-Company/acemq-go-amqp/actuator"
+
+metrics := acemq.NewMetrics()
+mq, err := acemq.Connect(ctx, url, acemq.WithObserver(metrics))
+
+act := actuator.New(actuator.Options{Metrics: metrics, Conn: mq, Name: "orders"})
+go http.ListenAndServe("127.0.0.1:9090", act)
 ```
 
-Whatever you serve it from is yours to authenticate. This library does not.
+| | |
+|---|---|
+| `/acemq-metrics` | Prometheus text format |
+| `/acemq-health` | JSON, **503** when anything is down |
+| `/acemq-info` | version, and what the transport can do |
+
+The paths match the Java and .NET libraries, so a scrape configuration or a
+probe written for one works against another.
+
+The Prometheus output is written directly rather than through a client library,
+so this package needs nothing outside the standard library either. Durations
+appear as a summary with a count and a sum — enough for a rate and an average —
+plus min and max as gauges. No quantiles, for the reason above.
+
+### It is not authenticated
+
+Nothing checks who is asking. Health says which dependencies are down and
+metrics say how much traffic there is, which is more than an anonymous caller
+should learn about a service.
+
+Bind it to loopback, put it on a port your ingress does not publish, or wrap the
+handler in your own middleware. The library will not do it for you, and says so
+rather than implying otherwise by shipping a token check nobody configures.

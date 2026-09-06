@@ -146,10 +146,85 @@ available, because somebody who typoed one cannot see the registry:
 acemq: no codec named "jsn" is registered; known: [csv json]
 ```
 
-## Compared with the other libraries
+## The other formats
 
-Java and .NET ship Protocol Buffers, Avro, YAML and TOML codecs as separate
-packages, so the core carries no serialization dependency. Go has only JSON so
-far. The `Codec` interface is the extension point in the meantime, and a
-message written by a Go publisher and read by a Java consumer needs both ends to
-agree on the format either way.
+Every format the Java and .NET libraries have. Each is a **module of its own**,
+so the core keeps its single dependency and an application takes only what it
+sends:
+
+```bash
+go get github.com/AceMQ-Company/acemq-go-amqp/codec/yaml
+```
+
+| Module | Format | Brings |
+|---|---|---|
+| `codec/xml` | XML | nothing — standard library |
+| `codec/yaml` | YAML | `gopkg.in/yaml.v3` |
+| `codec/toml` | TOML | `github.com/BurntSushi/toml` |
+| `codec/protobuf` | Protocol Buffers | `google.golang.org/protobuf` |
+| `codec/avro` | Avro | `github.com/hamba/avro/v2` |
+| `crypto` | encryption | nothing — standard library |
+
+**None of them answers for a message with no content type.** JSON is the default
+and gets that benefit of the doubt; the others would be recording traffic under
+a format nobody sent.
+
+### YAML and TOML
+
+Both are for a message a person reads and edits. YAML writes block style, which
+is the only reason to pay for it over JSON. TOML has no **Norway problem**: in
+YAML `country: NO` is the boolean false, while in TOML an unquoted `NO` is a
+parse error rather than a country that quietly became `false`.
+
+TOML is a **table format**, so a body must be a struct or a map at the top level.
+The encoder underneath will happily write a bare list as `["a", "b"]` — which is
+not a TOML document — so this codec refuses it before it goes out rather than
+letting it fail in the consumer with no clue where it came from.
+
+### Avro, and schema evolution
+
+Two modes. `avro.Of(schema)` carries nothing on the wire and expects both ends
+to hold the same schema: smallest, and most brittle.
+
+```go
+codec, err := avro.Registered(registry, "order.placed", schema)
+```
+
+`Registered` frames each message with a schema identifier the way Confluent's
+clients do — one zero byte, four bytes of identifier, big-endian — which is what
+lets Confluent's clients, the Java library and this one read each other. A
+producer can then add a field with a default and a consumer that has never heard
+of it still reads the message. There is a test for exactly that.
+
+### Encryption
+
+```go
+keyring, err := crypto.NewKeyring(crypto.Key{ID: "2026-01", Secret: secret})
+codec := crypto.Wrap(acemq.JSONCodec{}, keyring)
+```
+
+The payload is encoded as usual and the bytes are then encrypted with AES-GCM,
+so the broker, its disk, its backups and its management interface see
+ciphertext. GCM authenticates as well as encrypts, so a body altered in the
+broker fails to open rather than decrypting into something else.
+
+**Headers travel in the clear.** The envelope is how the library routes and
+retries, so it cannot be encrypted without the broker losing the ability to do
+its job. Do not put anything secret in a header.
+
+A keyring holds more than one key because rotation needs an overlap: add the new
+key everywhere first so every consumer can read it, then make it current. A
+keyring with one key cannot rotate without an outage.
+
+A short key is refused rather than padded or hashed into shape — both would make
+a weak key look like a strong one.
+
+## Several formats on one queue
+
+```go
+codec := acemq.NewCompositeCodec(acemq.JSONCodec{}, yaml.Codec{})
+```
+
+The first is what it writes; all of them are offered a message to read, and the
+first that claims the content type does. For a migration, or a queue several
+producers write to in different formats.
