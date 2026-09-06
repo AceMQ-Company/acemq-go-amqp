@@ -303,3 +303,18 @@ func (c *Conn) untrack(sub *Consumer) {
 		}
 	}
 }
+
+// PublishRaw sends bytes that are already encoded, with headers already
+// rendered.
+//
+// For the outbox relay and anything else replaying a message recorded earlier:
+// the payload's Go type may not exist any more, and re-encoding it would
+// produce different bytes from the ones that were committed.
+//
+// Ordinary publishing goes through [Publisher], which builds the envelope and
+// encodes the payload.
+func (c *Conn) PublishRaw(
+	ctx context.Context, exchange, routingKey string, msg Outbound,
+) (PublishResult, error) {
+	return c.transport.Publish(ctx, exchange, routingKey, msg)
+}

@@ -50,3 +50,10 @@ func newID() string {
 	hex.Encode(out[24:36], b[10:16])
 	return string(out[:])
 }
+
+// NewID returns a random UUID version 4, the same kind of identifier an
+// [Envelope] generates for itself.
+//
+// Exported for the patterns package, which needs correlation identifiers drawn
+// the same way rather than a second scheme that looks almost the same.
+func NewID() string { return newID() }

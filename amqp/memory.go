@@ -349,6 +349,17 @@ func (q *memQueue) pop(stop <-chan struct{}) (memMsg, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	// Checked before taking a message, not only while waiting for one. A queue
+	// that always has something in it — a consumer requeueing as fast as it is
+	// delivered, which is what a replay leaving messages in place does — would
+	// otherwise never reach the wait, and the subscription could never be
+	// closed.
+	select {
+	case <-stop:
+		return memMsg{}, false
+	default:
+	}
+
 	for len(q.pending) == 0 {
 		select {
 		case <-stop:
