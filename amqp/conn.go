@@ -30,6 +30,7 @@ type Conn struct {
 	origin    string
 	retry     RetryPolicy
 	prefetch  int
+	observer  Observer
 
 	mu     sync.Mutex
 	closed bool
@@ -47,10 +48,16 @@ type connConfig struct {
 	retry    RetryPolicy
 	prefetch int
 	security *security.Options
+	observer Observer
 }
 
 func defaultConfig() connConfig {
-	return connConfig{codec: JSONCodec{}, origin: defaultOrigin(), prefetch: 20}
+	return connConfig{
+		codec:    JSONCodec{},
+		origin:   defaultOrigin(),
+		prefetch: 20,
+		observer: NopObserver{},
+	}
 }
 
 // ConnOption configures a connection.
@@ -183,8 +190,14 @@ func newConn(transport Transport, cfg connConfig) *Conn {
 		origin:    cfg.origin,
 		retry:     cfg.retry,
 		prefetch:  cfg.prefetch,
+		observer:  cfg.observer,
 	}
 }
+
+// Observer is where this connection reports what it does.
+func (c *Conn) Observer() Observer { return c.observer }
+
+var errNilObserver = errors.New("acemq: WithObserver was given no observer")
 
 // Codec is the codec this connection publishes with.
 func (c *Conn) Codec() Codec { return c.codec }

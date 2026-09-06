@@ -130,14 +130,18 @@ func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (Pu
 		Persistent:  p.persistent,
 		Mandatory:   p.mandatory,
 	})
+	labels := map[string]string{"exchange": p.exchange, "key": p.routingKey}
 	if err != nil {
+		p.conn.observer.Count(MetricPublishFailed, 1, labels)
 		return result, err
 	}
+	p.conn.observer.Count(MetricPublished, 1, labels)
 
 	// Reported as an error rather than left in the result, because a caller
 	// using Send never sees the result and would otherwise carry on believing
 	// the message went somewhere.
 	if p.mandatory && !result.Routed {
+		p.conn.observer.Count(MetricPublishFailed, 1, labels)
 		reason := result.ReturnReason
 		if reason == "" {
 			reason = "no queue is bound to receive it"

@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,6 +50,7 @@ type Handler[T any] func(ctx context.Context, m Message[T]) Ack
 // Consumer is a running subscription. Close it to stop.
 type Consumer struct {
 	conn      *Conn
+	queue     string
 	transport Subscription
 	work      chan Delivery
 	wg        sync.WaitGroup
@@ -57,6 +59,12 @@ type Consumer struct {
 
 	attemptsMu sync.Mutex
 	attempts   map[string]int
+	flight     int64
+}
+
+// inFlight adjusts and returns how many messages this consumer is handling.
+func (c *Consumer) inFlight(delta int64) int64 {
+	return atomic.AddInt64(&c.flight, delta)
 }
 
 type consumeConfig struct {
@@ -136,6 +144,7 @@ func Consume[T any](
 
 	c := &Consumer{
 		conn:     conn,
+		queue:    queue,
 		work:     make(chan Delivery, cfg.concurrency),
 		attempts: map[string]int{},
 	}
@@ -181,14 +190,24 @@ func handleDelivery[T any](
 	env := EnvelopeFromWire(d.Headers, d.RoutingKey, d.MessageID)
 	env.Attempt = c.attemptFor(env.ID, d.Redelivered)
 
+	observer := c.conn.observer
+	labels := map[string]string{"queue": c.queue}
+	observer.Count(MetricConsumed, 1, labels)
+	observer.Gauge(MetricInFlight, c.inFlight(1), labels)
+	defer observer.Gauge(MetricInFlight, c.inFlight(-1), labels)
+
 	var payload T
 	if err := cfg.codec.Decode(d.Body, &payload); err != nil {
 		// A body that will not decode decodes no better next time, so this is
 		// dead-lettered rather than retried.
+		observer.Count(MetricRejected, 1, labels)
+		observer.Count(MetricDeadLettered, 1, labels)
 		c.forget(env.ID)
 		c.nack(d, false)
 		return
 	}
+
+	started := time.Now()
 
 	ack := callHandler(ctx, handler, Message[T]{
 		Payload:     payload,
@@ -198,6 +217,8 @@ func handleDelivery[T any](
 		Redelivered: d.Redelivered,
 		Body:        d.Body,
 	})
+
+	observeConsume(observer, c.queue, ack, time.Since(started))
 
 	switch ack.action {
 	case ackAccept:
@@ -228,6 +249,7 @@ func handleDelivery[T any](
 			delay, again = 0, true
 		}
 		if !again {
+			observer.Count(MetricDeadLettered, 1, labels)
 			c.forget(env.ID)
 			c.nack(d, false)
 			return

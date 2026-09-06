@@ -108,6 +108,7 @@ A package per concern, with nothing at the module root:
 | `amqp/` | envelopes, codecs, publishing, consuming, retry, the in-memory transport. No dependencies outside the standard library. Named `acemq`. |
 | `rabbitmq/` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go`. |
 | `security/` | TLS modes, trusted authorities, credentials. No dependencies either. |
+| `patterns/` | request-reply, idempotency, outbox, ordering, pipelines, replay. |
 | `devcerts/` | development certificates, behind `cmd/acemq-certs`. |
 
 ## Security

@@ -91,6 +91,7 @@ The module is a package per concern, with nothing at its root:
 | `.../acemq-go-amqp/amqp` | envelopes, codecs, publishing, consuming, retry, the in-memory transport |
 | `.../acemq-go-amqp/rabbitmq` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go` |
 | `.../acemq-go-amqp/security` | TLS modes, trusted authorities, credentials |
+| `.../acemq-go-amqp/patterns` | request-reply, idempotency, outbox, ordering, pipelines, replay |
 | `.../acemq-go-amqp/devcerts` | development certificates, behind the `acemq-certs` command |
 
 The package in `amqp/` is named `acemq`, so the import carries the name:
@@ -137,6 +138,8 @@ elsewhere.
 - [Exchanges, queues and bindings](topology.md)
 - [Security](security.md) — TLS, trust and credentials
 - [Retries, redelivery and shutdown](reliability.md)
+- [Patterns](patterns.md) — request-reply, idempotency, outbox, ordering, replay
+- [Metrics and health](observability.md)
 - [Testing without a broker](testing.md)
 - [API reference](https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp) on
   pkg.go.dev

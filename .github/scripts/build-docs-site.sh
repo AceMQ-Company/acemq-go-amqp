@@ -139,6 +139,7 @@ NAV='<nav class="top">
       <a href="topology.html">Exchanges, queues and bindings</a>
       <a href="envelope.html">The envelope</a>
       <a href="testing.html">Testing without a broker</a>
+      <a href="patterns.html">Patterns</a>
     </div>
   </div>
 
@@ -148,6 +149,7 @@ NAV='<nav class="top">
       <a href="security.html">Security</a>
       <a href="reliability.html">Retries, redelivery, shutdown</a>
       <a href="serialization.html">Codecs</a>
+      <a href="observability.html">Metrics and health</a>
       <a href="licence.html">Licence</a>
     </div>
   </div>
