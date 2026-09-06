@@ -118,8 +118,12 @@ jobs:
             -v "$RUNNER_TEMP/certs:/certs:ro" \
             -v "$RUNNER_TEMP/certs/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
             rabbitmq:4-alpine
+          # --since bounds this to the current boot. A restarted container
+          # still carries the previous boot's startup line, and without the
+          # bound the check passes against a broker that is not up.
+          started=$(date -u +%Y-%m-%dT%H:%M:%S)
           for i in $(seq 1 60); do
-            if docker logs acemq-tls 2>&1 | grep -q "Server startup complete"; then
+            if docker logs --since "$started" acemq-tls 2>&1 | grep -q "Server startup complete"; then
               echo "the broker is up"
               exit 0
             fi
@@ -130,33 +134,66 @@ jobs:
           exit 1
 
       - name: Test against it
+        # Run once, and judge that run. Running it twice races the restart the
+        # recovery test performs — the same mistake ci.yml made and this file
+        # inherited, which is why a good release failed its own integration job.
         env:
           ACEMQ_TEST_AMQPS_URL: amqps://guest:guest@localhost:5671/
           ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
           ACEMQ_TEST_CA: ${{ runner.temp }}/certs/ca.crt
-        run: go test -race -count=1 -v ./rabbitmq/
+          ACEMQ_TEST_RESTARTABLE_CONTAINER: acemq-tls
+          ACEMQ_TEST_RESTARTABLE_URL: amqp://guest:guest@localhost:5672/
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v ./rabbitmq/ 2>&1 | tee "$RUNNER_TEMP/broker-tests.log"
 
       - name: Check nothing skipped
-        env:
-          ACEMQ_TEST_AMQPS_URL: amqps://guest:guest@localhost:5671/
-          ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
-          ACEMQ_TEST_CA: ${{ runner.temp }}/certs/ca.crt
         run: |
-          output=$(go test -count=1 -v ./rabbitmq/ 2>&1)
-          if echo "$output" | grep -q -- "--- SKIP"; then
+          log="$RUNNER_TEMP/broker-tests.log"
+          if grep -q -- "--- SKIP" "$log"; then
             echo "::error::a broker test skipped during a release"
-            echo "$output" | grep -- "--- SKIP"
+            grep -- "--- SKIP" "$log"
             exit 1
           fi
+          passed=$(grep -c -- "--- PASS" "$log" || true)
+          if [ "$passed" -lt 23 ]; then
+            echo "::error::only $passed broker tests passed; expected at least 23"
+            exit 1
+          fi
+          echo "$passed broker tests passed"
 
   notify:
     needs: [verify, integration]
-    if: always() && (needs.verify.result == 'failure' || needs.integration.result == 'failure')
+    if: always()
     uses: AceMQ-Company/acemq-java-amqp/.github/workflows/slack-notify.yml@main
     with:
-      status: failure
-      title: "AceMQ for Go release FAILED"
-      message: "The tag is pushed but did not verify. The module proxy may already be serving it."
+      status: >-
+        ${{ (needs.verify.result == 'success' && needs.integration.result == 'success')
+            && 'success' || 'failure' }}
+      # Not "FAILED". Go publishes by tag, so by the time this runs the version
+      # is already on the module proxy and consumers can resolve it — the
+      # release is out. What failed is the checking, and calling that a failed
+      # release sends somebody looking for a broken artifact that does not
+      # exist. The Java and .NET libraries word it the same way.
+      title: >-
+        ${{ (needs.verify.result == 'success' && needs.integration.result == 'success')
+            && format('AceMQ for Go {0} released', github.ref_name)
+            || format('AceMQ for Go {0} is published but the release did not finish', github.ref_name) }}
+      message: >-
+        ${{ (needs.verify.result == 'success' && needs.integration.result == 'success')
+            && 'The module is on the proxy and pkg.go.dev. Consumers need nothing but go get.'
+            || 'The tag is pushed and the proxy may already be serving it, so consumers can resolve this version, but a check did not pass. A Go tag cannot be withdrawn once cached — review the run before announcing it.' }}
+      # Roadworks rather than a red dot for the half-finished case: the release
+      # is usable and unfinished, which is a different thing from broken and
+      # reads differently at a glance.
+      #
+      # Both branches name an emoji. Leaving the success branch empty to fall
+      # back on the status-derived tick does not work: in GitHub's expression
+      # language `a && '' || b` yields b, because an empty string is falsy, so
+      # every successful release would be announced with roadworks.
+      icon: >-
+        ${{ (needs.verify.result == 'success' && needs.integration.result == 'success')
+            && ':white_check_mark:' || ':construction:' }}
       url: https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp
     secrets:
       SLACK_DELIVERY_WEBHOOK: ${{ secrets.SLACK_DELIVERY_WEBHOOK }}
