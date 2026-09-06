@@ -1,5 +1,15 @@
 # AceMQ for Go
 
+[![ci](https://github.com/AceMQ-Company/acemq-go-amqp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/AceMQ-Company/acemq-go-amqp/actions/workflows/ci.yml)
+[![release](https://github.com/AceMQ-Company/acemq-go-amqp/actions/workflows/release.yml/badge.svg)](https://github.com/AceMQ-Company/acemq-go-amqp/actions/workflows/release.yml)
+[![authorship guard](https://github.com/AceMQ-Company/acemq-go-amqp/actions/workflows/attribution-guard.yml/badge.svg?branch=main)](https://github.com/AceMQ-Company/acemq-go-amqp/actions/workflows/attribution-guard.yml)
+[![version](https://img.shields.io/badge/version-0.1.0-blue)](https://github.com/AceMQ-Company/acemq-go-amqp/releases)
+[![reference](https://img.shields.io/badge/reference-pkg.go.dev-blue)](https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp)
+[![docs](https://img.shields.io/badge/docs-acemq.org-blue)](https://acemq.org/acemq-go-amqp/)
+[![license](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8)](#what-is-in-the-box)
+[![brokers](https://img.shields.io/badge/broker-RabbitMQ-lightgrey)](#what-is-in-the-box)
+
 A Go client for AceMQ messaging over AMQP, speaking the same wire contract as
 the [Java](https://github.com/AceMQ-Company/acemq-java-amqp) and
 [.NET](https://github.com/AceMQ-Company/acemq-dotnet-amqp) libraries: the same
