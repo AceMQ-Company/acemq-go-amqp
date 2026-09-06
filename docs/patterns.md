@@ -203,11 +203,21 @@ Messages the filter declines stay where they are. Each replayed message is
 stamped `acemq-replayed-from`, `acemq-replayed-at` and `acemq-replay-count`, so a
 consumer that needs to treat them differently can.
 
-**How it knows when to stop.** Leaving a message in place means returning it, and
-a returned message comes straight back — so a naive replay loops for ever. It
-remembers the identifiers it has seen: the second sighting means the queue has
-come full circle and everything left has been considered. An idle timer is the
-second answer, for a queue somebody is still writing to.
+**How it knows when to stop.** It reads the queue a message at a time and stops
+when the broker has nothing left to hand over.
+
+Messages the filter declines are held unacknowledged until the pass ends, and
+returned together at the end. Returning one immediately does not work: RabbitMQ
+puts a returned message back where it was, at the head of the queue, so the next
+read is handed the same message again and everything behind it is never looked
+at — a selective replay that silently stops at the first message it declines.
+Holding them takes them out of the way for the length of the pass, and the
+broker still has them, so a replay that dies half way through returns them
+rather than losing them.
+
+A message is acknowledged only after the broker has confirmed the new copy. A
+crash in that gap replays it twice, which is the right way round for a
+dead-letter queue.
 
 Bodies are read as bytes, not through the connection's codec. A body that will
 not decode is exactly the kind that ends up in a dead-letter queue.

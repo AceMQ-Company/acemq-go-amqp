@@ -26,6 +26,7 @@ import (
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+	"github.com/AceMQ-Company/acemq-go-amqp/patterns"
 	"github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
 	amqp091 "github.com/rabbitmq/amqp091-go"
 )
@@ -857,5 +858,70 @@ func TestCountingAndDeletingAQueueOnARealBroker(t *testing.T) {
 	}
 	if err := mq.DeclareQueue(ctx, queue); err != nil {
 		t.Fatalf("the connection did not survive: %v", err)
+	}
+}
+
+// TestReplayTakesEveryMatchOnARealBroker is the difference between a replay
+// somebody can trust and one that quietly stops early.
+//
+// A message the filter declines is put back, and RabbitMQ puts it back where it
+// was — at the head of the queue. A replay that read the queue by consuming it
+// would then be handed that same message again immediately, decide it had come
+// full circle, and stop with everything behind it unexamined.
+func TestReplayTakesEveryMatchOnARealBroker(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	queue := queueName(t)
+	dead := queue + "-dead"
+	removeAtEnd(t, []string{queue, dead}, nil)
+
+	for _, q := range []string{queue, dead} {
+		if err := mq.DeclareQueue(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	publisher := acemq.NewPublisher[OrderPlaced](mq, "", dead)
+	for _, id := range []string{"keep-1", "drop-1", "keep-2", "drop-2", "keep-3"} {
+		if err := publisher.Send(ctx, OrderPlaced{OrderID: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := patterns.Replay(ctx, mq, patterns.ReplayFrom{
+		Queue:      dead,
+		RoutingKey: queue,
+		Limit:      10,
+		Filter: func(_ acemq.Envelope, body []byte) bool {
+			return strings.Contains(string(body), "keep")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.Moved != 3 {
+		t.Errorf("moved %d of the 3 that matched (%s)", result.Moved, result)
+	}
+	if result.Skipped != 2 {
+		t.Errorf("skipped %d, want the 2 that did not match (%s)", result.Skipped, result)
+	}
+
+	// The ones it declined are still there, not lost.
+	waitFor(t, "the declined messages to be back on the queue", func() bool {
+		count, err := mq.MessageCount(ctx, dead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return count == 2
+	})
+
+	// And the ones it moved arrived.
+	count, err := mq.MessageCount(ctx, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Errorf("%d messages were replayed onto %s, want 3", count, queue)
 	}
 }

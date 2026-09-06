@@ -16,9 +16,7 @@ package patterns
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
@@ -112,141 +110,97 @@ func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (ReplayResul
 		defer cancel()
 	}
 
-	var (
-		mu       sync.Mutex
-		result   ReplayResult
-		finished = make(chan struct{})
-		closed   sync.Once
+	var result ReplayResult
 
-		// seen is how a replay knows it has finished.
-		//
-		// A message this replay declines — filtered out, or past the limit — is
-		// left in the queue, and leaving it means returning it, and a returned
-		// message comes straight back. Without a memory that is an infinite
-		// loop: the same messages go round for ever and the replay never ends.
-		//
-		// Seeing an identifier twice means the queue has come full circle and
-		// everything left has been considered. That is a real end, not a guess.
-		seen = map[string]bool{}
+	// Messages the filter declines are held, not returned one at a time.
+	//
+	// Returning one immediately is what an earlier version did, and it does not
+	// work: RabbitMQ puts a returned message back where it was, at the head of
+	// the queue, so the next read hands back the same message and everything
+	// behind it is never looked at. Holding them unacknowledged takes them out
+	// of the way for the length of the pass; the broker keeps them, so a crash
+	// half way through returns them rather than losing them.
+	var declined []*acemq.Pulled
+	defer func() {
+		for _, message := range declined {
+			// Nothing to report: the pass is over, and a message that cannot be
+			// returned is one the broker will return itself when this
+			// connection closes.
+			_ = message.Nack(true)
+		}
+	}()
 
-		// idle is the second answer, for a queue somebody is still writing to,
-		// where the identifiers never repeat. AMQP has no "that was the last
-		// one", so silence has to stand in for it.
-		idle = time.NewTimer(2 * time.Second)
-	)
-	defer idle.Stop()
-
-	stop := func(reason string) {
-		closed.Do(func() {
-			mu.Lock()
-			if result.Reason == "" {
-				result.Reason = reason
+	for {
+		if err := ctx.Err(); err != nil {
+			result.Reason = "cancelled"
+			if from.Deadline > 0 {
+				result.Reason = "deadline"
 			}
-			mu.Unlock()
-			close(finished)
+			return result, nil
+		}
+
+		if from.Limit > 0 && result.Moved >= from.Limit {
+			result.Reason = "limit"
+			return result, nil
+		}
+
+		message, found, err := conn.Pull(ctx, from.Queue)
+		if err != nil {
+			result.Reason = "failed"
+			return result, fmt.Errorf("acemq: cannot read %q to replay it: %w", from.Queue, err)
+		}
+		if !found {
+			// Everything available has been offered. What is left is what this
+			// pass declined, and it goes back when the pass ends.
+			result.Reason = "drained"
+			return result, nil
+		}
+
+		if from.Filter != nil && !from.Filter(message.Envelope, message.Body) {
+			result.Skipped++
+			declined = append(declined, message)
+			continue
+		}
+
+		routingKey := from.RoutingKey
+		if routingKey == "" {
+			routingKey = message.RoutingKey
+		}
+
+		headers := message.Envelope.ToWire()
+		headers[HeaderReplayedFrom] = from.Queue
+		headers[HeaderReplayedAt] = time.Now().UTC().Format(time.RFC3339)
+		headers[HeaderReplayCount] = replayCount(message.Envelope) + 1
+
+		_, err = conn.PublishRaw(ctx, from.Exchange, routingKey, acemq.Outbound{
+			Body:        message.Body,
+			ContentType: message.ContentType,
+			MessageID:   message.Envelope.ID,
+			Headers:     headers,
+			Persistent:  true,
 		})
+		if err != nil {
+			// Returned rather than dropped, and the replay stops. A replay that
+			// loses messages is worse than one that stops early.
+			_ = message.Nack(true)
+			result.Reason = "failed"
+			return result, fmt.Errorf(
+				"acemq: cannot republish a message from %q: %w", from.Queue, err)
+		}
+
+		// Acknowledged only after the broker has confirmed the new copy, so a
+		// failure between the two leaves the message where it was. The cost is
+		// that a crash in the gap replays it twice, which is the right way round
+		// for a dead-letter queue.
+		if err := message.Ack(); err != nil {
+			result.Reason = "failed"
+			return result, fmt.Errorf(
+				"acemq: a message was replayed but could not be acknowledged, "+
+					"so it is still on %q and will be replayed again: %w", from.Queue, err)
+		}
+		result.Moved++
 	}
-
-	// Read as bytes rather than through the connection's codec: these messages
-	// are going back out unchanged, and a body that will not decode is exactly
-	// the kind that ends up in a dead-letter queue.
-	consumer, err := acemq.Consume(ctx, conn, from.Queue,
-		func(ctx context.Context, m acemq.Message[[]byte]) acemq.Ack {
-			idle.Reset(2 * time.Second)
-
-			mu.Lock()
-			if seen[m.Envelope.ID] {
-				// Round the queue once. Everything still here has been offered
-				// and declined, so there is nothing left to do.
-				mu.Unlock()
-				stop("drained")
-				return acemq.Retry(errReplayFinished)
-			}
-			seen[m.Envelope.ID] = true
-
-			if from.Limit > 0 && result.Moved >= from.Limit {
-				mu.Unlock()
-				stop("limit")
-				// Left where it was: the replay is over and this message was
-				// not part of it.
-				return acemq.Retry(errReplayFinished)
-			}
-			mu.Unlock()
-
-			if from.Filter != nil && !from.Filter(m.Envelope, m.Body) {
-				mu.Lock()
-				result.Skipped++
-				mu.Unlock()
-				// Not taken, so it stays. Rejecting would drop it, which is the
-				// opposite of what declining to replay means.
-				return acemq.Retry(errNotSelected)
-			}
-
-			routingKey := from.RoutingKey
-			if routingKey == "" {
-				routingKey = m.RoutingKey
-			}
-
-			headers := m.Envelope.ToWire()
-			headers[HeaderReplayedFrom] = from.Queue
-			headers[HeaderReplayedAt] = time.Now().UTC().Format(time.RFC3339)
-			headers[HeaderReplayCount] = replayCount(m.Envelope) + 1
-
-			_, err := conn.PublishRaw(ctx, from.Exchange, routingKey, acemq.Outbound{
-				Body:        m.Body,
-				ContentType: m.ContentType,
-				MessageID:   m.Envelope.ID,
-				Headers:     headers,
-				Persistent:  true,
-			})
-			if err != nil {
-				// Left in place. A replay that loses messages is worse than one
-				// that stops early.
-				stop("failed")
-				return acemq.Retry(err)
-			}
-
-			mu.Lock()
-			result.Moved++
-			reached := from.Limit > 0 && result.Moved >= from.Limit
-			mu.Unlock()
-
-			if reached {
-				stop("limit")
-			}
-			return acemq.Accept()
-		}, acemq.Prefetch(1), acemq.ConsumeWith(acemq.BytesCodec{}))
-	if err != nil {
-		return result, fmt.Errorf("acemq: cannot read %q to replay it: %w", from.Queue, err)
-	}
-
-	select {
-	case <-finished:
-	case <-idle.C:
-		stop("drained")
-	case <-ctx.Done():
-		stop("cancelled")
-	}
-
-	if err := consumer.Close(); err != nil {
-		return result, err
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if result.Reason == "cancelled" && from.Deadline > 0 {
-		result.Reason = "deadline"
-	}
-	return result, nil
 }
-
-// errReplayFinished and errNotSelected are returned to leave a message where it
-// is. They are values rather than new errors each time so that a retry policy
-// counting them sees the same thing, and so nothing allocates in the loop.
-var (
-	errReplayFinished = errors.New("acemq: the replay has finished; this message was left in place")
-	errNotSelected    = errors.New("acemq: not selected for replay; left in place")
-)
 
 func replayCount(env acemq.Envelope) int {
 	switch v := env.Headers[HeaderReplayCount].(type) {
