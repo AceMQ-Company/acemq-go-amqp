@@ -124,7 +124,7 @@ jobs:
             -v "$RUNNER_TEMP/certs:/certs:ro" \
             -v "$RUNNER_TEMP/certs/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
             rabbitmq:4-alpine
-          # The broker's own word for it.
+          # The broker's own word for it, from this boot only.
           #
           # A TCP connect is not enough: Docker publishes the port as soon as
           # the container starts, so a connection succeeds — and is then reset —
@@ -135,10 +135,16 @@ jobs:
           # rabbitmq-diagnostics is no good either: it needs the Erlang cookie
           # and cannot authenticate to its own node here, so it reports a CLI
           # problem as a broker problem.
+          #
+          # --since bounds it to this boot. Without that, a container that has
+          # been restarted still has the previous boot's startup line in its
+          # log and the check passes immediately against a broker that is not
+          # up yet.
+          started=$(date -u +%Y-%m-%dT%H:%M:%S)
           for i in $(seq 1 60); do
-            if docker logs acemq-tls 2>&1 | grep -q "Server startup complete"; then
+            if docker logs --since "$started" acemq-tls 2>&1 | grep -q "Server startup complete"; then
               echo "the broker is up"
-              docker logs acemq-tls 2>&1 | grep -E "started (TCP|TLS) listener"
+              docker logs --since "$started" acemq-tls 2>&1 | grep -E "started (TCP|TLS) listener"
               exit 0
             fi
             sleep 3
@@ -148,33 +154,36 @@ jobs:
           exit 1
 
       - name: Test over TLS and plaintext together
-        # The generated configuration keeps the plaintext listener open beside
-        # the TLS one, so both halves of the transport suite run against the
-        # same broker and nothing is left skipping.
+        # Run once, and judge that run. It used to run twice — once for the
+        # result and once to count skips — which broke as soon as a test
+        # restarted the broker: the second run raced the restart and every test
+        # after it failed to connect.
         env:
           ACEMQ_TEST_AMQPS_URL: amqps://guest:guest@localhost:5671/
           ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
           ACEMQ_TEST_CA: ${{ runner.temp }}/certs/ca.crt
-        run: go test -race -count=1 -v ./rabbitmq/
+          # The recovery test restarts this container, which is why it needs a
+          # broker of its own rather than a shared one.
+          ACEMQ_TEST_RESTARTABLE_CONTAINER: acemq-tls
+          ACEMQ_TEST_RESTARTABLE_URL: amqp://guest:guest@localhost:5672/
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v ./rabbitmq/ 2>&1 | tee "$RUNNER_TEMP/broker-tests.log"
 
       - name: Check nothing skipped
-        # Every one of these skips when its variables are unset, and a skip
-        # reads as success. Without this, losing a variable would silently stop
-        # testing TLS at all.
-        env:
-          ACEMQ_TEST_AMQPS_URL: amqps://guest:guest@localhost:5671/
-          ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
-          ACEMQ_TEST_CA: ${{ runner.temp }}/certs/ca.crt
+        # Every broker test skips when its variables are unset, and a skip reads
+        # as success. Without this, losing one would silently stop testing
+        # against a broker at all.
         run: |
-          output=$(go test -count=1 -v ./rabbitmq/ 2>&1)
-          if echo "$output" | grep -q -- "--- SKIP"; then
+          log="$RUNNER_TEMP/broker-tests.log"
+          if grep -q -- "--- SKIP" "$log"; then
             echo "::error::a broker test skipped while a broker was running"
-            echo "$output" | grep -- "--- SKIP"
+            grep -- "--- SKIP" "$log"
             exit 1
           fi
-          passed=$(echo "$output" | grep -c -- "--- PASS" || true)
-          if [ "$passed" -lt 22 ]; then
-            echo "::error::only $passed broker tests passed; expected at least 22"
+          passed=$(grep -c -- "--- PASS" "$log" || true)
+          if [ "$passed" -lt 23 ]; then
+            echo "::error::only $passed broker tests passed; expected at least 23"
             exit 1
           fi
           echo "$passed broker tests passed"
