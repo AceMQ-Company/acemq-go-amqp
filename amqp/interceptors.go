@@ -317,7 +317,7 @@ func PullInto[T any](ctx context.Context, conn *Conn, queue string) (*Pulled, T,
 // Set at release time. It goes back to "dev" on the main branch after a
 // release, so a build from source never claims to be a version somebody could
 // look up.
-const Version = "0.1.3"
+const Version = "0.1.4"
 
 var errNilInterceptor = errorString("acemq: the interceptor is nil")
 
