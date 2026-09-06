@@ -9,7 +9,7 @@ module github.com/AceMQ-Company/acemq-go-amqp/patterns/sqltest
 go 1.25.0
 
 require (
-	github.com/AceMQ-Company/acemq-go-amqp v0.0.0
+	github.com/AceMQ-Company/acemq-go-amqp v0.1.0
 	modernc.org/sqlite v1.58.0
 )
 

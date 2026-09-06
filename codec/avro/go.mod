@@ -4,7 +4,7 @@ module github.com/AceMQ-Company/acemq-go-amqp/codec/avro
 go 1.23.0
 
 require (
-	github.com/AceMQ-Company/acemq-go-amqp v0.0.0
+	github.com/AceMQ-Company/acemq-go-amqp v0.1.0
 	github.com/hamba/avro/v2 v2.30.0
 )
 
