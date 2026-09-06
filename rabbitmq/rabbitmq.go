@@ -559,7 +559,7 @@ func (t *Transport) Consume(
 
 	// autoAck is false throughout: a message is acknowledged when the handler
 	// says so and not before, which is the whole point of returning an Ack.
-	deliveries, err := ch.Consume(queue, tag, false, false, false, false, nil)
+	deliveries, err := ch.Consume(queue, tag, false, false, false, false, amqp.Table(spec.Args))
 	if err != nil {
 		_ = ch.Close()
 		return nil, fmt.Errorf("acemq: cannot consume from %q: %w", queue, err)
@@ -659,7 +659,7 @@ func (s *subscription) reattach(_ context.Context, t *Transport) error {
 		return fmt.Errorf("acemq: cannot set prefetch on %q after reconnecting: %w", queue, err)
 	}
 
-	deliveries, err := ch.Consume(queue, tag, false, false, false, false, nil)
+	deliveries, err := ch.Consume(queue, tag, false, false, false, false, amqp.Table(spec.Args))
 	if err != nil {
 		_ = ch.Close()
 		return fmt.Errorf("acemq: cannot consume from %q after reconnecting: %w", queue, err)

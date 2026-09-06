@@ -73,6 +73,7 @@ type consumeConfig struct {
 	prefetch    int
 	concurrency int
 	tag         string
+	args        map[string]any
 }
 
 // ConsumeOption configures a consumer.
@@ -100,6 +101,19 @@ func Prefetch(n int) ConsumeOption {
 // that spend their time waiting on something else.
 func Concurrency(n int) ConsumeOption {
 	return func(cfg *consumeConfig) { cfg.concurrency = n }
+}
+
+// ConsumeArg sets a broker-specific consumer argument.
+//
+// Needed for a stream, which says where to start reading with x-stream-offset,
+// and for anything else a broker offers that this library does not name.
+func ConsumeArg(name string, value any) ConsumeOption {
+	return func(cfg *consumeConfig) {
+		if cfg.args == nil {
+			cfg.args = map[string]any{}
+		}
+		cfg.args[name] = value
+	}
 }
 
 // ConsumerTag names this consumer to the broker, which is what shows up in the
@@ -166,6 +180,7 @@ func Consume[T any](
 	sub, err := conn.transport.Consume(ctx, queue, ConsumeSpec{
 		Prefetch: cfg.prefetch,
 		Tag:      cfg.tag,
+		Args:     cfg.args,
 	}, func(d Delivery) {
 		c.work <- d
 	})

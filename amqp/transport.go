@@ -93,6 +93,10 @@ type ConsumeSpec struct {
 
 	// Tag names the consumer to the broker. Generated when empty.
 	Tag string
+
+	// Args are broker-specific consumer arguments, such as the x-stream-offset
+	// a stream consumer needs to say where it starts.
+	Args map[string]any
 }
 
 // PublishResult is what the broker said about a published message.

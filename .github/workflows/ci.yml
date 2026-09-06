@@ -39,6 +39,18 @@ jobs:
       - name: Test
         run: go test -race -count=1 ./...
 
+      - name: Check the library still builds on the Go it claims
+        # The nested module must not drag the parent's floor up with it. This
+        # already happened once: go mod tidy took the root to 1.25 and silently
+        # broke the promise the whole API design rests on.
+        run: |
+          declared=$(grep -E "^go [0-9]" go.mod | awk '{print $2}')
+          if [ "$declared" != "1.23" ]; then
+            echo "::error::go.mod says go $declared; this module targets 1.23"
+            exit 1
+          fi
+          echo "go.mod still targets $declared"
+
       - name: Check that go.mod and go.sum are tidy
         run: |
           go mod tidy
@@ -63,6 +75,15 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race -count=1 ./...
+
+      - name: Test the database-backed stores
+        # A module of its own, and only this job can build it: the pure-Go
+        # SQLite driver needs a newer Go than the library targets, and raising
+        # the library's floor to test three files would cost every user of it
+        # the thing that floor is there for.
+        run: |
+          cd patterns/sqltest
+          go test -race -count=1 ./...
 
   integration:
     # One broker, both listeners, the whole transport suite.
