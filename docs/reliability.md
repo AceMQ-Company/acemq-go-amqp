@@ -47,6 +47,44 @@ the message and falls back to rejecting it:
 acemq.NewTopology().Queue("orders").DeadLetters("orders")
 ```
 
+That one call declares more than the two queues. It also declares the shared
+`acemq.dlx` exchange, binds `orders.dlq` and `orders.parked` to it on their own
+names, and declares `orders` itself with
+
+| argument | value |
+|---|---|
+| `x-dead-letter-exchange` | `acemq.dlx` |
+| `x-dead-letter-routing-key` | `orders.dlq` |
+
+which is the same table Java, .NET, Python and Ruby write. It has to be, because
+it is part of the declaration of `orders`: two services consuming that queue both
+declare it, and a disagreement about these arguments is answered with
+`PRECONDITION_FAILED` — the second service cannot consume at all. The routing key
+matters as much as the exchange, because a dead-lettered message keeps the key it
+arrived under, and a message reaching `acemq.dlx` under `order.placed` matches no
+binding and is dropped.
+
+### Two paths, and why both
+
+The broker-side route is a backstop, not a replacement for the republish above.
+The library's own path carries the reason and chooses the destination; it runs
+whenever a handler returns and the consumer decides. The broker's runs for what
+the library never sees:
+
+- a message expiring against the source queue's own `x-message-ttl`
+- a message dropped because `x-max-length` was reached
+- a rejection from something that is not this library — another service, a
+  management console, a script
+
+Without the arguments on the source queue, all three are discarded silently.
+Both paths end in the same `{queue}.dlq`, which is the point: an operator draining
+dead letters looks in one place regardless of which one put the message there.
+
+A service that wants its own dead-letter exchange uses `acemq.DeadLetterTo` and
+leaves `DeadLetters` alone. Asking for both on one queue is refused rather than
+resolved — either answer would be a guess about which of two conflicting
+instructions was meant.
+
 ## A policy
 
 Without one, a message returned by `Retry` is republished at once with nothing to

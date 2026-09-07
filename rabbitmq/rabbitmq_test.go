@@ -1152,3 +1152,176 @@ func TestReplayTakesEveryMatchOnARealBroker(t *testing.T) {
 		t.Errorf("%d messages were replayed onto %s, want 3", count, queue)
 	}
 }
+
+// TestTheSourceQueueIsDeclaredIdenticallyInEveryLanguage puts the source queue's
+// own argument table in front of a real broker.
+//
+// This is the declaration two services actually collide on. An orders queue is
+// consumed by a Go service and a Python one, both of them declare orders, and
+// AMQP resolves a disagreement about arguments by refusing the second declarer
+// with PRECONDITION_FAILED — so the service that started second cannot consume
+// at all. The test declares the topology from this library, then declares the
+// same queue again from a second connection using the table the Python, Ruby,
+// .NET and Java libraries write, and requires the broker to accept it. The
+// second half is the same declaration with one argument changed, which has to be
+// refused: without that, an accepted declaration would prove only that the
+// broker was not looking.
+func TestTheSourceQueueIsDeclaredIdenticallyInEveryLanguage(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+
+	queue := queueName(t)
+	dlq := acemq.DeadLetterQueue(queue)
+	parked := acemq.ParkedQueue(queue)
+	// The two AceMQ exchanges are shared by every queue on the broker and are
+	// deliberately left behind: deleting acemq.dlx at the end of one test would
+	// unbind the dead letters of every other service using the same broker.
+	removeAtEnd(t, []string{queue, dlq, parked}, nil)
+
+	topology := acemq.NewTopology().Queue(queue).DeadLetters(queue)
+
+	// Printed whole so it can be put beside the other four libraries' by eye:
+	// every queue, both exchanges, every binding, and the arguments on the
+	// source queue.
+	plan, err := topology.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("the topology this library declares for %s:", queue)
+	for _, action := range plan {
+		t.Logf("  %s", action)
+	}
+
+	if err := topology.Apply(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+
+	// What every other AceMQ library writes for this queue, spelled out here
+	// rather than taken from the constants, so that a change to the constants
+	// cannot quietly change what this claims to be compatible with.
+	python := amqp091.Table{
+		"x-dead-letter-exchange":    "acemq.dlx",
+		"x-dead-letter-routing-key": queue + ".dlq",
+	}
+
+	conn, err := amqp091.Dial(brokerURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// A channel of its own for each declaration: a refused declaration kills the
+	// channel it was made on, so sharing one would make the second failure a
+	// consequence of the first.
+	agreeing, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = agreeing.Close() }()
+
+	if _, err := agreeing.QueueDeclare(queue, true, false, false, false, python); err != nil {
+		t.Fatalf("a second service declaring %s the way the other four libraries do was "+
+			"refused: %v", queue, err)
+	}
+	t.Logf("a second connection declared %s with %v and the broker accepted it", queue, python)
+
+	// And one argument different is refused, which is what would happen to the
+	// second of two services if this table ever drifted again.
+	disagreeing, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = disagreeing.Close() }()
+
+	_, err = disagreeing.QueueDeclare(queue, true, false, false, false, amqp091.Table{
+		"x-dead-letter-exchange":    "acemq.dlx",
+		"x-dead-letter-routing-key": queue + ".dead",
+	})
+	if err == nil {
+		t.Fatal("the broker accepted a different dead-letter routing key for the same queue, " +
+			"which means these arguments are not what makes two services agree")
+	}
+	if !strings.Contains(err.Error(), "PRECONDITION_FAILED") {
+		t.Errorf("the broker refused with %v, want PRECONDITION_FAILED", err)
+	}
+	t.Logf("the same queue with x-dead-letter-routing-key=%s.dead was refused: %v", queue, err)
+}
+
+// TestSomethingElseRejectingAMessageStillReachesTheDeadLetterQueue is the
+// backstop working.
+//
+// This library never takes this path: a consumer that gives up republishes to
+// {queue}.dlq with the reason in x-acemq-error and acknowledges the original,
+// which is the only way the reason survives. The broker-side route exists for
+// what the library never sees — a message expiring against the source queue's
+// own time-to-live, one dropped by x-max-length, or as here a rejection from a
+// consumer that is not this library at all. Without the two arguments on the
+// source queue those messages are discarded and nothing anywhere records that
+// they existed.
+//
+// It also proves the routing key is doing its job. The message arrives on the
+// source queue under the queue's own name, so a dead-letter route that did not
+// override the key would deliver it to acemq.dlx as that name, match no binding
+// and drop it — which looks exactly like dead-lettering that was never
+// configured.
+func TestSomethingElseRejectingAMessageStillReachesTheDeadLetterQueue(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+
+	queue := queueName(t)
+	dlq := acemq.DeadLetterQueue(queue)
+	removeAtEnd(t, []string{queue, dlq, acemq.ParkedQueue(queue)}, nil)
+
+	if err := acemq.NewTopology().Queue(queue).DeadLetters(queue).Apply(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := acemq.NewPublisher[OrderPlaced](mq, "", queue).
+		Send(ctx, OrderPlaced{OrderID: "o-1"}, acemq.MessageID("m-1")); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := amqp091.Dial(brokerURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	var delivery amqp091.Delivery
+	waitFor(t, "the message to reach "+queue, func() bool {
+		d, ok, err := ch.Get(queue, false)
+		if err != nil || !ok {
+			return false
+		}
+		delivery = d
+		return true
+	})
+
+	// A plain AMQP consumer, rejecting without requeue. Nothing about this knows
+	// AceMQ exists.
+	if err := delivery.Nack(false, false); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the broker to dead-letter it into "+dlq, func() bool {
+		n, err := mq.MessageCount(ctx, dlq)
+		return err == nil && n == 1
+	})
+
+	dead, found, err := mq.Pull(ctx, dlq)
+	if err != nil || !found {
+		t.Fatalf("Pull: %v, found=%v", err, found)
+	}
+	defer func() { _ = dead.Ack() }()
+
+	if dead.Envelope.ID != "m-1" {
+		t.Errorf("the message in %s is %q, not the one that was rejected",
+			dlq, dead.Envelope.ID)
+	}
+	t.Logf("a rejection from something that is not this library reached %s by itself", dlq)
+}

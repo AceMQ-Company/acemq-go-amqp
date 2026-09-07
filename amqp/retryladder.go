@@ -21,26 +21,39 @@ import (
 	"time"
 )
 
-// RetryExchange is the exchange a rung dead-letters through on its way back to
-// the queue the message came from.
+// The two exchanges this library owns rather than the caller.
 //
-// This constant, and [retryReturn] beside it, are the only two places that
-// decide how an expired rung message gets home. That is deliberate. The five
-// AceMQ libraries do not yet agree: Java — the oldest and the one most of the
-// released code follows — declares this named exchange and binds each source
-// queue to it, while the Python and Ruby libraries dead-letter through the
-// default exchange instead, which routes by queue name and so needs no exchange
-// and no binding at all. Both work. Only one can be right, because two services
-// consuming the same queue declare the same rung by name, and a rung declared
-// with different arguments answers the second service PRECONDITION_FAILED and
-// gives it no way to consume.
+// Both are declared direct and durable, because every binding on them matches a
+// queue name exactly and a topology that vanished with the broker would leave
+// queues dead-lettering into nothing. They are shared: one of each per broker,
+// however many queues use them, which is why the code that adds them checks
+// whether they are already there rather than declaring one per queue.
 //
-// Until that is settled, this library follows Java. Changing sides is an edit
-// to these few lines and nothing else: set RetryExchange to the empty string,
-// and [RetryLadder.Declare] stops declaring an exchange and stops binding,
-// because the default exchange already carries every queue's own name as a
-// routing key.
-const RetryExchange = "acemq.retry"
+// The names are a cross-language contract, not a preference. Java, .NET,
+// Python, Ruby and this library all name these two exchanges, and a queue
+// pointed at a different one is a queue whose messages a colleague cannot find.
+const (
+	// RetryExchange is the exchange a rung dead-letters through on its way back
+	// to the queue the message came from, bound on that queue's own name.
+	//
+	// This constant, and [retryReturn] beside it, are the only two places that
+	// decide how an expired rung message gets home. Python and Ruby once
+	// dead-lettered a rung through the default exchange instead, which routes by
+	// queue name and so needs no exchange and no binding at all; that works, but
+	// two libraries cannot both be right about one queue, and most of the
+	// released code follows Java. All five now name this one.
+	RetryExchange = "acemq.retry"
+
+	// DeadLetterExchange is the exchange {queue}.dlq and {queue}.parked are
+	// reached through, each bound on its own name.
+	//
+	// It is also where a source queue's own x-dead-letter-exchange points, which
+	// is the argument that has to match across languages: two services consuming
+	// orders declare orders, and a declaration that disagrees about this
+	// argument answers the second one PRECONDITION_FAILED and leaves it unable
+	// to consume at all. See [Topology.DeadLetters].
+	DeadLetterExchange = "acemq.dlx"
+)
 
 // The arguments that make a queue a rung.
 //

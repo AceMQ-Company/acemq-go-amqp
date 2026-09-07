@@ -15,7 +15,7 @@ Durable by default. Options:
 | `acemq.Transient()` | does not survive a broker restart |
 | `acemq.AutoDelete()` | removed when its last consumer goes away |
 | `acemq.Exclusive()` | only this connection can use it |
-| `acemq.DeadLetterTo(exchange)` | where rejected messages go |
+| `acemq.DeadLetterTo(exchange)` | a dead-letter exchange of your own, instead of `acemq.dlx` |
 | `acemq.QueueArg(name, value)` | any other broker argument |
 
 ```go
@@ -174,9 +174,38 @@ policy := acemq.ExponentialRetry(6, 10*time.Second, 0)
 
 topology := acemq.NewTopology().
 	Queue("orders").
-	DeadLetters("orders").     // orders.dlq, orders.parked
+	DeadLetters("orders").     // orders.dlq, orders.parked, acemq.dlx and the wiring
 	Retries("orders", policy)  // orders.retry.40s, .80s, .160s and their way home
 ```
+
+Printing it is the point — this is what `topology.String()` gives:
+
+```
+Topology: 2 exchanges, 6 queues, 3 bindings
+  declare exchange acemq.dlx (direct)
+  declare exchange acemq.retry (direct)
+  declare queue orders (durable, x-dead-letter-exchange=acemq.dlx, x-dead-letter-routing-key=orders.dlq)
+  declare queue orders.dlq (durable)
+  declare queue orders.parked (durable)
+  declare queue orders.retry.40s (durable, x-dead-letter-exchange=acemq.retry, x-dead-letter-routing-key=orders, x-message-ttl=40000)
+  declare queue orders.retry.80s (durable, x-dead-letter-exchange=acemq.retry, x-dead-letter-routing-key=orders, x-message-ttl=80000)
+  declare queue orders.retry.160s (durable, x-dead-letter-exchange=acemq.retry, x-dead-letter-routing-key=orders, x-message-ttl=160000)
+  declare binding orders.dlq (from acemq.dlx on orders.dlq)
+  declare binding orders.parked (from acemq.dlx on orders.parked)
+  declare binding orders (from acemq.retry on orders)
+```
+
+`DeadLetters` puts two arguments on `orders` itself, and they are the reason it
+has to declare the queue rather than only its dead letters: they are part of that
+declaration, and every other AceMQ library writes the same two. Two services
+consuming `orders` both declare it, so a disagreement here is a
+`PRECONDITION_FAILED` for whichever started second. Asking for dead letters on a
+queue this topology does not declare is refused for the same reason — there would
+be nowhere to put them.
+
+Both `acemq.dlx` and `acemq.retry` are shared. However many queues use them, each
+appears once in the plan, and neither is deleted by anything: they belong to the
+broker rather than to a service.
 
 `Retries` takes the policy rather than a list of delays because the rungs a
 consumer publishes into are derived from the policy it runs. A second list would

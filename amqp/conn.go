@@ -259,13 +259,28 @@ func QueueArg(name string, value any) QueueOption {
 	}
 }
 
-// DeadLetterTo sends rejected messages from this queue to an exchange.
+// DeadLetterTo sends rejected and expired messages from this queue to an
+// exchange of the caller's choosing.
 //
-// This is the broker's own dead-lettering, which is not how this library gives
-// up on a message: a consumer that has run out of attempts republishes to
-// {queue}.dlq with the reason attached and then acknowledges the original, so
-// that the reason survives and the destination is one it chose. See
-// [Topology.DeadLetters].
+// It is the way out of the arrangement [Topology.DeadLetters] sets up, and the
+// two are mutually exclusive: DeadLetters writes x-dead-letter-exchange as
+// acemq.dlx and x-dead-letter-routing-key as {queue}.dlq, and a topology that
+// asks for both on one queue is refused rather than resolved, because either
+// answer would be a guess about which of two conflicting instructions was
+// meant. A service that wants its own dead-letter exchange uses this and leaves
+// DeadLetters alone.
+//
+// It sets the exchange only. Nothing overrides the routing key, so a message
+// arrives at that exchange under the key it was published with — which is what
+// a caller pointing at an exchange of their own usually wants, and is why
+// DeadLetters, which shares one exchange between every queue on the broker, has
+// to set the key as well.
+//
+// Neither is how this library itself gives up on a message: a consumer that has
+// run out of attempts republishes to {queue}.dlq with the reason attached and
+// then acknowledges the original, so that the reason survives and the
+// destination is one it chose. The broker's own dead-lettering is the backstop
+// under that, for what the library never sees.
 func DeadLetterTo(exchange string) QueueOption {
 	return QueueArg(ArgDeadLetterExchange, exchange)
 }

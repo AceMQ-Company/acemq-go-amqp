@@ -187,6 +187,38 @@ decode goes to `{queue}.parked` instead: a message that failed five times and a
 message nothing could read are different problems, and whoever drains the dead
 letters should not have to sort them by hand.
 
+### The backstop underneath it
+
+`DeadLetters` declares those two queues, binds them to the shared `acemq.dlx`
+exchange on their own names, and declares the **source** queue with
+
+| argument | value |
+|---|---|
+| `x-dead-letter-exchange` | `acemq.dlx` (`DeadLetterExchange`) |
+| `x-dead-letter-routing-key` | `{queue}.dlq` |
+
+Those two arguments are part of the source queue's declaration, which is what
+makes them a cross-language contract: a Go service and a Python service
+consuming `orders` both declare `orders`, and a declaration that disagrees about
+them is refused with `PRECONDITION_FAILED`, leaving whichever service started
+second unable to consume at all.
+
+The routing key has to be overridden as well as the exchange. A dead-lettered
+message keeps the key it arrived under, so without it a message that reached
+`orders` as `order.placed` would arrive at `acemq.dlx` as `order.placed`, match
+no binding, and be dropped.
+
+This does not replace the republish-with-the-reason path, and neither is dead
+code. The broker-side route catches what the library never sees: a message
+expiring against the source queue's own `x-message-ttl`, one dropped by
+`x-max-length`, or a rejection from a consumer that is not this library. Without
+it, those are discarded and nothing records that they existed.
+
+`acemq.DeadLetterTo(exchange)` is the way out, for a service that wants its own
+dead-letter exchange. It and `DeadLetters` are mutually exclusive on one queue:
+a topology asking for both is refused rather than resolved, because either
+answer would be a guess about which of two conflicting instructions was meant.
+
 ### Where the waiting happens
 
 Short waits are spent in the consumer, holding the delivery and one prefetch
@@ -230,11 +262,12 @@ same rung by name, so different arguments mean the second is refused with
 | `x-dead-letter-exchange` | `acemq.retry` (`RetryExchange`) |
 | `x-dead-letter-routing-key` | the source queue |
 
-The exchange is the one thing the five AceMQ libraries do not yet agree on: Java
-declares `acemq.retry` and binds each source queue to it, Python and Ruby
-dead-letter through the default exchange, which routes by queue name and needs no
-binding. This library follows Java for now, and the choice is one constant —
-`RetryExchange` in `amqp/retryladder.go` — with a test pinning whatever it says.
+Java, .NET, Python, Ruby and this library all name `acemq.retry` here and bind
+each source queue to it. Python and Ruby once dead-lettered a rung through the
+default exchange instead, which routes by queue name and needs no binding; that
+works, but two libraries cannot both be right about one queue. Both shared
+exchange names live in one place — `RetryExchange` and `DeadLetterExchange` in
+`amqp/retryladder.go` — with tests pinning what they say.
 
 ### The schedule
 

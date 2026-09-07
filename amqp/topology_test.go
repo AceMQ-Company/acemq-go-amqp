@@ -16,6 +16,7 @@ package acemq
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -518,5 +519,202 @@ func TestAPolicyWithNoLongWaitsAddsNothing(t *testing.T) {
 	if plain.String() != withRetries.String() {
 		t.Errorf("a short-wait policy changed the topology:\n%s\nversus\n%s",
 			plain, withRetries)
+	}
+}
+
+// ---- the queues a message ends up in when it cannot be handled -------
+
+// queueIn is the declaration a topology holds for a queue, so a test can assert
+// on the arguments rather than on the sentence that describes them.
+func queueIn(t *testing.T, topology *Topology, name string) namedQueue {
+	t.Helper()
+	if err := topology.Validate(); err != nil {
+		t.Fatalf("the topology is not valid: %v", err)
+	}
+	for _, q := range topology.queues {
+		if q.Name == name {
+			return q
+		}
+	}
+	t.Fatalf("the topology does not declare %s:\n%s", name, topology)
+	return namedQueue{}
+}
+
+func hasBinding(topology *Topology, queue, exchange, key string) bool {
+	for _, b := range topology.bindings {
+		if b.Queue == queue && b.Exchange == exchange && b.RoutingKey == key {
+			return true
+		}
+	}
+	return false
+}
+
+// The argument table is a cross-language contract rather than a preference, and
+// this is the test that pins it. Two services consuming orders both declare
+// orders, so a Go service that wrote different arguments here would be refused
+// by the broker with PRECONDITION_FAILED — or would refuse the Python service
+// that declared it first, which is the same outage seen from the other side.
+func TestDeadLettersPointsTheSourceQueueAtTheSharedExchange(t *testing.T) {
+	topology := NewTopology().Queue("orders").DeadLetters("orders")
+
+	args := queueIn(t, topology, "orders").Spec.Args
+	if len(args) != 2 {
+		t.Fatalf("orders was declared with %v, want exactly the two dead-letter arguments", args)
+	}
+	if got := args[ArgDeadLetterExchange]; got != DeadLetterExchange {
+		t.Errorf("%s = %v, want %q", ArgDeadLetterExchange, got, DeadLetterExchange)
+	}
+	// The key, not just the exchange. A dead-lettered message keeps the routing
+	// key it arrived under, so without this one it reaches acemq.dlx as
+	// order.placed, matches no binding and is dropped.
+	if got := args[ArgDeadLetterRoutingKey]; got != "orders.dlq" {
+		t.Errorf("%s = %v, want %q", ArgDeadLetterRoutingKey, got, "orders.dlq")
+	}
+
+	for _, target := range []string{"orders.dlq", "orders.parked"} {
+		if got := queueIn(t, topology, target).Spec.Args; len(got) != 0 {
+			t.Errorf("%s was declared with %v; a dead-letter queue that dead-letters is a loop",
+				target, got)
+		}
+		if !hasBinding(topology, target, DeadLetterExchange, target) {
+			t.Errorf("%s is not bound to %s on its own name:\n%s",
+				target, DeadLetterExchange, topology)
+		}
+	}
+
+	if !topology.hasExchange(DeadLetterExchange) {
+		t.Fatalf("%s was not declared:\n%s", DeadLetterExchange, topology)
+	}
+	for _, e := range topology.exchanges {
+		if e.Name == DeadLetterExchange && (e.Spec.Kind != "direct" || !e.Spec.Durable) {
+			t.Errorf("%s was declared %s; every other library declares it direct and durable",
+				DeadLetterExchange, describeExchange(e.Spec))
+		}
+	}
+}
+
+// A builder is written in whichever order reads best, and what reaches the
+// broker cannot depend on which one somebody chose. The order the declarations
+// come out in is allowed to differ — a broker does not care which queue is
+// declared first — so this compares the plan as a set.
+func TestDeadLettersWorksInEitherOrder(t *testing.T) {
+	first := NewTopology().Queue("orders").DeadLetters("orders")
+	second := NewTopology().DeadLetters("orders").Queue("orders")
+
+	lines := func(topology *Topology) string {
+		t.Helper()
+		actions, err := topology.Plan()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make([]string, 0, len(actions))
+		for _, a := range actions {
+			out = append(out, a.String())
+		}
+		sort.Strings(out)
+		return strings.Join(out, "\n")
+	}
+
+	if lines(first) != lines(second) {
+		t.Errorf("the order of the calls changed the topology:\n%s\nversus\n%s", first, second)
+	}
+}
+
+// Refused rather than resolved: either answer would be a guess about which of
+// two conflicting instructions was meant, and the guess that silently wins is
+// the one nobody finds out about until a message is somewhere else.
+func TestSettingTheArgumentsByHandAndAskingForDeadLettersIsRefused(t *testing.T) {
+	cases := map[string]*Topology{
+		"the option first":       NewTopology().Queue("orders", DeadLetterTo("mine")).DeadLetters("orders"),
+		"DeadLetters first":      NewTopology().DeadLetters("orders").Queue("orders", DeadLetterTo("mine")),
+		"only the routing key":   NewTopology().Queue("orders", QueueArg(ArgDeadLetterRoutingKey, "elsewhere")).DeadLetters("orders"),
+		"a queue somewhere else": NewTopology().Queue("shipments").Queue("orders", DeadLetterTo("mine")).DeadLetters("orders"),
+	}
+	for name, topology := range cases {
+		err := topology.Validate()
+		if err == nil {
+			t.Errorf("%s: a queue that dead-letters twice was accepted:\n%s", name, topology)
+			continue
+		}
+		if !strings.Contains(err.Error(), "pick one") {
+			t.Errorf("%s: %v does not say what to do about it", name, err)
+		}
+	}
+}
+
+// The wiring is two arguments on the source queue's own declaration. A topology
+// that asks for dead letters on a queue it does not declare has nowhere to put
+// them, and leaving them off quietly is how the queue ends up disagreeing with
+// the same queue declared by a service in another language.
+func TestDeadLettersOnAQueueThisTopologyDoesNotDeclareIsRefused(t *testing.T) {
+	err := NewTopology().DeadLetters("orders").Validate()
+	if err == nil {
+		t.Fatal("dead letters were accepted for a queue nothing declares")
+	}
+	if !strings.Contains(err.Error(), "orders") {
+		t.Errorf("%v does not name the queue", err)
+	}
+}
+
+// One exchange per broker, not one per queue: declaring it twice is what
+// Validate refuses, and two dead-lettered queues in one service is ordinary.
+func TestTwoQueuesShareOneDeadLetterExchange(t *testing.T) {
+	topology := NewTopology().
+		Queue("orders").
+		DeadLetters("orders").
+		Queue("shipments").
+		DeadLetters("shipments")
+
+	if err := topology.Validate(); err != nil {
+		t.Fatalf("two dead-lettered queues: %v", err)
+	}
+	declared := 0
+	for _, e := range topology.exchanges {
+		if e.Name == DeadLetterExchange {
+			declared++
+		}
+	}
+	if declared != 1 {
+		t.Errorf("%s appears %d times in the plan, want once:\n%s",
+			DeadLetterExchange, declared, topology)
+	}
+}
+
+// The retry exchange and the dead-letter exchange are both shared and both
+// declared once, and a queue that has retries as well as dead letters gets both
+// without either standing on the other.
+func TestAQueueCanHaveBothLaddersAndDeadLetters(t *testing.T) {
+	topology := NewTopology().
+		Queue("orders").
+		DeadLetters("orders").
+		Retries("orders", FixedRetry(3, time.Minute))
+
+	args := queueIn(t, topology, "orders").Spec.Args
+	if args[ArgDeadLetterExchange] != DeadLetterExchange {
+		t.Errorf("the source queue dead-letters to %v, not %q",
+			args[ArgDeadLetterExchange], DeadLetterExchange)
+	}
+	// A rung dead-letters through acemq.retry, and only a rung does. The source
+	// queue's own dead letters are the end of the road, not another lap.
+	rung := queueIn(t, topology, "orders.retry.1m").Spec.Args
+	if rung[ArgDeadLetterExchange] != RetryExchange {
+		t.Errorf("the rung dead-letters to %v, not %q", rung[ArgDeadLetterExchange], RetryExchange)
+	}
+	if !hasBinding(topology, "orders", RetryExchange, "orders") {
+		t.Errorf("nothing brings an expired rung message home:\n%s", topology)
+	}
+}
+
+// Saying the same thing twice is not saying anything wrong, and declaring
+// orders.dlq twice is what Validate refuses.
+func TestAskingForDeadLettersTwiceIsAskingOnce(t *testing.T) {
+	once := NewTopology().Queue("orders").DeadLetters("orders")
+	twice := NewTopology().Queue("orders").DeadLetters("orders").DeadLetters("orders")
+
+	if err := twice.Validate(); err != nil {
+		t.Fatalf("asking twice: %v", err)
+	}
+	if once.String() != twice.String() {
+		t.Errorf("asking twice changed the topology:\n%s\nversus\n%s", once, twice)
 	}
 }

@@ -43,7 +43,12 @@ type Topology struct {
 	exchanges []namedExchange
 	queues    []namedQueue
 	bindings  []BindingSpec
-	err       error
+	// deadLettered is the set of queues [Topology.DeadLetters] was asked for.
+	// Kept because a builder is written in either order — the queue before its
+	// dead letters or after them — and the arguments the source queue needs can
+	// only be written once both calls have happened.
+	deadLettered map[string]bool
+	err          error
 }
 
 type namedExchange struct {
@@ -100,11 +105,19 @@ func (t *Topology) Queue(name string, opts ...QueueOption) *Topology {
 	for _, opt := range opts {
 		opt(&spec)
 	}
-	t.queues = append(t.queues, namedQueue{Name: name, Spec: spec})
+	queue := namedQueue{Name: name, Spec: spec}
+	if t.deadLettered[name] {
+		// DeadLetters was asked for first. The arguments belong on this
+		// declaration, and there is nowhere else to put them.
+		t.stampDeadLetter(&queue)
+	}
+	t.queues = append(t.queues, queue)
 	return t
 }
 
-// DeadLetters adds the two queues that catch what a queue cannot handle.
+// DeadLetters adds the two queues that catch what a queue cannot handle, the
+// exchange they are reached through, and the arguments that point the source
+// queue at them.
 //
 // {queue}.dlq is where a message goes when its attempts run out or it grows too
 // old, and {queue}.parked is where one goes that never reached the handler at
@@ -114,15 +127,43 @@ func (t *Topology) Queue(name string, opts ...QueueOption) *Topology {
 // usually a producer, and whoever drains the dead letters should not have to
 // sort them by hand.
 //
-// Neither gets wiring of its own. A dead-letter queue that dead-letters is a
-// loop, and a loop is how a poison message becomes an outage. A consumer reaches
-// them by publishing to them by name, through the default exchange, so there is
-// nothing to bind and nothing to forget.
+// Both are bound to [DeadLetterExchange] on their own names, and the source
+// queue is declared with
 //
-// Declaring them is not optional in practice. A consumer that gives up on a
-// message publishes it to {queue}.dlq mandatory; if that queue is not there the
-// publish is refused, and the message is rejected to the broker instead — which
-// is the last thing between it and nothing.
+//	x-dead-letter-exchange    acemq.dlx
+//	x-dead-letter-routing-key {queue}.dlq
+//
+// The routing key has to be set as well as the exchange, and it is what makes a
+// shared exchange work at all: a message the broker dead-letters keeps the
+// routing key it arrived under, so without it a message that reached orders as
+// order.placed would arrive at acemq.dlx as order.placed, match no binding, and
+// be dropped — the silent loss this is here to prevent.
+//
+// Those two arguments are the reason this is not optional. They are part of the
+// source queue's declaration, and the Java, .NET, Python and Ruby libraries all
+// write them: a Go service that declared orders without them and a Python
+// service that declared orders with them cannot both consume it, because the
+// second to declare is refused with PRECONDITION_FAILED.
+//
+// This does not replace the consumer's own path, and neither is dead code. A
+// consumer that gives up republishes to {queue}.dlq with the reason in
+// x-acemq-error and acknowledges the original, because that is the only way the
+// reason survives and the only way the destination is one this library chose.
+// The broker-side route is the backstop underneath it, and it catches what the
+// library never sees: a message expiring against the source queue's own
+// x-message-ttl, one dropped by x-max-length, one rejected by a consumer that
+// is not this library at all. Without it those messages are discarded and
+// nothing anywhere records that they existed.
+//
+// Neither {queue}.dlq nor {queue}.parked gets dead-lettering of its own. A
+// dead-letter queue that dead-letters is a loop, and a loop is how a poison
+// message becomes an outage.
+//
+// The source queue has to be declared by this topology as well — with
+// [Topology.Queue], because it usually has arguments of its own — and asking
+// for dead letters on a queue that is not there is refused by
+// [Topology.Validate] rather than quietly leaving the arguments off the one
+// declaration that needed them.
 func (t *Topology) DeadLetters(queue string) *Topology {
 	if t.err != nil {
 		return t
@@ -131,7 +172,66 @@ func (t *Topology) DeadLetters(queue string) *Topology {
 		t.err = fmt.Errorf("acemq: DeadLetters needs the name of the queue they belong to")
 		return t
 	}
-	return t.Queue(DeadLetterQueue(queue)).Queue(ParkedQueue(queue))
+	if t.deadLettered[queue] {
+		// Asked for twice is asked for once. Declaring {queue}.dlq a second time
+		// is what Validate refuses, and a caller who says the same thing twice
+		// has not said anything wrong.
+		return t
+	}
+	if t.deadLettered == nil {
+		t.deadLettered = map[string]bool{}
+	}
+	t.deadLettered[queue] = true
+
+	// One exchange per broker rather than one per queue. Declaring it twice is
+	// harmless to the broker and is what Validate refuses, and a plan that lists
+	// acemq.dlx once per queue is a plan somebody stops reading.
+	if !t.hasExchange(DeadLetterExchange) {
+		t.Exchange(DeadLetterExchange, "direct")
+	}
+	for _, target := range []string{DeadLetterQueue(queue), ParkedQueue(queue)} {
+		t.Queue(target).Binding(target, DeadLetterExchange, target)
+	}
+
+	// The queue may already be here, or may be declared further down the chain;
+	// Queue handles the second case.
+	for i := range t.queues {
+		if t.queues[i].Name == queue {
+			t.stampDeadLetter(&t.queues[i])
+			break
+		}
+	}
+	return t
+}
+
+// stampDeadLetter writes the two dead-letter arguments onto a source queue.
+//
+// A caller who has already set either one by hand — with [QueueArg] or
+// [DeadLetterTo] — is refused rather than overwritten. Either answer would be a
+// guess about which of two conflicting instructions was meant, and the guess
+// that silently wins is the one nobody finds out about until a message is
+// somewhere else.
+func (t *Topology) stampDeadLetter(queue *namedQueue) {
+	if t.err != nil {
+		return
+	}
+	var conflicting []string
+	for _, arg := range []string{ArgDeadLetterExchange, ArgDeadLetterRoutingKey} {
+		if _, set := queue.Spec.Args[arg]; set {
+			conflicting = append(conflicting, arg)
+		}
+	}
+	if len(conflicting) > 0 {
+		t.err = fmt.Errorf(
+			"acemq: queue %q asks for DeadLetters and also sets %s; pick one",
+			queue.Name, strings.Join(conflicting, " and "))
+		return
+	}
+	if queue.Spec.Args == nil {
+		queue.Spec.Args = map[string]any{}
+	}
+	queue.Spec.Args[ArgDeadLetterExchange] = DeadLetterExchange
+	queue.Spec.Args[ArgDeadLetterRoutingKey] = DeadLetterQueue(queue.Name)
 }
 
 // Retries adds the rung queues a policy's long waits need, and whatever brings
@@ -222,6 +322,23 @@ func (t *Topology) Validate() error {
 			return fmt.Errorf("acemq: the topology declares queue %q twice", q.Name)
 		}
 		queues[q.Name] = true
+	}
+
+	// A queue asked to dead-letter has to be one this topology declares, because
+	// the wiring is two arguments on that declaration and there is nowhere else
+	// to put them. Sorted so a topology with two of these reports the same one
+	// every time.
+	missing := make([]string, 0, len(t.deadLettered))
+	for source := range t.deadLettered {
+		if !queues[source] {
+			missing = append(missing, source)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf(
+			"acemq: DeadLetters names queue %q, which this topology does not declare; "+
+				"the dead-letter arguments belong on that declaration", missing[0])
 	}
 
 	exchanges := map[string]bool{}
