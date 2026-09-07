@@ -50,6 +50,22 @@ const (
 
 	// MetricInFlight is how many messages are being handled right now.
 	MetricInFlight = "acemq.messages.in.flight"
+
+	// MetricRungMissing counts long retries that had to wait in the consumer
+	// because the rung queue they were meant to wait on is not on the broker.
+	//
+	// Worth an alert. Nothing breaks: the message is still retried, and the wait
+	// still happens. What is lost is the reason the rung exists — a consumer
+	// restart mid-wait now shortens a five-minute backoff to nothing — and there
+	// would otherwise be no sign of it, because this library writes no log lines.
+	MetricRungMissing = "acemq.retry.rung.missing"
+
+	// MetricSetAsideFailed counts messages that could not be moved to a
+	// dead-letter or parking queue, usually because it has not been declared.
+	//
+	// The message is rejected to the broker instead, which is the last thing
+	// between it and nothing.
+	MetricSetAsideFailed = "acemq.messages.set.aside.failed"
 )
 
 // Observer is told what the library is doing.

@@ -447,3 +447,76 @@ func TestDeletingAQueueThatIsNotThereIsFine(t *testing.T) {
 		t.Errorf("deleting a queue that does not exist failed: %v", err)
 	}
 }
+
+// ---- the queues a retry policy needs ---------------------------------
+
+func TestATopologyDeclaresTheRungsAPolicyNeeds(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	policy := ExponentialRetry(5, 20*time.Second, 0)
+	topology := NewTopology().
+		Queue("orders").
+		DeadLetters("orders").
+		Retries("orders", policy)
+
+	if err := topology.Apply(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+
+	// The rungs are derived from the policy rather than listed beside it. A
+	// second list would be free to drift from the first, and the way that drift
+	// shows up is a retry published into a queue nobody declared, at the moment
+	// the service is already failing.
+	want := []string{
+		"orders", "orders.dlq", "orders.parked",
+		"orders.retry.40s", "orders.retry.80s", "orders.retry.160s",
+	}
+	for _, queue := range want {
+		exists, err := mq.QueueExists(ctx, queue)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !exists {
+			t.Errorf("%s was not declared", queue)
+		}
+	}
+
+	// The twenty-second wait is below the threshold and waits in the consumer,
+	// so it costs the broker nothing.
+	if exists, _ := mq.QueueExists(ctx, "orders.retry.20s"); exists {
+		t.Error("a wait shorter than the threshold was given a queue")
+	}
+
+	// And a consumer's own idea of the ladder has to agree with what was
+	// declared, or the two are two lists again.
+	for _, queue := range LadderFor("orders", policy).Queues() {
+		if exists, _ := mq.QueueExists(ctx, queue); !exists {
+			t.Errorf("the consumer would publish into %s, which the topology did not declare", queue)
+		}
+	}
+}
+
+func TestRetriesForTwoQueuesShareOneExchange(t *testing.T) {
+	// Declaring it twice is what a Topology calls an error, and two queues with
+	// long retries in one service is ordinary.
+	topology := NewTopology().
+		Queue("orders").
+		Retries("orders", FixedRetry(3, time.Minute)).
+		Queue("shipments").
+		Retries("shipments", FixedRetry(3, 2*time.Minute))
+
+	if err := topology.Validate(); err != nil {
+		t.Fatalf("two queues with retries: %v", err)
+	}
+}
+
+func TestAPolicyWithNoLongWaitsAddsNothing(t *testing.T) {
+	plain := NewTopology().Queue("orders")
+	withRetries := NewTopology().Queue("orders").Retries("orders", FixedRetry(3, time.Second))
+
+	if plain.String() != withRetries.String() {
+		t.Errorf("a short-wait policy changed the topology:\n%s\nversus\n%s",
+			plain, withRetries)
+	}
+}

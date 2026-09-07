@@ -104,6 +104,94 @@ func (t *Topology) Queue(name string, opts ...QueueOption) *Topology {
 	return t
 }
 
+// DeadLetters adds the two queues that catch what a queue cannot handle.
+//
+// {queue}.dlq is where a message goes when its attempts run out or it grows too
+// old, and {queue}.parked is where one goes that never reached the handler at
+// all — most often because it could not be decoded. Two queues rather than one
+// because they are different problems with different answers: a message that
+// failed five times is usually the world, and a message nothing could read is
+// usually a producer, and whoever drains the dead letters should not have to
+// sort them by hand.
+//
+// Neither gets wiring of its own. A dead-letter queue that dead-letters is a
+// loop, and a loop is how a poison message becomes an outage. A consumer reaches
+// them by publishing to them by name, through the default exchange, so there is
+// nothing to bind and nothing to forget.
+//
+// Declaring them is not optional in practice. A consumer that gives up on a
+// message publishes it to {queue}.dlq mandatory; if that queue is not there the
+// publish is refused, and the message is rejected to the broker instead — which
+// is the last thing between it and nothing.
+func (t *Topology) DeadLetters(queue string) *Topology {
+	if t.err != nil {
+		return t
+	}
+	if queue == "" {
+		t.err = fmt.Errorf("acemq: DeadLetters needs the name of the queue they belong to")
+		return t
+	}
+	return t.Queue(DeadLetterQueue(queue)).Queue(ParkedQueue(queue))
+}
+
+// Retries adds the rung queues a policy's long waits need, and whatever brings
+// an expired message home.
+//
+// One {queue}.retry.{delay} per distinct delay at or past the policy's
+// threshold, each with x-message-ttl set to that delay and its dead-letter
+// target set back to this queue, so a message parked on a rung returns here when
+// its time is up. See [RetryLadder] for why the waiting happens there at all,
+// and [RungArgs] for why the arguments are what they are.
+//
+// It takes the policy rather than a list of delays on purpose. The rungs a
+// consumer will publish to are derived from the policy it is running, so
+// anything else here would be a second copy of the same list, free to drift from
+// the first — and the way that drift shows up is a retry published to a queue
+// nobody declared, at the moment the service is already failing.
+//
+// The queue itself is not declared here, because it usually has arguments of its
+// own; declare it with [Topology.Queue] as well. A policy whose waits are all
+// short adds nothing, which is the common case.
+func (t *Topology) Retries(queue string, p RetryPolicy) *Topology {
+	if t.err != nil {
+		return t
+	}
+	if queue == "" {
+		t.err = fmt.Errorf("acemq: Retries needs the name of the queue the rungs belong to")
+		return t
+	}
+
+	ladder := LadderFor(queue, p)
+	if ladder.Empty() {
+		return t
+	}
+
+	exchange, routingKey := retryReturn(queue)
+	if exchange != "" && !t.hasExchange(exchange) {
+		t.Exchange(exchange, "direct")
+	}
+	for _, rung := range ladder.Rungs {
+		opts := make([]QueueOption, 0, len(rung.Args))
+		for name, value := range rung.Args {
+			opts = append(opts, QueueArg(name, value))
+		}
+		t.Queue(rung.Queue, opts...)
+	}
+	if exchange != "" {
+		t.Binding(queue, exchange, routingKey)
+	}
+	return t
+}
+
+func (t *Topology) hasExchange(name string) bool {
+	for _, e := range t.exchanges {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // Binding routes messages matching a key from an exchange to a queue.
 func (t *Topology) Binding(queue, exchange, routingKey string) *Topology {
 	if t.err != nil {

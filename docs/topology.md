@@ -161,6 +161,30 @@ if err := topology.Apply(ctx, mq); err != nil {
 
 Exchanges, then queues, then bindings — the order a broker needs.
 
+### The queues a consumer needs to fail into
+
+A consumer that gives up on a message republishes it to `{queue}.dlq` with the
+reason attached, one that cannot decode a body republishes it to
+`{queue}.parked`, and one whose policy has long waits republishes into a
+`{queue}.retry.{delay}` rung. All three have to exist, or the publish is refused
+and the message goes back to the broker with nothing recorded about why:
+
+```go
+policy := acemq.ExponentialRetry(6, 10*time.Second, 0)
+
+topology := acemq.NewTopology().
+	Queue("orders").
+	DeadLetters("orders").     // orders.dlq, orders.parked
+	Retries("orders", policy)  // orders.retry.40s, .80s, .160s and their way home
+```
+
+`Retries` takes the policy rather than a list of delays because the rungs a
+consumer publishes into are derived from the policy it runs. A second list would
+be free to drift from the first, and the way that drift shows up is a retry
+published into a queue nobody declared, at the moment the service is already
+failing. See [reliability](reliability.md) for what a rung is and why the waiting
+happens there.
+
 ### It is checked before the broker sees it
 
 A binding naming a queue the topology does not declare is refused here rather

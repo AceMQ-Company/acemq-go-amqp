@@ -893,6 +893,93 @@ func TestReplayMovesMessagesBack(t *testing.T) {
 	}
 }
 
+// TestAReplayGivesAMessageItsAttemptsBack is what a replay is for.
+//
+// A message dead-lettered on the last attempt of a five-attempt policy comes
+// back on attempt five. Put it on the queue as it was and the first consumer to
+// see it dead-letters it again before the handler runs, so the operator who has
+// just fixed the bug has moved two thousand messages from one queue to the same
+// queue.
+func TestAReplayGivesAMessageItsAttemptsBack(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	for _, q := range []string{"orders", "orders-dead"} {
+		if err := mq.DeclareQueue(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	exhausted := acemq.NewPublisher[OrderPlaced](mq, "", "orders-dead")
+	err := exhausted.Send(ctx, OrderPlaced{OrderID: "o-1"},
+		acemq.Attempt(5), acemq.DeadLetterReason("exhausted 5 attempts: the database timed out"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := patterns.Replay(ctx, mq, patterns.ReplayFrom{
+		Queue:      "orders-dead",
+		RoutingKey: "orders",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	back, found, err := mq.Pull(ctx, "orders")
+	if err != nil || !found {
+		t.Fatalf("Pull: %v, found=%v", err, found)
+	}
+	defer func() { _ = back.Ack() }()
+
+	if back.Envelope.Attempt != 1 {
+		t.Errorf("Attempt = %d, want 1: a replayed message needs a full schedule again",
+			back.Envelope.Attempt)
+	}
+	if back.Envelope.Error != "" {
+		t.Errorf("Error = %q, want the reason it was dead-lettered cleared", back.Envelope.Error)
+	}
+}
+
+// TestAReplayCanPutBackExactlyWhatWasThere is the other half: for an audit, or
+// for a queue read by something that counts attempts itself.
+func TestAReplayCanPutBackExactlyWhatWasThere(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	for _, q := range []string{"orders", "orders-dead"} {
+		if err := mq.DeclareQueue(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err := acemq.NewPublisher[OrderPlaced](mq, "", "orders-dead").
+		Send(ctx, OrderPlaced{OrderID: "o-1"},
+			acemq.Attempt(5), acemq.DeadLetterReason("exhausted 5 attempts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := patterns.Replay(ctx, mq, patterns.ReplayFrom{
+		Queue:        "orders-dead",
+		RoutingKey:   "orders",
+		KeepAttempts: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	back, found, err := mq.Pull(ctx, "orders")
+	if err != nil || !found {
+		t.Fatalf("Pull: %v, found=%v", err, found)
+	}
+	defer func() { _ = back.Ack() }()
+
+	if back.Envelope.Attempt != 5 {
+		t.Errorf("Attempt = %d, want the 5 it was dead-lettered on", back.Envelope.Attempt)
+	}
+	if back.Envelope.Error == "" {
+		t.Error("the reason it was dead-lettered was cleared despite KeepAttempts")
+	}
+}
+
 func TestReplayCanTakeSomeAndLeaveTheRest(t *testing.T) {
 	ctx := context.Background()
 	mq := brokerFor(t)

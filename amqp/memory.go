@@ -471,10 +471,17 @@ func (s *memSubscription) run(deliver func(Delivery)) {
 	}
 }
 
-// Close stops delivery and waits for the delivering goroutine to finish, so no
+// Stop ends delivery and waits for the delivering goroutine to finish, so no
 // further deliveries happen once it returns. The consumer relies on that to
 // close its work channel safely.
-func (s *memSubscription) Close() error {
+//
+// Nothing is released here, because nothing in memory has to be: the split
+// exists for a real transport, where a settlement travels on the channel its
+// delivery arrived on and the channel therefore has to outlive the handlers.
+// This transport implements it anyway rather than being kinder than the real
+// one, so that a consumer's shutdown takes the same path in a test as it does
+// against a broker.
+func (s *memSubscription) Stop() error {
 	s.closeOnce.Do(func() {
 		close(s.stop)
 		// Broadcasting under the queue's lock is what makes this safe. A waiter
@@ -488,6 +495,9 @@ func (s *memSubscription) Close() error {
 	})
 	return nil
 }
+
+// Close stops delivery if it has not been stopped already.
+func (s *memSubscription) Close() error { return s.Stop() }
 
 // topicMatches implements AMQP topic matching: * is exactly one word, # is zero
 // or more.

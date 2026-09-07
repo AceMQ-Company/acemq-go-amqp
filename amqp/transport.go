@@ -55,6 +55,26 @@ type Subscription interface {
 	Close() error
 }
 
+// Stopper is a [Subscription] that can stop delivering without letting go of
+// whatever its settlements travel on.
+//
+// The two are separate because a settlement travels on the channel its delivery
+// arrived on. A consumer shutting down has to stop being given new messages,
+// then finish the ones it already has — each of which is acknowledged, or
+// republished and then acknowledged — and only then release the channel. Close
+// them in the other order and every message being worked on at that moment is
+// settled into a channel that has gone: the broker never hears the
+// acknowledgement, hands the message to somebody else, and a retry that had
+// already been republished is now on the queue twice.
+//
+// Both transports in this module implement it. A transport that does not is
+// closed outright, which is the old behaviour and no worse than it was.
+type Stopper interface {
+	// Stop ends delivery and waits for anything already dispatched to have been
+	// handed over. Close still has to be called afterwards.
+	Stop() error
+}
+
 // QueueSpec is how a queue should be declared.
 type QueueSpec struct {
 	// Durable survives a broker restart. True by default via [DeclareQueue].

@@ -65,6 +65,10 @@ type ReplayFilter func(acemq.Envelope, []byte) bool
 // [HeaderReplayedFrom], [HeaderReplayedAt] and [HeaderReplayCount]. A consumer
 // that needs to treat them differently can, and one that does not is unaffected.
 //
+// A replayed message goes back on attempt one unless [ReplayFrom.KeepAttempts]
+// says otherwise, because a message dead-lettered on its last attempt would
+// otherwise be dead-lettered again before any handler saw it.
+//
 // The routing key is the message's own unless [ReplayFrom.RoutingKey] overrides
 // it, so a message goes back where it came from rather than everywhere.
 type ReplayFrom struct {
@@ -87,6 +91,19 @@ type ReplayFrom struct {
 
 	// Filter decides which messages go. Nil takes all of them.
 	Filter ReplayFilter
+
+	// KeepAttempts leaves each message's attempt counter and dead-letter reason
+	// exactly as they were.
+	//
+	// Off by default, so a replayed message goes back on attempt one with a clean
+	// slate. That is what a replay is for: a message dead-lettered on the last
+	// attempt of a five-attempt policy would otherwise be dead-lettered again
+	// before any handler saw it, and the operator who has just fixed the bug
+	// would have moved two thousand messages from one queue to the same queue.
+	//
+	// Turn it on to put back exactly what was there — for an audit, or for a
+	// queue read by something that counts attempts itself.
+	KeepAttempts bool
 }
 
 // HeaderReplayedFrom names the queue a message was replayed out of.
@@ -167,7 +184,13 @@ func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (ReplayResul
 			routingKey = message.RoutingKey
 		}
 
-		headers := message.Envelope.ToWire()
+		goingBack := message.Envelope
+		if !from.KeepAttempts {
+			goingBack.Attempt = 1
+			goingBack.Error = ""
+		}
+
+		headers := goingBack.ToWire()
 		headers[HeaderReplayedFrom] = from.Queue
 		headers[HeaderReplayedAt] = time.Now().UTC().Format(time.RFC3339)
 		headers[HeaderReplayCount] = replayCount(message.Envelope) + 1
@@ -175,7 +198,7 @@ func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (ReplayResul
 		_, err = conn.PublishRaw(ctx, from.Exchange, routingKey, acemq.Outbound{
 			Body:        message.Body,
 			ContentType: message.ContentType,
-			MessageID:   message.Envelope.ID,
+			MessageID:   goingBack.ID,
 			Headers:     headers,
 			Persistent:  true,
 		})

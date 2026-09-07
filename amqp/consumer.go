@@ -51,15 +51,15 @@ type Handler[T any] func(ctx context.Context, m Message[T]) Ack
 type Consumer struct {
 	conn      *Conn
 	queue     string
+	retry     RetryPolicy
+	ladder    RetryLadder
 	transport Subscription
 	work      chan Delivery
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 	closeErr  error
 
-	attemptsMu sync.Mutex
-	attempts   map[string]int
-	flight     int64
+	flight int64
 }
 
 // inFlight adjusts and returns how many messages this consumer is handling.
@@ -157,10 +157,11 @@ func Consume[T any](
 	}
 
 	c := &Consumer{
-		conn:     conn,
-		queue:    queue,
-		work:     make(chan Delivery, cfg.concurrency),
-		attempts: map[string]int{},
+		conn:   conn,
+		queue:  queue,
+		retry:  cfg.retry,
+		ladder: LadderFor(queue, cfg.retry),
+		work:   make(chan Delivery, cfg.concurrency),
 	}
 
 	if err := conn.track(c); err != nil {
@@ -202,8 +203,15 @@ func Consume[T any](
 func handleDelivery[T any](
 	c *Consumer, ctx context.Context, d Delivery, handler Handler[T], cfg consumeConfig,
 ) {
+	// The attempt comes off the wire, because that is where a retry put it. An
+	// earlier version counted redeliveries in a map on this consumer, which is
+	// the only thing a requeue leaves to count: a requeue hands back the bytes
+	// the broker was given, so the header still reads what the publisher wrote
+	// however many times the message has come round. The map is per-process,
+	// unbounded across a fleet, and empty again after the restart that the
+	// failing service was about to have. Republishing instead of requeueing is
+	// what lets the counter live on the message, where it belongs.
 	env := EnvelopeFromWire(d.Headers, d.RoutingKey, d.MessageID)
-	env.Attempt = c.attemptFor(env.ID, d.Redelivered)
 
 	observer := c.conn.observer
 	labels := map[string]string{"queue": c.queue}
@@ -225,8 +233,8 @@ func handleDelivery[T any](
 				// retried, because an interceptor that says no will say no
 				// again to the same message.
 				observer.Count(MetricRejected, 1, labels)
-				c.forget(env.ID)
-				c.nack(d, false)
+				observer.Count(MetricDeadLettered, 1, labels)
+				c.deadLetter(ctx, d, env, "an interceptor refused it: "+describe(err))
 				return
 			}
 		}
@@ -234,12 +242,15 @@ func handleDelivery[T any](
 
 	var payload T
 	if err := decodeWith(cfg.codec, d.ContentType, d.Body, &payload); err != nil {
-		// A body that will not decode decodes no better next time, so this is
-		// dead-lettered rather than retried.
+		// A body that will not decode decodes no better next time, so it does not
+		// go round the retry schedule until it ages out.
+		//
+		// Parked rather than dead-lettered: a message that failed five times and a
+		// message nothing could read are different problems with different answers
+		// — one is usually the world, the other is usually a producer — and
+		// whoever drains the dead letters should not have to sort them by hand.
 		observer.Count(MetricRejected, 1, labels)
-		observer.Count(MetricDeadLettered, 1, labels)
-		c.forget(env.ID)
-		c.nack(d, false)
+		c.park(ctx, d, env, "could not be decoded: "+describe(err))
 		return
 	}
 
@@ -258,51 +269,222 @@ func handleDelivery[T any](
 
 	switch ack.action {
 	case ackAccept:
-		c.forget(env.ID)
 		if d.Ack != nil {
 			_ = d.Ack()
 		}
 
 	case ackReject:
-		c.forget(env.ID)
-		c.nack(d, false)
+		c.deadLetter(ctx, d, env, "the handler rejected it: "+describe(ack.err))
 
 	case ackRetry:
 		if IsFatal(ack.err) {
 			// The handler asked for a retry but marked the reason as one that
 			// will not change. Honouring the mark rather than the request is
 			// the point of having it.
-			c.forget(env.ID)
-			c.nack(d, false)
+			observer.Count(MetricDeadLettered, 1, labels)
+			c.deadLetter(ctx, d, env,
+				"the handler reported an unprocessable message: "+describe(ack.err))
 			return
 		}
 
-		delay, again := cfg.retry.NextDelay(env.Attempt, env.Age())
-		if cfg.retry.MaxAttempts == 0 {
-			// No policy configured: requeue and let the broker decide how fast
-			// to bring it back. Documented on WithRetry as rarely what anybody
-			// wants for long.
-			delay, again = 0, true
+		wait, again := c.retry.NextWait(env.Attempt, env.Age())
+		if c.retry.MaxAttempts == 0 {
+			// No policy configured: send it straight back and let the broker
+			// decide how fast to bring it round. Documented on WithRetry as
+			// rarely what anybody wants for long.
+			wait, again = Wait{}, true
 		}
 		if !again {
 			observer.Count(MetricDeadLettered, 1, labels)
-			c.forget(env.ID)
-			c.nack(d, false)
+			c.deadLetter(ctx, d, env, c.exhausted(env)+": "+describe(ack.err))
 			return
 		}
-		if delay > 0 {
+
+		if wait.InBroker && c.retryInBroker(ctx, d, env, wait.Delay) {
+			return
+		}
+
+		if wait.Delay > 0 {
 			// Waiting here holds the delivery, and so holds one of this
-			// consumer's prefetch slots. That is the honest cost of delaying a
-			// retry without a delay queue: the alternative is to acknowledge
-			// and republish, which turns one message into two and loses the
-			// broker's redelivery flag.
+			// consumer's prefetch slots. For a wait of a few seconds that is the
+			// cheaper of the two costs; for a longer one it is not, which is why
+			// the policy has a threshold and the long waits went to a rung queue
+			// a few lines above.
 			select {
-			case <-time.After(delay):
+			case <-time.After(wait.Delay):
 			case <-ctx.Done():
 			}
 		}
-		c.nack(d, true)
+		c.retryAgain(ctx, d, env)
 	}
+}
+
+// exhausted says why there is no next attempt, in words an operator can act on.
+func (c *Consumer) exhausted(env Envelope) string {
+	if env.Attempt >= c.retry.MaxAttempts {
+		attempts := "attempts"
+		if c.retry.MaxAttempts == 1 {
+			attempts = "attempt"
+		}
+		return fmt.Sprintf("exhausted %d %s", c.retry.MaxAttempts, attempts)
+	}
+	return fmt.Sprintf("exceeded the maximum message age of %s", c.retry.MaxMessageAge)
+}
+
+// retryInBroker puts the message on a rung queue and lets the broker return it,
+// reporting whether the rung took it.
+//
+// The rung's x-message-ttl is the delay and its dead-letter target is this
+// queue, so the wait costs this process nothing: no delivery held, no prefetch
+// slot spent, and — the reason it exists — nothing lost when this process
+// restarts halfway through. A consumer sleeping on a five-minute backoff that
+// dies at minute one does not resume at minute one; the broker redelivers the
+// unacknowledged message immediately, and the policy that said five minutes
+// delivers in none.
+//
+// The attempt advances here exactly as it does on an immediate retry: the
+// counter belongs to the message, and a message that has been round the broker
+// is no less on its second attempt than one that waited here.
+//
+// False means the rung is not on the broker, and the caller should fall back to
+// waiting here. Degraded rather than fatal: the message is still deliverable,
+// and waiting for it here is what this library did before there were rungs.
+func (c *Consumer) retryInBroker(
+	ctx context.Context, d Delivery, env Envelope, delay time.Duration,
+) bool {
+	rung, ok := c.ladder.RungFor(delay)
+	if !ok {
+		return false
+	}
+
+	routed, err := c.republish(ctx, d, rung, env.NextAttempt())
+	if err != nil || !routed {
+		// Counted rather than logged, because this library writes no log lines:
+		// a topology that declares the queue without its rungs otherwise looks
+		// like it works, right up until a long backoff quietly becomes a held
+		// prefetch slot.
+		c.conn.observer.Count(MetricRungMissing, 1, map[string]string{
+			"queue": c.queue, "rung": rung})
+		return false
+	}
+
+	c.conn.observer.Count(MetricRetried, 1, map[string]string{
+		"queue": c.queue, "rung": rung})
+	if d.Ack != nil {
+		_ = d.Ack()
+	}
+	return true
+}
+
+// retryAgain puts the message back on its own queue, one attempt further on.
+//
+// Republished rather than requeued, because a requeue returns the bytes the
+// broker was given: the attempt header would still read what the publisher wrote
+// however many times the message had come round, and the count would live only
+// in this process's memory, which is the one place it is lost when the process
+// that has been failing restarts.
+//
+// The cost is that the message goes to the back of the queue rather than the
+// front, so a retry is no longer in order with its neighbours. For a message
+// that has already failed once, that is the better trade.
+func (c *Consumer) retryAgain(ctx context.Context, d Delivery, env Envelope) {
+	routed, err := c.republish(ctx, d, c.queue, env.NextAttempt())
+	if err != nil || !routed {
+		// The queue this consumer reads has gone, or the connection has. Returned
+		// to the broker rather than acknowledged, because dropping it here would
+		// lose a message over a broker change nobody told this consumer about.
+		c.nack(d, true)
+		return
+	}
+	if d.Ack != nil {
+		_ = d.Ack()
+	}
+}
+
+// park sends the message to {queue}.parked with the reason attached.
+//
+// Where a message goes when it never reached the handler at all. Somebody has to
+// look at it, and what they need to know first is that it was unreadable rather
+// than unlucky.
+func (c *Consumer) park(ctx context.Context, d Delivery, env Envelope, reason string) {
+	c.setAside(ctx, d, env, ParkedQueue(c.queue), reason)
+}
+
+// deadLetter sends the message to {queue}.dlq with the reason attached.
+func (c *Consumer) deadLetter(ctx context.Context, d Delivery, env Envelope, reason string) {
+	c.setAside(ctx, d, env, DeadLetterQueue(c.queue), reason)
+}
+
+// setAside republishes to a queue with the reason recorded, then acknowledges
+// the original.
+//
+// Acknowledging a message that failed looks wrong and is what makes this
+// reliable: the message has already been safely republished somewhere else, so
+// acknowledging the original is removing the copy that has been dealt with.
+// Rejecting it instead would either requeue it into a hot loop or, with a
+// dead-letter exchange configured on the queue, send it somewhere this consumer
+// did not choose and without the reason.
+//
+// The reason travels as an envelope field, so a consumer of the dead-letter
+// queue reads it back through the API rather than having to know the wire header
+// name.
+func (c *Consumer) setAside(ctx context.Context, d Delivery, env Envelope, target, reason string) {
+	failed := env
+	failed.Error = reason
+
+	routed, err := c.republish(ctx, d, target, failed)
+	if err != nil || !routed {
+		// Rejected rather than acknowledged: without a queue to put it in, the
+		// broker's own dead-lettering is the last thing left between this message
+		// and nothing.
+		c.conn.observer.Count(MetricSetAsideFailed, 1, map[string]string{
+			"queue": c.queue, "target": target})
+		c.nack(d, false)
+		return
+	}
+	if d.Ack != nil {
+		_ = d.Ack()
+	}
+}
+
+// republish sends the original bytes to a queue by name, and says whether they
+// arrived.
+//
+// Through the default exchange, which routes to the queue whose name matches the
+// routing key, and mandatory so that a queue that is not there is an answer
+// rather than a silence. The body goes back exactly as it came: re-encoding
+// through a type that has since changed would replace what was committed with
+// something else.
+func (c *Consumer) republish(
+	ctx context.Context, d Delivery, queue string, env Envelope,
+) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		// The consumer is shutting down. Publishing on a cancelled context would
+		// fail anyway, and saying so here lets the caller give the message back
+		// to the broker rather than lose it.
+		return false, fmt.Errorf("acemq: cannot republish onto %q: %w", queue, err)
+	}
+
+	result, err := c.conn.PublishRaw(ctx, "", queue, Outbound{
+		Body:        d.Body,
+		ContentType: d.ContentType,
+		MessageID:   env.ID,
+		Headers:     env.ToWire(),
+		Persistent:  true,
+		Mandatory:   true,
+	})
+	if err != nil {
+		return false, fmt.Errorf("acemq: cannot republish onto %q: %w", queue, err)
+	}
+	return result.Routed, nil
+}
+
+// describe renders a failure as the sentence that goes on the message.
+func describe(err error) string {
+	if err == nil {
+		return "no reason given"
+	}
+	return err.Error()
 }
 
 // decodeWith reads a body, letting a codec that chooses by content type see it.
@@ -331,46 +513,37 @@ func (c *Consumer) nack(d Delivery, requeue bool) {
 	}
 }
 
-// attemptFor works out which attempt this delivery is.
-//
-// The attempt header cannot answer: a broker requeues the bytes it was given,
-// so the header still reads 1 however many times the message has come back.
-// The redelivery flag is the only signal there is, and it is counted here,
-// per consumer, keyed by message id.
-func (c *Consumer) attemptFor(id string, redelivered bool) int {
-	c.attemptsMu.Lock()
-	defer c.attemptsMu.Unlock()
-
-	if !redelivered {
-		c.attempts[id] = 1
-		return 1
-	}
-	n := c.attempts[id] + 1
-	c.attempts[id] = n
-	return n
-}
-
-// forget drops a message's attempt count once it is settled, so the map holds
-// only what is in flight.
-func (c *Consumer) forget(id string) {
-	c.attemptsMu.Lock()
-	defer c.attemptsMu.Unlock()
-	delete(c.attempts, id)
-}
-
 // Close stops the consumer and waits for handlers already running.
 //
-// A message being worked on when Close is called is finished and acknowledged,
-// rather than abandoned for the broker to hand to somebody else.
+// A message being worked on when Close is called is finished and settled, rather
+// than abandoned for the broker to hand to somebody else.
+//
+// The subscription is released last, after everything has been settled, because
+// a settlement travels on the channel its delivery arrived on. Releasing it
+// first — which is what this did until the rung tests caught it — leaves every
+// message in flight acknowledged into a channel that has gone: the broker hears
+// nothing, hands the message to another consumer, and one that had already been
+// republished for its next attempt is now on the queue twice. See [Stopper].
 func (c *Consumer) Close() error {
 	c.closeOnce.Do(func() {
-		if c.transport != nil {
-			// The transport guarantees no further deliveries once this returns,
-			// which is what makes closing the work channel safe.
+		stopper, canStop := c.transport.(Stopper)
+		if c.transport != nil && canStop {
+			// No further deliveries once this returns, which is what makes
+			// closing the work channel safe, but the channel is still open so
+			// the handlers below can settle what they hold.
+			c.closeErr = stopper.Stop()
+		} else if c.transport != nil {
 			c.closeErr = c.transport.Close()
 		}
+
 		close(c.work)
 		c.wg.Wait()
+
+		if c.transport != nil && canStop {
+			if err := c.transport.Close(); err != nil && c.closeErr == nil {
+				c.closeErr = err
+			}
+		}
 		c.conn.untrack(c)
 	})
 	return c.closeErr

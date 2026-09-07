@@ -92,16 +92,17 @@ func removeAtEnd(t *testing.T, queues []string, exchanges []string) {
 			return
 		}
 		defer func() { _ = ch.Close() }()
+		// Every one of them, even after a failure: giving up at the first leaves
+		// the rest behind, and a queue that survives a run makes the next one
+		// assert against the leftovers of the last.
 		for _, q := range queues {
 			if _, err := ch.QueueDelete(q, false, false, false); err != nil {
 				t.Logf("cannot delete queue %s: %v", q, err)
-				return
 			}
 		}
 		for _, e := range exchanges {
 			if err := ch.ExchangeDelete(e, false, false); err != nil {
 				t.Logf("cannot delete exchange %s: %v", e, err)
-				return
 			}
 		}
 	})
@@ -187,8 +188,10 @@ func TestAMessageGoesThroughARealBroker(t *testing.T) {
 //
 // The in-memory transport is written to behave this way, so on its own it
 // proves only that it matches its own design. This proves the thing the design
-// is about: RabbitMQ requeues the bytes it was given, the attempt header still
-// reads 1, and the count has to come from the redelivery flag.
+// is about: the counter rides on the message through a real broker's header
+// table, because each retry is a fresh publish carrying the advanced header —
+// where a requeue would have handed back the bytes the publisher wrote, leaving
+// the header on 1 for ever.
 func TestTheAttemptCounterAdvancesAgainstARealBroker(t *testing.T) {
 	ctx := context.Background()
 	mq := connect(t, acemq.WithRetry(acemq.FixedRetry(3, 0)))
@@ -243,8 +246,11 @@ func TestRetriesStopAndTheMessageLeavesTheQueue(t *testing.T) {
 	ctx := context.Background()
 	mq := connect(t, acemq.WithRetry(acemq.FixedRetry(2, 0)))
 	queue := queueName(t)
+	dlq := acemq.DeadLetterQueue(queue)
+	removeAtEnd(t, []string{queue, dlq, acemq.ParkedQueue(queue)}, nil)
 
-	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
+	err := acemq.NewTopology().Queue(queue).DeadLetters(queue).Apply(ctx, mq)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -276,9 +282,218 @@ func TestRetriesStopAndTheMessageLeavesTheQueue(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	mu.Lock()
-	defer mu.Unlock()
 	if calls != 2 {
 		t.Errorf("the handler ran %d times against a real broker, want exactly 2", calls)
+	}
+	mu.Unlock()
+
+	// Republished into the dead-letter queue with the reason attached, and the
+	// original acknowledged, rather than rejected and left to whatever the
+	// broker's own dead-lettering happens to point at.
+	waitFor(t, "the message to reach "+dlq, func() bool {
+		n, err := mq.MessageCount(ctx, dlq)
+		return err == nil && n == 1
+	})
+
+	dead, found, err := mq.Pull(ctx, dlq)
+	if err != nil || !found {
+		t.Fatalf("Pull: %v, found=%v", err, found)
+	}
+	defer func() { _ = dead.Ack() }()
+
+	if !strings.Contains(dead.Envelope.Error, "exhausted 2 attempts") {
+		t.Errorf("Error = %q, want it to say why", dead.Envelope.Error)
+	}
+	if !strings.Contains(dead.Envelope.Error, "still broken") {
+		t.Errorf("Error = %q, want the handler's own reason kept", dead.Envelope.Error)
+	}
+	if n, err := mq.MessageCount(ctx, queue); err != nil || n != 0 {
+		t.Errorf("the source queue holds %d messages (%v), want none", n, err)
+	}
+}
+
+// TestALongRetryWaitsInTheBrokerAndComesBack is the test the whole rung
+// mechanism exists for, and the one a fake cannot stand in for.
+//
+// It proves three things in order, against a real broker. The message is on the
+// rung queue and not on the source queue. Nothing is holding it: the consumer is
+// closed before the count is taken, so anything it still held unacknowledged
+// would have been returned to the source queue and counted there. And when the
+// rung's time-to-live expires the broker sends it home by itself, one attempt
+// further on, with no consumer involved in the waiting at any point.
+//
+// The delay is deliberately short and the threshold moved down to match, so that
+// the test takes seconds. Nothing else about the arrangement changes: the same
+// code path runs for a five-minute rung.
+func TestALongRetryWaitsInTheBrokerAndComesBack(t *testing.T) {
+	ctx := context.Background()
+	policy := acemq.FixedRetry(3, 3*time.Second).WaitInBrokerFrom(time.Second)
+	mq := connect(t, acemq.WithRetry(policy))
+
+	queue := queueName(t)
+	ladder := acemq.LadderFor(queue, policy)
+	rung := ladder.Queues()[0]
+	removeAtEnd(t,
+		[]string{queue, acemq.DeadLetterQueue(queue), acemq.ParkedQueue(queue), rung},
+		[]string{acemq.RetryExchange})
+
+	// Printed so the declaration can be put beside the Python and Ruby
+	// libraries' by eye.
+	t.Logf("%s", ladder)
+	for _, r := range ladder.Rungs {
+		t.Logf("declare queue %s durable, %s=%v, %s=%q, %s=%q",
+			r.Queue,
+			acemq.ArgMessageTTL, r.Args[acemq.ArgMessageTTL],
+			acemq.ArgDeadLetterExchange, r.Args[acemq.ArgDeadLetterExchange],
+			acemq.ArgDeadLetterRoutingKey, r.Args[acemq.ArgDeadLetterRoutingKey])
+	}
+
+	topology := acemq.NewTopology().Queue(queue).DeadLetters(queue).Retries(queue, policy)
+	if err := topology.Apply(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+
+	failed := make(chan int, 4)
+	sub, err := acemq.Consume(ctx, mq, queue,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			failed <- m.Envelope.Attempt
+			return acemq.Retry(errors.New("the payment gateway is down"))
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	published := time.Now()
+	if err := acemq.NewPublisher[OrderPlaced](mq, "", queue).
+		Send(ctx, OrderPlaced{OrderID: "o-1", TotalCents: 4250}, acemq.MessageID("m-1")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case attempt := <-failed:
+		if attempt != 1 {
+			t.Fatalf("the first delivery reported attempt %d", attempt)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the message never reached the handler")
+	}
+
+	// Closed before anything is counted. A consumer that was holding the message
+	// unacknowledged gives it back here, and it would be counted on the source
+	// queue below rather than on the rung.
+	if err := sub.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the message to reach "+rung, func() bool {
+		n, err := mq.MessageCount(ctx, rung)
+		return err == nil && n == 1
+	})
+	onRung := time.Now()
+
+	source, err := mq.MessageCount(ctx, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source != 0 {
+		t.Errorf("%s holds %d messages while the wait is on; the wait is not the broker's", queue, source)
+	}
+	t.Logf("after %s: %s holds 1, %s holds %d, and no consumer is attached",
+		onRung.Sub(published).Round(time.Millisecond), rung, queue, source)
+
+	// Nothing consumes a rung. The time-to-live is the only thing that ever
+	// takes a message out of one, and this is it happening.
+	waitFor(t, "the broker to send it home when the time-to-live expires", func() bool {
+		n, err := mq.MessageCount(ctx, queue)
+		return err == nil && n == 1
+	})
+	back := time.Now()
+
+	if n, err := mq.MessageCount(ctx, rung); err != nil || n != 0 {
+		t.Errorf("%s still holds %d messages (%v)", rung, n, err)
+	}
+	t.Logf("after a further %s the broker returned it to %s by itself",
+		back.Sub(onRung).Round(time.Millisecond), queue)
+
+	if waited := back.Sub(onRung); waited < 2*time.Second {
+		t.Errorf("the message came home after %s, which is less than the rung's three-second "+
+			"time-to-live; it cannot have waited there", waited)
+	}
+
+	returned, found, err := mq.Pull(ctx, queue)
+	if err != nil || !found {
+		t.Fatalf("Pull: %v, found=%v", err, found)
+	}
+	defer func() { _ = returned.Ack() }()
+
+	if returned.Envelope.Attempt != 2 {
+		t.Errorf("Attempt = %d, want 2: a message that has been round the broker is no less "+
+			"on its second attempt than one that waited in the consumer",
+			returned.Envelope.Attempt)
+	}
+	if returned.Envelope.ID != "m-1" {
+		t.Errorf("ID = %q, want the message's own", returned.Envelope.ID)
+	}
+	if !strings.Contains(string(returned.Body), "o-1") {
+		t.Errorf("body = %q, want the bytes that were published", returned.Body)
+	}
+}
+
+// TestARungIsDeclaredIdenticallyEverywhere puts the argument table in front of a
+// real broker, which is the only thing that can answer for it.
+//
+// A rung declared with different arguments by another service is refused with
+// PRECONDITION_FAILED, and that service cannot consume at all. This declares the
+// rung as this library does, then declares it again with a different
+// time-to-live and requires the broker to refuse — which is what would happen to
+// the second of two services if this table ever drifted.
+func TestARungIsDeclaredIdenticallyEverywhere(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+
+	queue := queueName(t)
+	policy := acemq.FixedRetry(2, time.Minute)
+	ladder := acemq.LadderFor(queue, policy)
+	rung := ladder.Queues()[0]
+	removeAtEnd(t, []string{queue, rung}, []string{acemq.RetryExchange})
+
+	if err := mq.DeclareQueue(ctx, queue); err != nil {
+		t.Fatal(err)
+	}
+	if err := ladder.Declare(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same declaration again is how AMQP is meant to be used, and has to be
+	// accepted or a second service on the same queue could never start.
+	if err := ladder.Declare(ctx, mq); err != nil {
+		t.Errorf("the same rung declared twice was refused: %v", err)
+	}
+
+	// A different one is refused, on its own channel so the refusal does not take
+	// the connection with it.
+	conn, err := amqp091.Dial(brokerURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	_, err = ch.QueueDeclare(rung, true, false, false, false, amqp091.Table{
+		"x-message-ttl":             int64(1),
+		"x-dead-letter-exchange":    acemq.RetryExchange,
+		"x-dead-letter-routing-key": queue,
+	})
+	if err == nil {
+		t.Fatal("the broker accepted a rung with a different time-to-live, which means the " +
+			"argument table is not what makes two services agree")
+	}
+	if !strings.Contains(err.Error(), "PRECONDITION_FAILED") {
+		t.Errorf("the broker refused with %v, want PRECONDITION_FAILED", err)
 	}
 }
 
@@ -287,6 +502,7 @@ func TestATopicExchangeRoutesOnARealBroker(t *testing.T) {
 	mq := connect(t)
 	exchange := queueName(t) + "-x"
 	euQueue := queueName(t) + "-eu"
+	removeAtEnd(t, []string{euQueue}, []string{exchange})
 
 	if err := mq.DeclareExchange(ctx, exchange, "topic", acemq.TransientExchange()); err != nil {
 		t.Fatal(err)
@@ -339,6 +555,7 @@ func TestDeclaringAQueueTwiceWithDifferentSettingsIsRefused(t *testing.T) {
 	ctx := context.Background()
 	mq := connect(t)
 	queue := queueName(t)
+	removeAtEnd(t, []string{queue}, nil)
 
 	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
 		t.Fatal(err)
@@ -412,6 +629,7 @@ func TestTheBrokerActuallyConfirms(t *testing.T) {
 	ctx := context.Background()
 	mq := connect(t)
 	queue := queueName(t)
+	removeAtEnd(t, []string{queue}, nil)
 
 	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
 		t.Fatal(err)
@@ -435,6 +653,7 @@ func TestAnUnroutableMandatoryMessageIsAnErrorAgainstARealBroker(t *testing.T) {
 	ctx := context.Background()
 	mq := connect(t)
 	exchange := queueName(t) + "-x"
+	removeAtEnd(t, nil, []string{exchange})
 
 	if err := mq.DeclareExchange(ctx, exchange, "topic", acemq.TransientExchange()); err != nil {
 		t.Fatal(err)
@@ -462,6 +681,7 @@ func TestARoutableMandatoryMessageIsNotMistakenForAnUnroutableOne(t *testing.T) 
 	mq := connect(t)
 	queue := queueName(t)
 	exchange := queueName(t) + "-x"
+	removeAtEnd(t, []string{queue}, []string{exchange})
 
 	if err := mq.DeclareExchange(ctx, exchange, "topic", acemq.TransientExchange()); err != nil {
 		t.Fatal(err)
@@ -511,6 +731,7 @@ func TestConfirmsCanBeTurnedOff(t *testing.T) {
 	defer mq.Close()
 
 	queue := queueName(t)
+	removeAtEnd(t, []string{queue}, nil)
 	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
 		t.Fatal(err)
 	}
@@ -534,6 +755,7 @@ func TestATopologyAppliesToARealBroker(t *testing.T) {
 	ctx := context.Background()
 	mq := connect(t)
 	prefix := queueName(t)
+	removeAtEnd(t, []string{prefix + "-q"}, []string{prefix + "-x"})
 
 	topology := acemq.NewTopology().
 		Exchange(prefix+"-x", "topic", acemq.TransientExchange()).
@@ -578,6 +800,10 @@ func TestCheckNoticesDriftOnARealBroker(t *testing.T) {
 	mq := connect(t)
 	queue := queueName(t)
 
+	// Registered first so that it runs last: clean-ups run in reverse, and the
+	// one below puts the queue back before this takes it away for good.
+	removeAtEnd(t, []string{queue, queue + "-after"}, nil)
+
 	// Durable on the broker, transient in the topology.
 	if err := mq.DeclareQueue(ctx, queue); err != nil {
 		t.Fatal(err)
@@ -613,6 +839,7 @@ func TestCheckIsQuietWhenTheRealBrokerAgrees(t *testing.T) {
 	ctx := context.Background()
 	mq := connect(t)
 	queue := queueName(t)
+	removeAtEnd(t, []string{queue}, nil)
 
 	topology := acemq.NewTopology().Queue(queue, acemq.AutoDelete())
 

@@ -87,10 +87,13 @@ run in parallel without coordinating:
 mq, err := acemq.Connect(ctx, "memory://"+t.Name())
 ```
 
-It is deliberately not more forgiving than RabbitMQ. A message returned for
-retry comes back marked redelivered, exactly as a broker would return it — a
-test transport that is kinder than the real one certifies code that then fails
-in production.
+It is deliberately not more forgiving than RabbitMQ: a message returned to a
+queue comes back marked redelivered, an unroutable mandatory publish is reported
+as unroutable, and redeclaring a queue with different arguments is refused with
+`PRECONDITION_FAILED` — a test transport that is kinder than the real one
+certifies code that then fails in production. It does not expire messages from a
+rung queue, though, because nothing in memory keeps time; the proof that a broker
+wait works end to end is a test against a real broker.
 
 ## Why publishing and consuming are functions
 
@@ -166,16 +169,99 @@ Verified against a real broker restart.
 
 ## Retry, and the attempt counter
 
-A broker requeues the bytes it was given, so the attempt header on the wire
-still reads 1 however many times a message has come back. Counting that header
-makes a retry limit that never trips and a message that goes round for ever.
-The count comes from the broker's redelivery flag instead, kept per consumer and
-keyed by message id, and there is a test against a real broker that proves it.
+A retry is **republished** onto the same queue with `x-acemq-attempt` advanced,
+and the original acknowledged. It is not requeued. A requeue hands back the bytes
+the broker was given, so the header would read 1 for ever and the count would
+have to live in a map on the consumer — which is per-process, unbounded across a
+fleet, and empty again after the restart the failing service was about to have.
+Republishing puts the counter on the message, where every consumer in every
+language can read it. The cost is that a retry goes to the back of the queue
+rather than the front; for a message that has already failed once that is the
+better trade.
 
-Delaying a retry holds the delivery, and so holds one of the consumer's prefetch
-slots. That is the honest cost of a delay without a delay queue: the alternative
-is to acknowledge and republish, which turns one message into two and loses the
-redelivery flag the count depends on.
+Giving up works the same way. A message that runs out of attempts, grows too old,
+or is rejected is republished to `{queue}.dlq` with the reason in
+`x-acemq-error`, and only then is the original acknowledged — so the reason
+survives and the destination is one this library chose. A body that will not
+decode goes to `{queue}.parked` instead: a message that failed five times and a
+message nothing could read are different problems, and whoever drains the dead
+letters should not have to sort them by hand.
+
+### Where the waiting happens
+
+Short waits are spent in the consumer, holding the delivery and one prefetch
+slot. Waits at or past `BrokerWaitThreshold` — thirty seconds by default — are
+spent in the **broker**, on a `{queue}.retry.{delay}` rung whose `x-message-ttl`
+is the wait and whose dead-letter target is the queue it came from. Nothing
+consumes a rung; the time-to-live is the only thing that ever takes a message out
+of one.
+
+The threshold exists because a consumer sleeping through a five-minute backoff is
+holding an unacknowledged message: restart it and the broker redelivers at once,
+so a five-minute policy delivers in none. Below thirty seconds a lost wait costs
+seconds and a queue per rung is not worth it; above it the lost wait is the whole
+delay. `WaitInBrokerFrom(0)` turns rungs off entirely, for a service that may not
+declare queues on its broker.
+
+One queue per distinct delay, and **never** a per-message TTL: RabbitMQ expires
+messages only from the head of a queue, so one queue of per-message TTLs lets a
+ten-minute wait at the front hold back every thirty-second one behind it.
+
+Declare the rungs with the topology, from the same policy the consumer runs:
+
+```go
+policy := acemq.ExponentialRetry(6, 10*time.Second, 0)
+
+err := acemq.NewTopology().
+	Queue("orders").
+	DeadLetters("orders").   // orders.dlq and orders.parked
+	Retries("orders", policy). // orders.retry.40s, .80s, .160s
+	Apply(ctx, mq)
+```
+
+A rung is declared with exactly three arguments, and they are a cross-language
+contract rather than a preference — two services on the same queue declare the
+same rung by name, so different arguments mean the second is refused with
+`PRECONDITION_FAILED` and cannot consume at all:
+
+| argument | value |
+|---|---|
+| `x-message-ttl` | the delay in milliseconds |
+| `x-dead-letter-exchange` | `acemq.retry` (`RetryExchange`) |
+| `x-dead-letter-routing-key` | the source queue |
+
+The exchange is the one thing the five AceMQ libraries do not yet agree on: Java
+declares `acemq.retry` and binds each source queue to it, Python and Ruby
+dead-letter through the default exchange, which routes by queue name and needs no
+binding. This library follows Java for now, and the choice is one constant —
+`RetryExchange` in `amqp/retryladder.go` — with a test pinning whatever it says.
+
+### The schedule
+
+Exponential doubling with 20% jitter applied in **both** directions, because
+jitter that only ever delays turns a thundering herd into a slower one. The
+ceiling is applied inside the loop as well as after it, so a large multiplier
+cannot run the delay towards overflow before the ceiling is reached. A policy can
+also give up on age — `GiveUpAfter(time.Hour)` — which is the bound that matters
+when a queue has been paused: attempts say nothing about how long a message has
+been waiting.
+
+A broker wait is never jittered. A rung's TTL is fixed at declaration, so a moved
+delay would name a queue that is not there — and the spread is free anyway,
+because each message's TTL starts when it arrives rather than when the batch
+failed.
+
+`Schedule()` is the policy without jitter, which is what to read when deciding
+whether a policy is the one you meant: `ExponentialRetry(5, time.Second,
+time.Minute)` is `[1s 2s 4s 8s]` in Go, Java, .NET, Python and Ruby alike.
+
+### Replay
+
+`patterns.Replay` puts a dead-letter queue back through the system, and resets
+each message to attempt one unless `KeepAttempts` says otherwise. Without the
+reset a message dead-lettered on the last attempt of a five-attempt policy is
+dead-lettered again before any handler sees it, and the operator who has just
+fixed the bug has moved two thousand messages from one queue to the same queue.
 
 ## Running the tests
 

@@ -87,9 +87,15 @@ func WithOrigin(origin string) ConnOption {
 
 // WithRetry sets the retry policy consumers use by default.
 //
-// Without one a message returned by [Retry] is simply requeued, and the broker
+// Without one a message returned by [Retry] is republished onto its own queue at
+// once, with its attempt counter advanced and nothing to stop it, and the broker
 // will hand it back as fast as it can. That is rarely what anybody wants for
 // long, so set a policy for anything that is not a toy.
+//
+// A policy with waits at or past its [RetryPolicy.BrokerWaitThreshold] needs its
+// rung queues declared — see [Topology.Retries]. A consumer whose rungs are
+// missing still retries, but waits in the process instead and counts
+// [MetricRungMissing] each time.
 func WithRetry(p RetryPolicy) ConnOption {
 	return func(cfg *connConfig) error {
 		if err := p.Validate(); err != nil {
@@ -254,8 +260,14 @@ func QueueArg(name string, value any) QueueOption {
 }
 
 // DeadLetterTo sends rejected messages from this queue to an exchange.
+//
+// This is the broker's own dead-lettering, which is not how this library gives
+// up on a message: a consumer that has run out of attempts republishes to
+// {queue}.dlq with the reason attached and then acknowledges the original, so
+// that the reason survives and the destination is one it chose. See
+// [Topology.DeadLetters].
 func DeadLetterTo(exchange string) QueueOption {
-	return QueueArg("x-dead-letter-exchange", exchange)
+	return QueueArg(ArgDeadLetterExchange, exchange)
 }
 
 // ExchangeOption adjusts how an exchange is declared.

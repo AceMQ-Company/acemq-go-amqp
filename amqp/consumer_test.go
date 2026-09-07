@@ -101,59 +101,6 @@ func TestAMessageGoesRoundTrip(t *testing.T) {
 	}
 }
 
-// TestTheAttemptCounterAdvancesOnRedelivery is the one that matters most here.
-//
-// A broker requeues the bytes it was given, so the attempt header on the wire
-// still reads 1 however many times a message has come back. Counting the header
-// rather than the redelivery makes a retry limit that never trips, and the
-// message goes round for ever.
-func TestTheAttemptCounterAdvancesOnRedelivery(t *testing.T) {
-	ctx := context.Background()
-	mq := brokerFor(t, WithRetry(FixedRetry(3, 0)))
-	declare(t, mq, "orders")
-
-	var mu sync.Mutex
-	var attempts []int
-
-	sub, err := Consume(ctx, mq, "orders",
-		func(_ context.Context, m Message[OrderPlaced]) Ack {
-			mu.Lock()
-			attempts = append(attempts, m.Envelope.Attempt)
-			n := len(attempts)
-			mu.Unlock()
-
-			if n < 3 {
-				return Retry(errors.New("not yet"))
-			}
-			return Accept()
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sub.Close()
-
-	pub := NewPublisher[OrderPlaced](mq, "", "orders")
-	if err := pub.Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
-		t.Fatal(err)
-	}
-
-	waitFor(t, "three deliveries", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(attempts) >= 3
-	})
-
-	mu.Lock()
-	defer mu.Unlock()
-	want := []int{1, 2, 3}
-	for i, w := range want {
-		if attempts[i] != w {
-			t.Errorf("delivery %d reported attempt %d, want %d (the whole sequence was %v)",
-				i+1, attempts[i], w, attempts)
-		}
-	}
-}
-
 func TestRetryingStopsWhenTheAttemptsRunOut(t *testing.T) {
 	ctx := context.Background()
 	mq := brokerFor(t, WithRetry(FixedRetry(2, 0)))
@@ -632,4 +579,348 @@ func TestTheResultReportsAnUnroutableMessage(t *testing.T) {
 	if result.ReturnReason == "" {
 		t.Error("nothing explains why it was not routed")
 	}
+}
+
+// ---- where a failed message goes -------------------------------------
+
+// TestARetryIsRepublishedRatherThanRequeued watches for the difference from the
+// outside.
+//
+// A requeued message comes back marked redelivered and still carrying the
+// attempt the publisher wrote. A republished one arrives as a new message, one
+// attempt further on, which is what makes the count survive a consumer that
+// restarts and a fleet that shares the queue.
+func TestARetryIsRepublishedRatherThanRequeued(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t, WithRetry(FixedRetry(3, 0)))
+	declare(t, mq, "orders")
+
+	type delivery struct {
+		attempt     int
+		redelivered bool
+	}
+	var mu sync.Mutex
+	var seen []delivery
+
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			mu.Lock()
+			seen = append(seen, delivery{m.Envelope.Attempt, m.Redelivered})
+			n := len(seen)
+			mu.Unlock()
+
+			if n < 3 {
+				return Retry(errors.New("not yet"))
+			}
+			return Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "three deliveries", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(seen) >= 3
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i, want := range []int{1, 2, 3} {
+		if seen[i].attempt != want {
+			t.Errorf("delivery %d reported attempt %d, want %d (all: %v)",
+				i+1, seen[i].attempt, want, seen)
+		}
+		if seen[i].redelivered {
+			t.Errorf("delivery %d arrived marked redelivered, so it was requeued rather than "+
+				"republished and the attempt header cannot have advanced", i+1)
+		}
+	}
+}
+
+// TestAConsumerReadsTheAttemptOffTheWire is the other half of the same point.
+//
+// This consumer has never seen the message before. If the count lived in its
+// memory it would call this the first attempt and give the message a full
+// schedule of its own, which is how a message survives a policy that says three
+// attempts: every consumer it lands on starts again.
+func TestAConsumerReadsTheAttemptOffTheWire(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t, WithRetry(FixedRetry(5, 0)))
+	declare(t, mq, "orders")
+
+	got := make(chan int, 1)
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			got <- m.Envelope.Attempt
+			return Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	_, err = mq.PublishRaw(ctx, "", "orders", Outbound{
+		Body:        []byte(`{"orderId":"o-1"}`),
+		ContentType: JSONContentType,
+		MessageID:   "m-1",
+		Headers:     map[string]any{HeaderID: "m-1", HeaderAttempt: 4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case attempt := <-got:
+		if attempt != 4 {
+			t.Errorf("Attempt = %d, want the 4 the message arrived with", attempt)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the message never arrived")
+	}
+}
+
+func TestGivingUpPutsTheMessageInTheDeadLetterQueueWithTheReason(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t, WithRetry(FixedRetry(2, 0)))
+	declare(t, mq, "orders")
+	declare(t, mq, "orders.dlq")
+
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			return Retry(errors.New("the database timed out"))
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}, MessageID("m-1")); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the message to reach the dead-letter queue", func() bool {
+		n, err := mq.MessageCount(ctx, "orders.dlq")
+		return err == nil && n == 1
+	})
+
+	dead, found, err := mq.Pull(ctx, "orders.dlq")
+	if err != nil || !found {
+		t.Fatalf("Pull: %v, found=%v", err, found)
+	}
+	defer func() { _ = dead.Ack() }()
+
+	// Republished with the reason attached rather than nacked, so that whoever
+	// drains this queue can see why without reading the consumer's logs — and so
+	// that the message goes where this library chose rather than wherever the
+	// broker's own dead-lettering points.
+	if !strings.Contains(dead.Envelope.Error, "exhausted 2 attempts") {
+		t.Errorf("Error = %q, want it to say the attempts ran out", dead.Envelope.Error)
+	}
+	if !strings.Contains(dead.Envelope.Error, "the database timed out") {
+		t.Errorf("Error = %q, want the handler's reason kept", dead.Envelope.Error)
+	}
+	if dead.Envelope.ID != "m-1" {
+		t.Errorf("ID = %q, want the message's own", dead.Envelope.ID)
+	}
+
+	// And it is gone from the queue it failed on, rather than sitting there
+	// unacknowledged or coming round again.
+	if n, err := mq.MessageCount(ctx, "orders"); err != nil || n != 0 {
+		t.Errorf("the source queue holds %d messages (%v), want none", n, err)
+	}
+}
+
+func TestARejectedMessageSaysWhoRejectedIt(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t, WithRetry(FixedRetry(5, 0)))
+	declare(t, mq, "orders")
+	declare(t, mq, "orders.dlq")
+
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			return Reject(errors.New("no such customer"))
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the rejection", func() bool {
+		n, err := mq.MessageCount(ctx, "orders.dlq")
+		return err == nil && n == 1
+	})
+
+	dead, _, err := mq.Pull(ctx, "orders.dlq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dead.Ack() }()
+
+	if !strings.Contains(dead.Envelope.Error, "no such customer") {
+		t.Errorf("Error = %q", dead.Envelope.Error)
+	}
+}
+
+func TestABodyThatWillNotDecodeIsParkedRatherThanDeadLettered(t *testing.T) {
+	// Different problems with different answers: a message that failed five
+	// times is usually the world, and a message nothing could read is usually a
+	// producer. Whoever drains the dead letters should not have to sort them by
+	// hand.
+	ctx := context.Background()
+	mq := brokerFor(t, WithRetry(FixedRetry(5, 0)))
+	declare(t, mq, "orders")
+	declare(t, mq, "orders.dlq")
+	declare(t, mq, "orders.parked")
+
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack { return Accept() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	_, err = mq.transport.Publish(ctx, "", "orders", Outbound{
+		Body:        []byte("this is not json"),
+		ContentType: JSONContentType,
+		MessageID:   "m-1",
+		Headers:     map[string]any{HeaderID: "m-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the message to be parked", func() bool {
+		n, err := mq.MessageCount(ctx, "orders.parked")
+		return err == nil && n == 1
+	})
+
+	parked, _, err := mq.Pull(ctx, "orders.parked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = parked.Ack() }()
+
+	if !strings.Contains(parked.Envelope.Error, "could not be decoded") {
+		t.Errorf("Error = %q", parked.Envelope.Error)
+	}
+	if n, err := mq.MessageCount(ctx, "orders.dlq"); err != nil || n != 0 {
+		t.Errorf("the dead-letter queue holds %d messages (%v), want the parking lot to have it",
+			n, err)
+	}
+}
+
+func TestALongWaitIsHandedToTheBrokerAndNotHeldHere(t *testing.T) {
+	ctx := context.Background()
+	policy := FixedRetry(3, time.Minute)
+	mq := brokerFor(t, WithRetry(policy))
+	declare(t, mq, "orders")
+
+	ladder := LadderFor("orders", policy)
+	if err := ladder.Declare(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			return Retry(errors.New("the payment gateway is down"))
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the message to reach the rung", func() bool {
+		n, err := mq.MessageCount(ctx, "orders.retry.1m")
+		return err == nil && n == 1
+	})
+
+	// The point of the whole arrangement: the minute is the broker's. Nothing is
+	// held here, so a restart in the next fifty-nine seconds costs nothing.
+	if n, err := mq.MessageCount(ctx, "orders"); err != nil || n != 0 {
+		t.Errorf("the source queue holds %d messages (%v); the wait is being held here", n, err)
+	}
+
+	waiting, _, err := mq.Pull(ctx, "orders.retry.1m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = waiting.Ack() }()
+
+	if waiting.Envelope.Attempt != 2 {
+		t.Errorf("Attempt = %d on the rung, want 2: a message that has been round the broker "+
+			"is no less on its second attempt than one that waited here",
+			waiting.Envelope.Attempt)
+	}
+}
+
+func TestARungThatIsNotThereFallsBackToWaitingHere(t *testing.T) {
+	// Degraded rather than fatal. The message is still deliverable and waiting
+	// for it here is what this library did before there were rungs — but it is
+	// counted, because a topology that declares the queue and forgets its rungs
+	// otherwise looks like it works.
+	ctx := context.Background()
+	metrics := NewMetrics()
+	policy := FixedRetry(2, 50*time.Millisecond).WaitInBrokerFrom(10 * time.Millisecond)
+	mq := brokerFor(t, WithRetry(policy), WithObserver(metrics))
+	declare(t, mq, "orders")
+	declare(t, mq, "orders.dlq")
+
+	var mu sync.Mutex
+	calls := 0
+
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			return Retry(errors.New("still broken"))
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the retry that had nowhere to wait", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls >= 2
+	})
+
+	if total := countOf(metrics, MetricRungMissing); total == 0 {
+		t.Errorf("%s was never counted, so a missing rung is silent", MetricRungMissing)
+	}
+}
+
+// countOf adds up a metric across whatever labels it was counted with.
+func countOf(m *Metrics, metric string) int64 {
+	var total int64
+	for key, value := range m.Counts() {
+		if key == metric || strings.HasPrefix(key, metric+"{") {
+			total += value
+		}
+	}
+	return total
 }

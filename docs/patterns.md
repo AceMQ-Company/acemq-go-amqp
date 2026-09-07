@@ -203,6 +203,13 @@ Messages the filter declines stay where they are. Each replayed message is
 stamped `acemq-replayed-from`, `acemq-replayed-at` and `acemq-replay-count`, so a
 consumer that needs to treat them differently can.
 
+**Attempts start again.** A replayed message goes back on attempt one with the
+reason it was dead-lettered cleared, because a message dead-lettered on the last
+attempt of a five-attempt policy would otherwise be dead-lettered again before
+any handler saw it — two thousand messages moved from one queue to the same
+queue. `KeepAttempts: true` puts back exactly what was there, for an audit or for
+a queue read by something that counts attempts itself.
+
 **How it knows when to stop.** It reads the queue a message at a time and stops
 when the broker has nothing left to hand over.
 

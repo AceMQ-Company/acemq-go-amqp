@@ -622,6 +622,7 @@ type subscription struct {
 	tag     string
 
 	wg        sync.WaitGroup
+	stopOnce  sync.Once
 	closeOnce sync.Once
 	closeErr  error
 	closed    bool
@@ -696,13 +697,19 @@ func (s *subscription) run(deliveries <-chan amqp.Delivery, deliver func(acemq.D
 	}
 }
 
-// Close cancels the consumer and waits for the deliveries already dispatched.
+// Stop cancels the consumer and waits for the deliveries already dispatched.
 //
 // Cancelling closes the delivery channel once the broker has acknowledged it,
 // which ends the loop above; waiting on that is what lets the caller rely on no
 // further deliveries once this returns.
-func (s *subscription) Close() error {
-	s.closeOnce.Do(func() {
+//
+// The AMQP channel is deliberately left open. A message the consumer is still
+// working on is acknowledged — or republished and then acknowledged — on the
+// channel it arrived on, and a channel closed underneath that turns every
+// settlement in flight into a message the broker never heard about and hands to
+// somebody else. Close releases it, once the handlers are done.
+func (s *subscription) Stop() error {
+	s.stopOnce.Do(func() {
 		s.mu.Lock()
 		s.closed = true
 		ch, tag := s.channel, s.tag
@@ -715,9 +722,16 @@ func (s *subscription) Close() error {
 			s.closeErr = nil
 		}
 		s.wg.Wait()
+	})
+	return s.closeErr
+}
 
+// Close stops the consumer if it is still running, and releases its channel.
+func (s *subscription) Close() error {
+	_ = s.Stop()
+	s.closeOnce.Do(func() {
 		// Read again: a recovery may have replaced the channel between the
-		// cancel and the wait.
+		// cancel and now.
 		s.mu.Lock()
 		current := s.channel
 		s.mu.Unlock()
