@@ -10,6 +10,51 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`telemetry/otel`, OpenTelemetry spans for publishes and deliveries.** A
+  module of its own — `github.com/AceMQ-Company/acemq-go-amqp/telemetry/otel` —
+  so `go.opentelemetry.io/otel` never becomes a dependency of anyone who only
+  wanted a message queue, the same arrangement as the codec modules. It pins
+  OpenTelemetry v1.38.0, the newest release that still builds on Go 1.23; v1.39.0
+  requires 1.24 and taking it would move the library's floor for everyone.
+
+  A handler's span is a child of the publish that caused it, and the parent comes
+  out of the message's own `traceparent` header rather than out of whatever the
+  delivery goroutine happened to be doing. Those are two different traces,
+  minutes and machines apart, and joining them is the one thing a messaging
+  system needs from tracing that an HTTP client does not. There is a test that
+  hands a handler a message from one trace while a live, unrelated span is
+  current on the goroutine, and fails if the ambient one wins.
+
+  `traceparent` and `tracestate` are deliberately not `x-acemq-` prefixed. They
+  are the W3C names that every other tracing tool already knows, and the Java,
+  .NET, Python and Ruby libraries write the same two, so a Go consumer joins a
+  Java producer's trace with neither side configured for the other.
+
+  Span names, kinds and attributes are the Java adapter's: `<destination>
+  publish` as a PRODUCER, `<queue> process` as a CONSUMER, `<destination>
+  request` as a CLIENT — CLIENT because that span waits for an answer, and a
+  reader who cannot tell it from a publish cannot tell a slow broker from a slow
+  responder. `unroutable`, `failed` and `dead_lettered` set the span status to
+  ERROR; `acked`, `retried` and `rejected` do not, because a retry is the system
+  working and a rejection is a decision, and marking either as an error is how a
+  trace view fills with red and stops meaning anything.
+
+  `outbox.publish_failed`, `pipeline.run_finished`, `message.retried` and
+  `message.dead_lettered` are events on the span already open rather than spans of
+  their own: a zero-length span at the end of a trace adds a row and no
+  information. An event with no span open is dropped rather than opening one.
+
+  `Tracing.PropagationHeaders` injects the current context into a fresh carrier,
+  for a message this library does not publish — an outbox record, whose publish
+  happens later and elsewhere.
+
+  Go's interceptors run before a publish rather than around it, so the shape
+  differs from the Python and Ruby adapters: the span comes from
+  `otel.NewPublisher` and `otel.Handle`, and the interceptor writes the headers
+  and completes the publish span's message attributes. The interceptor leaves a
+  span it did not open alone, so an HTTP server span that happens to be current
+  does not acquire messaging attributes.
+
 - **`patterns.Saga`, for work that spans services.** Steps run in order and the
   completed ones are undone in reverse when one fails, because that is the order
   the world was changed in. A step whose `Undo` is nil is skipped rather than
@@ -55,6 +100,24 @@ While the version is `0.x` the public API may change in any release.
   payload. `patterns.ScheduleTopology()` is the whole declaration, exported so a
   deployment can apply it up front or compare it with another AceMQ library's by
   eye.
+
+### Fixed
+
+- **`crypto.ContentType` no longer claims an interoperability that does not
+  exist.** Its documentation said the content type was "what Java and .NET
+  write", which is true of the string and of nothing after it. This package
+  frames a message as version, key id length (two bytes), key id, nonce,
+  ciphertext; Java, Python and Ruby put a `0xAE` magic byte first and use a
+  one-byte key id length; .NET does not use AES-GCM at all, but AES-256-CBC with
+  a separate HMAC-SHA-256. All four write
+  `application/vnd.acemq.encrypted` and mean four different things by it.
+
+  Nothing on the wire changed — a framing change is not backwards compatible with
+  itself, and would strand everything already encrypted — only the comment, which
+  now says plainly that an encrypted body is not portable between the libraries.
+  The security guide said the library did not encrypt bodies at all, which has
+  been untrue since `crypto` landed; it now describes what is really there,
+  including the incompatibility.
 
 ## [0.3.0] - 2026-09-08
 

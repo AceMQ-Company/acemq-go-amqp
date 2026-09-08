@@ -1,4 +1,4 @@
-# Metrics and health
+# Metrics, tracing and health
 
 ## Metrics
 
@@ -60,6 +60,120 @@ the application.
 Labels are sorted into the key. Go randomises map iteration deliberately, so a
 key built by walking the map would differ each time and one counter would quietly
 become many — there is a test for that.
+
+## Tracing
+
+Metrics answer *how much*. A trace answers *what happened to this message*: it
+was published by the checkout service, retried twice over four minutes and given
+up on — which is the question somebody is actually holding when they open a
+dashboard.
+
+```bash
+go get github.com/AceMQ-Company/acemq-go-amqp/telemetry/otel
+```
+
+```go
+import "github.com/AceMQ-Company/acemq-go-amqp/telemetry/otel"
+
+tracing := otel.New()
+
+mq, err := acemq.Connect(ctx, url,
+	acemq.WithPublishInterceptor(tracing.PublishInterceptor()))
+
+orders := otel.NewPublisher[OrderPlaced](tracing, mq, "", "orders")
+err = orders.Send(ctx, order)
+
+_, err = acemq.Consume(ctx, mq, "orders",
+	otel.Handle(tracing, "orders", handle))
+```
+
+A module of its own, so `go.opentelemetry.io/otel` never becomes a dependency of
+the core — the same arrangement as the codec modules. A service that publishes
+messages and traces nothing resolves nothing new.
+
+`otel.New()` takes the process's tracer provider, so **nothing is emitted until
+the application configures an SDK**. The exporter and the sampler are the
+application's business; this module only says what happened.
+
+### The join across processes is the point
+
+A consumer's span is a child of the publish that caused it, and the parent comes
+out of **the message's own headers** rather than out of whatever the delivery
+goroutine happened to be doing. Those are two different traces, minutes and
+machines apart, and joining them is the one thing a messaging system needs from
+tracing that an HTTP client does not.
+
+That is what `traceparent` carries. It is deliberately **not** `x-acemq-`
+prefixed: it is the W3C name, which every other tracing tool already knows, and
+renaming it would make this library's traces invisible to all of them. The Java,
+.NET, Python and Ruby libraries write the same two headers, so a Go consumer
+joins a Java producer's trace without either side being configured for the other.
+
+### Span names and kinds
+
+| | | |
+|---|---|---|
+| `<destination> publish` | `PRODUCER` | a publish |
+| `<queue> process` | `CONSUMER` | a handler |
+| `<destination> request` | `CLIENT` | a request that waits for its reply |
+
+`CLIENT` for a request rather than `PRODUCER` because that span waits: its
+duration is a round trip. A reader who cannot tell the two apart cannot tell a
+slow broker from a slow responder.
+
+### Attributes
+
+| Attribute | |
+|---|---|
+| `messaging.system` | `rabbitmq`, or whatever `otel.WithSystem` says |
+| `messaging.destination.name` | the exchange, or the queue on the way in |
+| `messaging.operation` | `publish`, `process` or `request` |
+| `messaging.message.id` | the envelope's identifier |
+| `messaging.message.conversation_id` | its correlation |
+| `messaging.rabbitmq.destination.routing_key` | the key it went out under |
+| `messaging.acemq.message_type` | the logical type |
+| `messaging.acemq.attempt` | which delivery attempt this is |
+| `messaging.acemq.outcome` | how it ended |
+
+The first six are the OpenTelemetry messaging conventions; the last three have no
+standard names and are the three things most often wanted. Every AceMQ library
+writes the same set.
+
+### Which outcomes are errors
+
+`unroutable`, `failed` and `dead_lettered` set the span status to `ERROR`.
+
+`acked`, `retried`, `rejected`, `confirmed`, `published`, `answered` and
+`timed_out` do not. A retry is the system working — the message will be tried
+again and very often succeeds — and a message the handler refused on purpose is a
+decision rather than a fault. Marking either as an error is how a trace view
+fills with red and stops meaning anything.
+
+### Events rather than spans
+
+`outbox.publish_failed`, `pipeline.run_finished`, `message.retried` and
+`message.dead_lettered` are events on the span that is already open, not spans of
+their own. A zero-length span at the end of a trace adds a row and no
+information.
+
+```go
+tracing.MessageDeadLettered(ctx, "orders", envelope, "out of attempts")
+```
+
+An event with no span open is dropped rather than opening one for itself. That
+is a legitimate answer: an outbox relay on its own goroutine with no delivery in
+flight has nothing to hang an event on.
+
+### Trace context for a message this library does not publish
+
+```go
+headers := tracing.PropagationHeaders(ctx)  // map[string]string, empty when untraced
+tracing.Inject(ctx, &envelope)              // the same thing, onto an envelope
+```
+
+For a record going into an outbox, whose publish happens later and elsewhere.
+Every message published on a connection carrying `tracing.PublishInterceptor()`
+already has this written for it.
 
 ## Health
 

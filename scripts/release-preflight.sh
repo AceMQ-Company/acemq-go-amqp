@@ -24,7 +24,11 @@ version="${version#v}"
 cd "$(dirname "$0")/.."
 
 nested_codecs="codec/yaml codec/toml codec/protobuf codec/avro"
-nested_all="$nested_codecs patterns/sqltest"
+# telemetry/otel is not a codec, but it is published exactly like one: its own
+# module, its own path-prefixed tag, and a require on the parent that has to
+# name a version that exists.
+nested_published="$nested_codecs telemetry/otel"
+nested_all="$nested_published patterns/sqltest"
 
 failed=0
 fail() { echo "  NO   $*"; failed=1; }
@@ -71,7 +75,7 @@ done
 # does not contain package", which reads like the package was left out.
 
 echo "  --   tag these together with v$version:"
-for module in $nested_codecs; do
+for module in $nested_published; do
   echo "         $module/v$version"
 done
 
@@ -102,9 +106,9 @@ fi
 
 echo "Ready. Tag it:"
 echo
-for module in $nested_codecs; do
+for module in $nested_published; do
   echo "  git tag -a $module/v$version -m 'AceMQ for Go $module $version'"
 done
 echo "  git tag -a v$version   # with release notes"
-echo "  git push origin $(for m in $nested_codecs; do printf '%s/v%s ' "$m" "$version"; done)"
+echo "  git push origin $(for m in $nested_published; do printf '%s/v%s ' "$m" "$version"; done)"
 echo "  git push origin v$version"

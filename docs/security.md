@@ -197,13 +197,26 @@ error from a failed login.
 - `AllowDevelopmentCertificates` **not** called. If it is, something is wrong.
 - The broker account has the narrowest permissions that do the job. This library
   does not manage broker users; that is the broker's own configuration.
-- Message bodies are not encrypted by this library. If the payload needs
-  protecting at rest inside the broker, encrypt it before publishing — the Java
-  library's `EncryptedCodec` has no Go equivalent yet.
+- Message bodies travel in the clear unless you wrap the codec in `crypto.Wrap`.
+  If the payload needs protecting at rest inside the broker, wrap it — and read
+  the next paragraph before assuming another language can open the result.
+
+## Encrypted bodies are not portable between the libraries
+
+`crypto` and the Java, .NET, Python and Ruby equivalents all write
+`application/vnd.acemq.encrypted`, and that string is all they share. This
+package frames a message as version, key id length, key id, nonce, ciphertext;
+Java, Python and Ruby put a `0xAE` magic byte first and use a one-byte key id
+length; .NET does not use AES-GCM at all, but AES-256-CBC with a separate
+HMAC-SHA-256. A body encrypted by one of them will not open in another.
+
+Encrypt on one side of a queue that the other side of it also decrypts, in the
+same language, and the arrangement holds. Do not plan on a Java producer and a
+Go consumer sharing a key.
 
 ## What this library does not do
 
 It secures the connection. It does not manage broker users or permissions, hold
-your keys, encrypt message bodies, or decide who may publish what.
+your keys, or decide who may publish what.
 
 Reporting a problem: [SECURITY.md](https://github.com/AceMQ-Company/acemq-go-amqp/blob/main/SECURITY.md).

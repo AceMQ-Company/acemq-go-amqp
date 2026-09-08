@@ -155,7 +155,7 @@ elsewhere.
 - [Retries, redelivery and shutdown](reliability.md)
 - [Patterns](patterns.md) — request-reply, idempotency, outbox, ordering, replay,
   sagas, delayed delivery
-- [Metrics and health](observability.md)
+- [Metrics, tracing and health](observability.md)
 - [Testing without a broker](testing.md)
 - [API reference](https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp) on
   pkg.go.dev

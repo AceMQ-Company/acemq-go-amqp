@@ -76,11 +76,12 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
-      - name: Build and test every codec module
+      - name: Build and test every optional module
         # Each is a module of its own, so nothing in the root build covers
-        # them. A codec left broken is a format nobody can use.
+        # them. A codec left broken is a format nobody can use, and a broken
+        # telemetry/otel is a service that cannot be traced.
         run: |
-          for module in codec/yaml codec/toml codec/protobuf codec/avro; do
+          for module in codec/yaml codec/toml codec/protobuf codec/avro telemetry/otel; do
             echo "--- $module"
             (cd "$module" && go build ./... && go vet ./... && go test -count=1 ./...)
           done

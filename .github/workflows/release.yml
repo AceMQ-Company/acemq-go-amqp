@@ -76,12 +76,14 @@ jobs:
           go vet ./...
           go test -race -count=1 ./...
 
-      - name: Build every codec module
+      - name: Build every optional module
         # Each is a module of its own, so nothing in the root build covers
         # them. A release that leaves one broken is a release nobody can use
-        # that format from.
+        # that format -- or that tracing -- from. Built on 1.23 like everything
+        # else here, which is what keeps telemetry/otel on an OpenTelemetry
+        # release that does not raise the library's floor.
         run: |
-          for module in codec/yaml codec/toml codec/protobuf codec/avro; do
+          for module in codec/yaml codec/toml codec/protobuf codec/avro telemetry/otel; do
             echo "--- $module"
             (cd "$module" && go build ./... && go vet ./...)
           done
@@ -103,7 +105,7 @@ jobs:
           version="${GITHUB_REF_NAME}"
           tags="$(git ls-remote --tags origin | sed -e 's#.*refs/tags/##' -e 's#\^{}$##')"
           missing=""
-          for module in codec/yaml codec/toml codec/protobuf codec/avro; do
+          for module in codec/yaml codec/toml codec/protobuf codec/avro telemetry/otel; do
             if ! printf '%s\n' "$tags" | grep -qx "$module/$version"; then
               missing="$missing $module/$version"
             fi
@@ -118,7 +120,7 @@ jobs:
           fi
           echo "every nested module is tagged"
 
-      - name: Check the codec modules require a released parent
+      - name: Check the nested modules require a released parent
         # A replace directive is ignored by anyone importing the module, so a
         # codec whose go.mod points at ../.. resolves the parent by its require
         # version. That version has to exist, or `go get` on the codec fails
@@ -126,7 +128,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           failed=0
-          for module in codec/yaml codec/toml codec/protobuf codec/avro patterns/sqltest; do
+          for module in codec/yaml codec/toml codec/protobuf codec/avro telemetry/otel patterns/sqltest; do
             required=$(grep -oE 'github.com/AceMQ-Company/acemq-go-amqp v[0-9][^ ]*' "$module/go.mod" | awk '{print $2}')
             if [ "$required" != "v$version" ]; then
               echo "::error::$module requires the parent at $required; the tag is v$version"

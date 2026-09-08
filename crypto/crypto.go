@@ -50,8 +50,29 @@ import (
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
 )
 
-// ContentType is what an encrypted message carries, and what Java and .NET
-// write.
+// ContentType is what an encrypted message carries. Java, .NET, Python and Ruby
+// write the same string.
+//
+// The string is all that is shared. What follows it is not: this package frames
+// a message as
+//
+//	[1 byte version][2 bytes key id length][key id][12 byte nonce][ciphertext+tag]
+//
+// while Java, Python and Ruby write a magic byte first and a one-byte key id
+// length —
+//
+//	[0xAE][1 byte version][1 byte key id length][key id][12 byte nonce][ciphertext+tag]
+//
+// — and .NET does not use AES-GCM at all, but AES-256-CBC with a separate
+// HMAC-SHA-256. So a body encrypted here cannot be read by any of the others,
+// and none of theirs can be read here: the content type says "encrypted", and
+// the four libraries mean four different things by it.
+//
+// Do not treat this as an interoperability guarantee, and do not change the
+// framing to obtain one without deciding what happens to everything already
+// encrypted. A format change is not backwards compatible with itself: the
+// version byte lets a reader say so clearly, and says nothing about how to open
+// a message written before it.
 const ContentType = "application/vnd.acemq.encrypted"
 
 // KeySize is the length of a key in bytes. AES-256.

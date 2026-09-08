@@ -131,7 +131,44 @@ A package per concern, with nothing at the module root:
 | `actuator/` | metrics, health and info over HTTP, on the same paths as Java and .NET. |
 | `crypto/` | encrypted message bodies, AES-GCM. Standard library only. |
 | `codec/xml`, `codec/yaml`, `codec/toml`, `codec/protobuf`, `codec/avro` | one module each, so the core keeps its single dependency. |
+| `telemetry/otel/` | OpenTelemetry spans, a module of its own for the same reason. |
 | `devcerts/` | development certificates, behind `cmd/acemq-certs`. |
+
+## Tracing
+
+```bash
+go get github.com/AceMQ-Company/acemq-go-amqp/telemetry/otel
+```
+
+```go
+tracing := otel.New()
+
+mq, err := acemq.Connect(ctx, url,
+	acemq.WithPublishInterceptor(tracing.PublishInterceptor()))
+
+orders := otel.NewPublisher[OrderPlaced](tracing, mq, "", "orders")
+
+_, err = acemq.Consume(ctx, mq, "orders",
+	otel.Handle(tracing, "orders", handle))
+```
+
+A handler's span is a child of the publish that caused it, taken from the
+message's own `traceparent` header rather than from whatever the delivery
+goroutine happened to be doing. Those are two different traces, minutes and
+machines apart, and joining them is the one thing a messaging system needs from
+tracing that an HTTP client does not.
+
+`traceparent` and `tracestate` are deliberately not `x-acemq-` prefixed: they are
+the W3C names, and the Java, .NET, Python and Ruby libraries write the same two,
+so a Go consumer joins a Java producer's trace with neither side configured for
+the other.
+
+A module of its own, so `go.opentelemetry.io/otel` never becomes a dependency of
+anyone who only wanted a message queue. Nothing is emitted until the application
+configures an SDK.
+
+Full detail in
+[metrics, tracing and health](https://acemq.org/acemq-go-amqp/observability.html).
 
 ## Security
 
