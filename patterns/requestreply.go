@@ -73,6 +73,11 @@ type requesterConfig struct {
 // One is generated when this is not given: an exclusive, auto-deleting queue
 // belonging to this process, which is what most callers want. Name one only
 // when replies must survive a restart.
+//
+// A named one is declared durable, and so is quorum like any other durable
+// queue this library declares. A generated one is classic and has to be:
+// RabbitMQ allows a quorum queue to be neither exclusive nor auto-deleting, and
+// a reply queue is both.
 func ReplyTo(queue string) RequesterOption {
 	return func(c *requesterConfig) { c.replyQueue = queue }
 }
@@ -103,7 +108,13 @@ func NewRequester[Req, Resp any](
 	if generated {
 		// Belongs to this process and goes away with it. A reply queue that
 		// outlived its requester would collect answers nobody is waiting for.
-		declareOpts = append(declareOpts, acemq.Transient(), acemq.AutoDelete(), acemq.Exclusive())
+		//
+		// Classic, said out loud as well as implied by the three flags: RabbitMQ
+		// refuses a quorum queue that is exclusive, auto-deleting or transient,
+		// so this queue becoming quorum would not be a slower reply queue but a
+		// requester that cannot start at all.
+		declareOpts = append(declareOpts,
+			acemq.Transient(), acemq.AutoDelete(), acemq.Exclusive(), acemq.OfType(acemq.QueueClassic))
 	}
 	if err := conn.DeclareQueue(ctx, replyQueue, declareOpts...); err != nil {
 		return nil, fmt.Errorf("acemq: cannot declare the reply queue %q: %w", replyQueue, err)

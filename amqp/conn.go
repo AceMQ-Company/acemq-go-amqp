@@ -214,12 +214,25 @@ var errNilObserver = errors.New("acemq: WithObserver was given no observer")
 // Codec is the codec this connection publishes with.
 func (c *Conn) Codec() Codec { return c.codec }
 
-// DeclareQueue creates a durable queue if it is not already there.
+// DeclareQueue creates a durable quorum queue if it is not already there.
+//
+// Quorum, not classic, and that is the same default the Java, .NET, Python and
+// Ruby libraries apply — a queue two services in two languages both declare has
+// to be the same queue, and x-queue-type is compared as strictly as any other
+// argument. Say [OfType] with [QueueClassic] for a queue that should not be
+// replicated; a queue asked to be [Transient], [Exclusive] or [AutoDelete] is
+// classic already, because RabbitMQ allows a quorum queue to be none of those,
+// and a declaration that named its own type is left exactly as it reads.
+//
+// A queue that already exists as classic is not converted by this. The broker
+// answers PRECONDITION_FAILED, because a queue's type cannot be changed after
+// it is created; drain it and recreate it, or declare it [QueueClassic] here.
 func (c *Conn) DeclareQueue(ctx context.Context, name string, opts ...QueueOption) error {
 	spec := QueueSpec{Durable: true}
 	for _, opt := range opts {
 		opt(&spec)
 	}
+	quorumByDefault(&spec)
 	return c.transport.DeclareQueue(ctx, name, spec)
 }
 

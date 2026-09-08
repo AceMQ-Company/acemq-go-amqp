@@ -8,13 +8,14 @@ if err := mq.DeclareQueue(ctx, "orders"); err != nil {
 }
 ```
 
-Durable by default. Options:
+Durable by default, and — because it is durable — a **quorum** queue. Options:
 
 | | |
 |---|---|
 | `acemq.Transient()` | does not survive a broker restart |
 | `acemq.AutoDelete()` | removed when its last consumer goes away |
 | `acemq.Exclusive()` | only this connection can use it |
+| `acemq.OfType(t)` | `QueueClassic`, `QueueQuorum` or `QueueStream` |
 | `acemq.DeadLetterTo(exchange)` | a dead-letter exchange of your own, instead of `acemq.dlx` |
 | `acemq.QueueArg(name, value)` | any other broker argument |
 
@@ -23,6 +24,40 @@ err := mq.DeclareQueue(ctx, "orders",
 	acemq.DeadLetterTo("orders-dead"),
 	acemq.QueueArg("x-max-length", 100000))
 ```
+
+### Quorum, classic and streams
+
+`orders` above is declared with `x-queue-type: quorum`, and so is any durable
+queue `Topology.Queue(...)` adds. The type is part of the queue's identity as
+far as the broker is concerned, so this is a cross-language contract rather than
+a preference: two services consuming `orders` both declare `orders`, and the
+second one to disagree about the type is refused with `PRECONDITION_FAILED` and
+cannot consume at all. Java has declared source queues quorum since before the
+other libraries existed, and a quorum queue cannot be redeclared as anything
+else, so quorum is what all five agree on.
+
+Three kinds of queue are left classic:
+
+- **Anything exclusive, auto-deleting or transient.** RabbitMQ allows a quorum
+  queue to be none of the three, so a default that applied to them would not be
+  a slower queue but a declaration the broker rejects — at start-up, wherever a
+  reply queue, a health probe or a temporary queue is created.
+- **The queues underneath a source queue**: every `{queue}.retry.{delay}` rung,
+  `{queue}.dlq` and `{queue}.parked`. Nothing consumes a rung, and the two
+  dead-letter queues are drained by a person. Java declares all of them
+  `QueueType.CLASSIC` and this library matches.
+- **Anything that named its own type**, with `acemq.OfType` or by writing
+  `x-queue-type` with `acemq.QueueArg`.
+
+`acemq.OfType(acemq.QueueClassic)` sends **no** `x-queue-type` argument, because
+that is what classic is on the wire in Java, .NET, Python and Ruby. Asking for
+classic and inheriting classic therefore produce the identical argument table,
+which matters wherever two tables are compared rather than two brokers
+consulted — the in-memory transport here, and anybody diffing two topologies.
+
+A queue that is already classic on the broker is not converted. Its type cannot
+be changed after it is created, so the declaration is refused; drain the queue
+and recreate it, or declare it `acemq.OfType(acemq.QueueClassic)`.
 
 ### Redeclaring
 
@@ -184,12 +219,12 @@ Printing it is the point — this is what `topology.String()` gives:
 Topology: 2 exchanges, 6 queues, 3 bindings
   declare exchange acemq.dlx (direct)
   declare exchange acemq.retry (direct)
-  declare queue orders (durable, x-dead-letter-exchange=acemq.dlx, x-dead-letter-routing-key=orders.dlq)
-  declare queue orders.dlq (durable)
-  declare queue orders.parked (durable)
-  declare queue orders.retry.40s (durable, x-dead-letter-exchange=acemq.retry, x-dead-letter-routing-key=orders, x-message-ttl=40000)
-  declare queue orders.retry.80s (durable, x-dead-letter-exchange=acemq.retry, x-dead-letter-routing-key=orders, x-message-ttl=80000)
-  declare queue orders.retry.160s (durable, x-dead-letter-exchange=acemq.retry, x-dead-letter-routing-key=orders, x-message-ttl=160000)
+  declare queue orders (durable, quorum, x-dead-letter-exchange=acemq.dlx, x-dead-letter-routing-key=orders.dlq)
+  declare queue orders.dlq (durable, classic)
+  declare queue orders.parked (durable, classic)
+  declare queue orders.retry.40s (durable, classic, x-dead-letter-exchange=acemq.retry, x-dead-letter-routing-key=orders, x-message-ttl=40000)
+  declare queue orders.retry.80s (durable, classic, x-dead-letter-exchange=acemq.retry, x-dead-letter-routing-key=orders, x-message-ttl=80000)
+  declare queue orders.retry.160s (durable, classic, x-dead-letter-exchange=acemq.retry, x-dead-letter-routing-key=orders, x-message-ttl=160000)
   declare binding orders.dlq (from acemq.dlx on orders.dlq)
   declare binding orders.parked (from acemq.dlx on orders.parked)
   declare binding orders (from acemq.retry on orders)
@@ -237,8 +272,8 @@ fmt.Println(topology)
 ```
 Topology: 1 exchanges, 2 queues, 2 bindings
   declare exchange orders-events (topic)
-  declare queue shipping-orders (durable, x-dead-letter-exchange=shipping-dead)
-  declare queue shipping-dead (durable)
+  declare queue shipping-orders (durable, quorum, x-dead-letter-exchange=shipping-dead)
+  declare queue shipping-dead (durable, quorum)
   declare binding shipping-orders (from orders-events on order.placed)
   declare binding shipping-orders (from orders-events on order.cancelled)
 ```
@@ -262,9 +297,9 @@ for _, action := range plan {
 
 ```
 exchange orders-events: topic — unknown, AMQP cannot report exchanges
-queue shipping-orders: durable, x-dead-letter-exchange=shipping-dead — differs:
+queue shipping-orders: durable, quorum, x-dead-letter-exchange=shipping-dead — differs:
   the broker refused the declaration: Exception (406) PRECONDITION_FAILED
-queue shipping-dead: durable — would create
+queue shipping-dead: durable, quorum — would create
 binding shipping-orders: from orders-events on order.placed — unknown, AMQP
   cannot report bindings
 ```

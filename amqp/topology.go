@@ -92,7 +92,19 @@ func (t *Topology) Exchange(name, kind string, opts ...ExchangeOption) *Topology
 	return t
 }
 
-// Queue adds a durable queue.
+// Queue adds a durable quorum queue.
+//
+// Quorum is the default here for the same reason it is the default in
+// [Conn.DeclareQueue]: the type is part of the queue's identity, and five
+// libraries that disagreed about it would give the second service to declare a
+// shared queue a PRECONDITION_FAILED and no way to consume. Ask for something
+// else with [OfType], and note that a queue asked to be [Transient],
+// [Exclusive] or [AutoDelete] stays classic because RabbitMQ allows a quorum
+// queue to be none of those.
+//
+// The rungs, {queue}.dlq and {queue}.parked are classic, and are declared as
+// such by [Topology.Retries] and [Topology.DeadLetters] rather than by anything
+// a caller has to remember.
 func (t *Topology) Queue(name string, opts ...QueueOption) *Topology {
 	if t.err != nil {
 		return t
@@ -105,6 +117,7 @@ func (t *Topology) Queue(name string, opts ...QueueOption) *Topology {
 	for _, opt := range opts {
 		opt(&spec)
 	}
+	quorumByDefault(&spec)
 	queue := namedQueue{Name: name, Spec: spec}
 	if t.deadLettered[name] {
 		// DeadLetters was asked for first. The arguments belong on this
@@ -189,8 +202,12 @@ func (t *Topology) DeadLetters(queue string) *Topology {
 	if !t.hasExchange(DeadLetterExchange) {
 		t.Exchange(DeadLetterExchange, "direct")
 	}
+	// Classic, deliberately, and the same in all five libraries: Java declares
+	// both QueueType.CLASSIC. They hold what nothing could handle, they are
+	// drained by a person rather than consumed, and neither the replication nor
+	// the memory a quorum queue costs buys anything for that.
 	for _, target := range []string{DeadLetterQueue(queue), ParkedQueue(queue)} {
-		t.Queue(target).Binding(target, DeadLetterExchange, target)
+		t.Queue(target, OfType(QueueClassic)).Binding(target, DeadLetterExchange, target)
 	}
 
 	// The queue may already be here, or may be declared further down the chain;
@@ -271,7 +288,16 @@ func (t *Topology) Retries(queue string, p RetryPolicy) *Topology {
 		t.Exchange(exchange, "direct")
 	}
 	for _, rung := range ladder.Rungs {
-		opts := make([]QueueOption, 0, len(rung.Args))
+		// Classic, and said out loud rather than left to the default, because
+		// the default is quorum and a rung must not be one. Java declares every
+		// rung QueueType.CLASSIC, so a rung this library declared as quorum
+		// would be a queue a Java service could not declare — and the whole
+		// point of a rung is that two services consuming the same queue agree
+		// about it. A rung is also the wrong shape for quorum: nothing consumes
+		// it, its messages sit there until x-message-ttl expires them, and
+		// replicating a queue whose entire purpose is to wait buys nothing.
+		opts := make([]QueueOption, 0, len(rung.Args)+1)
+		opts = append(opts, OfType(QueueClassic))
 		for name, value := range rung.Args {
 			opts = append(opts, QueueArg(name, value))
 		}
@@ -642,6 +668,15 @@ func describeExchange(s ExchangeSpec) string {
 	return strings.Join(parts, ", ")
 }
 
+// describeQueue renders a queue the way somebody comparing this topology with
+// the same one in another language would want to read it.
+//
+// The type is named in words even when it is classic, where the wire form says
+// it by leaving x-queue-type out. A plan that showed the type only when it
+// happened to be quorum would make the queues that must not be quorum — the
+// rungs, the dead-letter queue and the parking lot — look like queues nobody
+// had thought about. x-queue-type is then left out of the argument list, since
+// it would be that same word a second time.
 func describeQueue(s QueueSpec) string {
 	var parts []string
 	if s.Durable {
@@ -649,6 +684,7 @@ func describeQueue(s QueueSpec) string {
 	} else {
 		parts = append(parts, "transient")
 	}
+	parts = append(parts, string(queueTypeOf(s)))
 	if s.AutoDelete {
 		parts = append(parts, "auto-delete")
 	}
@@ -658,6 +694,9 @@ func describeQueue(s QueueSpec) string {
 	if len(s.Args) > 0 {
 		keys := make([]string, 0, len(s.Args))
 		for k := range s.Args {
+			if k == ArgQueueType {
+				continue
+			}
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)

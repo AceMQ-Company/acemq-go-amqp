@@ -86,8 +86,17 @@ type QueueSpec struct {
 	// Exclusive limits the queue to the declaring connection.
 	Exclusive bool
 
-	// Args are broker-specific arguments, such as x-dead-letter-exchange.
+	// Args are broker-specific arguments, such as x-dead-letter-exchange. The
+	// queue's type is one of them, under x-queue-type, and its absence means
+	// classic — see [OfType].
 	Args map[string]any
+
+	// typeNamed records that [OfType] was used, which is the only way to tell a
+	// declaration that asked for classic from one that said nothing about its
+	// type at all. Both leave x-queue-type unset, and only the second becomes
+	// quorum. A spec built as a struct literal rather than from options names no
+	// type, and so is declared exactly as it reads.
+	typeNamed bool
 }
 
 // ExchangeSpec is how an exchange should be declared.

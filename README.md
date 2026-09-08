@@ -63,6 +63,9 @@ defer sub.Close()
 The blank import registers the `amqp` and `amqps` schemes. It is what keeps the
 AMQP client out of programs that only use the in-memory transport.
 
+`orders` there is a **durable quorum queue**, which is what a durable queue is
+in all five AceMQ libraries. See [what type a queue is](#what-type-a-queue-is).
+
 ## Deciding what happens to a message
 
 A handler returns its decision rather than calling a method, so a handler that
@@ -167,6 +170,41 @@ transport, err := rabbitmq.Dial(ctx, url, rabbitmq.Config{
 
 Verified against a real broker restart.
 
+## What type a queue is
+
+A durable queue declared through `mq.DeclareQueue(...)` or `Topology.Queue(...)`
+is a **quorum** queue. `x-queue-type` is compared by the broker as strictly as
+any other argument, so this is a cross-language contract rather than a
+preference: a Go service and a Java service consuming `orders` both declare
+`orders`, and a disagreement about its type refuses the second one with
+`PRECONDITION_FAILED` and leaves it unable to consume at all.
+
+Quorum rather than classic because Java has declared source queues quorum since
+before the other four libraries existed, and **a queue that already exists as
+quorum cannot be redeclared as anything else**. Classic would have been an
+equally good agreement to have reached first; it is no longer one that is
+available.
+
+Some queues stay classic, and none of them is an oversight:
+
+| queue | why |
+|---|---|
+| `{queue}.retry.{delay}` | a rung is never consumed; Java declares every rung classic |
+| `{queue}.dlq`, `{queue}.parked` | drained by a person, not consumed; classic in Java too |
+| anything `Exclusive()`, `AutoDelete()` or `Transient()` | RabbitMQ allows a quorum queue to be none of the three, so these would be refused outright — this is what keeps a requester's generated reply queue working |
+| anything that named its own type | `acemq.OfType(acemq.QueueClassic)`, `QueueStream`, or `x-queue-type` set by hand |
+
+`acemq.OfType(acemq.QueueClassic)` is the way to ask for classic, and it sends
+**no** `x-queue-type` argument at all — which is what classic looks like on the
+wire in Java, .NET, Python and Ruby. A rung declared by any of them and
+redeclared here produces the identical argument table, not merely an equivalent
+one.
+
+A queue that already exists as classic is **not** converted by any of this. The
+broker refuses the declaration, because a queue's type cannot be changed after
+it is created; drain it and recreate it, or declare it
+`acemq.OfType(acemq.QueueClassic)`.
+
 ## Retry, and the attempt counter
 
 A retry is **republished** onto the same queue with `x-acemq-attempt` advanced,
@@ -194,6 +232,7 @@ exchange on their own names, and declares the **source** queue with
 
 | argument | value |
 |---|---|
+| `x-queue-type` | `quorum` — see [what type a queue is](#what-type-a-queue-is) |
 | `x-dead-letter-exchange` | `acemq.dlx` (`DeadLetterExchange`) |
 | `x-dead-letter-routing-key` | `{queue}.dlq` |
 
@@ -261,6 +300,9 @@ same rung by name, so different arguments mean the second is refused with
 | `x-message-ttl` | the delay in milliseconds |
 | `x-dead-letter-exchange` | `acemq.retry` (`RetryExchange`) |
 | `x-dead-letter-routing-key` | the source queue |
+
+Three, and no `x-queue-type`: a rung is classic, and classic is the absence of
+that argument in every one of the five libraries.
 
 Java, .NET, Python, Ruby and this library all name `acemq.retry` here and bind
 each source queue to it. Python and Ruby once dead-lettered a rung through the

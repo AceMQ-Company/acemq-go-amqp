@@ -16,6 +16,7 @@ package acemq
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -173,11 +174,13 @@ func (c *Conn) Supports(capability Capability) bool {
 type QueueType string
 
 const (
-	// QueueClassic is the default: one node, fastest, lost if that node is.
+	// QueueClassic is one node, fastest, and lost if that node is. The type a
+	// queue that cannot be quorum falls back to — see [OfType].
 	QueueClassic QueueType = "classic"
 
-	// QueueQuorum is replicated across nodes. What to use for anything that
-	// must not be lost with a single machine.
+	// QueueQuorum is replicated across nodes, and the default for a durable
+	// queue. What to use for anything that must not be lost with a single
+	// machine.
 	QueueQuorum QueueType = "quorum"
 
 	// QueueStream keeps messages after reading. See the streams pattern.
@@ -186,23 +189,90 @@ const (
 
 // OfType declares a queue of a particular kind.
 //
-//	mq.DeclareQueue(ctx, "orders", acemq.OfType(acemq.QueueQuorum))
+//	mq.DeclareQueue(ctx, "orders", acemq.OfType(acemq.QueueClassic))
+//
+// Mostly worth passing to say classic, because a durable queue that says
+// nothing is already quorum — see [Conn.DeclareQueue].
+//
+// Classic is the absence of x-queue-type rather than x-queue-type=classic. That
+// is what the Java, .NET, Python and Ruby libraries put on the wire for a
+// classic queue, and a rung declared by one of them and redeclared by this one
+// has to produce the identical argument table, not merely an equivalent one:
+// the in-memory transport here compares arguments exactly, as does anything
+// diffing two topologies by eye.
 //
 // A quorum queue must be durable and cannot be exclusive or auto-deleting;
 // those are set here rather than left to fail at the broker with a message that
 // does not mention quorum at all.
 func OfType(t QueueType) QueueOption {
 	return func(s *QueueSpec) {
+		s.typeNamed = true
+		if t == QueueClassic {
+			delete(s.Args, ArgQueueType)
+			return
+		}
 		if s.Args == nil {
 			s.Args = map[string]any{}
 		}
-		s.Args["x-queue-type"] = string(t)
+		s.Args[ArgQueueType] = string(t)
 		if t == QueueQuorum || t == QueueStream {
 			s.Durable = true
 			s.Exclusive = false
 			s.AutoDelete = false
 		}
 	}
+}
+
+// quorumByDefault settles the type of a queue whose declaration did not name
+// one, and is the reason a plain durable queue is quorum.
+//
+// Quorum is the default because a queue that survives losing its node is what
+// almost everyone wants and almost nobody remembers to ask for, and because
+// this is not a decision one library gets to take on its own: Java has been
+// declaring source queues quorum since before any of the others existed, and a
+// Go service declaring orders as classic against a broker where a Java service
+// already declared orders is refused with PRECONDITION_FAILED and cannot
+// consume at all. Five libraries agreeing on classic would have been just as
+// good an answer, and is no longer available — an existing quorum queue cannot
+// be redeclared as anything else.
+//
+// Three declarations are left classic, and none of them is an oversight:
+//
+//   - Anything exclusive or auto-deleting. RabbitMQ does not allow a quorum
+//     queue to be either, so a reply queue or a health probe that became quorum
+//     would be refused by the broker outright. This is the guard underneath the
+//     generated reply queue a requester consumes its answers on.
+//   - Anything transient. A quorum queue is replicated to disk by definition;
+//     asking for one that does not survive a restart is a contradiction the
+//     broker refuses.
+//   - Anything that named its own type, including [QueueClassic] and
+//     [QueueStream], and anything that wrote x-queue-type with [QueueArg].
+//
+// The rungs, {queue}.dlq and {queue}.parked are classic too, but they are
+// classic because they ask to be rather than because of anything here; see
+// [Topology.Retries] and [Topology.DeadLetters].
+func quorumByDefault(s *QueueSpec) {
+	if s.typeNamed {
+		return
+	}
+	if _, set := s.Args[ArgQueueType]; set {
+		return
+	}
+	if !s.Durable || s.Exclusive || s.AutoDelete {
+		return
+	}
+	if s.Args == nil {
+		s.Args = map[string]any{}
+	}
+	s.Args[ArgQueueType] = string(QueueQuorum)
+}
+
+// queueTypeOf is the type a spec will actually be declared as.
+func queueTypeOf(s QueueSpec) QueueType {
+	if t, ok := s.Args[ArgQueueType]; ok {
+		return QueueType(fmt.Sprint(t))
+	}
+	return QueueClassic
 }
 
 // Pulled is one message fetched without a consumer.

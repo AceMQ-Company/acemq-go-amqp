@@ -558,8 +558,15 @@ func TestDeadLettersPointsTheSourceQueueAtTheSharedExchange(t *testing.T) {
 	topology := NewTopology().Queue("orders").DeadLetters("orders")
 
 	args := queueIn(t, topology, "orders").Spec.Args
-	if len(args) != 2 {
-		t.Fatalf("orders was declared with %v, want exactly the two dead-letter arguments", args)
+	if len(args) != 3 {
+		t.Fatalf("orders was declared with %v, want the two dead-letter arguments and the type",
+			args)
+	}
+	// The type belongs to the same contract as the other two. Java has declared
+	// source queues quorum since before the other libraries existed, and a queue
+	// that already exists as quorum cannot be redeclared as anything else.
+	if got := args[ArgQueueType]; got != string(QueueQuorum) {
+		t.Errorf("%s = %v, want %q", ArgQueueType, got, QueueQuorum)
 	}
 	if got := args[ArgDeadLetterExchange]; got != DeadLetterExchange {
 		t.Errorf("%s = %v, want %q", ArgDeadLetterExchange, got, DeadLetterExchange)
@@ -571,10 +578,13 @@ func TestDeadLettersPointsTheSourceQueueAtTheSharedExchange(t *testing.T) {
 		t.Errorf("%s = %v, want %q", ArgDeadLetterRoutingKey, got, "orders.dlq")
 	}
 
+	// No arguments at all on either of them, which includes no x-queue-type:
+	// both are classic, and classic on the wire is the absence of the argument,
+	// exactly as Java's QueueType.CLASSIC produces it.
 	for _, target := range []string{"orders.dlq", "orders.parked"} {
 		if got := queueIn(t, topology, target).Spec.Args; len(got) != 0 {
-			t.Errorf("%s was declared with %v; a dead-letter queue that dead-letters is a loop",
-				target, got)
+			t.Errorf("%s was declared with %v; a dead-letter queue that dead-letters is a loop, "+
+				"and it must stay classic", target, got)
 		}
 		if !hasBinding(topology, target, DeadLetterExchange, target) {
 			t.Errorf("%s is not bound to %s on its own name:\n%s",
@@ -716,5 +726,156 @@ func TestAskingForDeadLettersTwiceIsAskingOnce(t *testing.T) {
 	}
 	if once.String() != twice.String() {
 		t.Errorf("asking twice changed the topology:\n%s\nversus\n%s", once, twice)
+	}
+}
+
+// ---- the type a queue is declared as ---------------------------------
+
+// TestADurableQueueIsQuorum pins the default that this library, Java, .NET,
+// Python and Ruby all have to share.
+//
+// A queue's type is compared by the broker as strictly as any other argument,
+// so two services consuming orders have to agree about it or the second is
+// refused with PRECONDITION_FAILED and cannot consume. Java declares source
+// queues quorum and has deployments; a queue that exists as quorum cannot be
+// redeclared as anything else, so quorum is the only answer the five of them
+// could still agree on.
+func TestADurableQueueIsQuorum(t *testing.T) {
+	topology := NewTopology().Queue("orders")
+
+	if got := queueIn(t, topology, "orders").Spec.Args[ArgQueueType]; got != string(QueueQuorum) {
+		t.Errorf("orders was declared with %s=%v, want %q", ArgQueueType, got, QueueQuorum)
+	}
+}
+
+// A caller who wants classic can still have it, and gets it in the form the
+// other four libraries put on the wire: no x-queue-type at all, which is what
+// Java's QueueType.CLASSIC sends. An argument saying "classic" would be
+// equivalent to the broker and different to anything comparing two argument
+// tables, including the in-memory transport here.
+func TestClassicCanStillBeAskedForAndIsTheAbsenceOfTheArgument(t *testing.T) {
+	topology := NewTopology().Queue("orders", OfType(QueueClassic))
+
+	args := queueIn(t, topology, "orders").Spec.Args
+	if _, set := args[ArgQueueType]; set {
+		t.Errorf("a classic queue was declared with %v; classic is the absence of %s",
+			args, ArgQueueType)
+	}
+}
+
+// A stream is not quietly turned into a quorum queue, and neither is anything
+// that set x-queue-type by hand.
+func TestANamedTypeIsLeftAlone(t *testing.T) {
+	stream := NewTopology().Queue("events", OfType(QueueStream))
+	if got := queueIn(t, stream, "events").Spec.Args[ArgQueueType]; got != string(QueueStream) {
+		t.Errorf("a stream was declared %s=%v, want %q", ArgQueueType, got, QueueStream)
+	}
+
+	byHand := NewTopology().Queue("events", QueueArg(ArgQueueType, "stream"))
+	if got := queueIn(t, byHand, "events").Spec.Args[ArgQueueType]; got != "stream" {
+		t.Errorf("a queue that set %s itself was declared %v, want it left alone",
+			ArgQueueType, got)
+	}
+}
+
+// TestAQueueTheBrokerCannotReplicateStaysClassic is the guard that keeps this
+// change from breaking every reply queue in every service.
+//
+// RabbitMQ refuses a quorum queue that is exclusive, auto-deleting or
+// transient, so a default that applied to those would not be a slower queue but
+// a declaration the broker rejects — and the failure would land wherever a
+// requester, a health probe or a temporary queue is created, which is start-up.
+func TestAQueueTheBrokerCannotReplicateStaysClassic(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		opt  QueueOption
+	}{
+		{"exclusive", Exclusive()},
+		{"auto-delete", AutoDelete()},
+		{"transient", Transient()},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			topology := NewTopology().Queue("replies", c.opt)
+			args := queueIn(t, topology, "replies").Spec.Args
+			if _, set := args[ArgQueueType]; set {
+				t.Errorf("an %s queue was declared with %v; RabbitMQ allows a quorum queue to "+
+					"be none of exclusive, auto-deleting or transient, so this queue would be "+
+					"refused outright", c.name, args)
+			}
+		})
+	}
+}
+
+// The rungs, the dead-letter queue and the parking lot are classic, and are so
+// because they say so rather than because of what they happen to look like.
+// Java declares all three QueueType.CLASSIC; a rung declared quorum here would
+// be a rung a Java service could not redeclare, and a rung nothing consumes has
+// no use for replication anyway.
+func TestTheQueuesUnderneathASourceQueueAreClassic(t *testing.T) {
+	topology := NewTopology().
+		Queue("orders").
+		DeadLetters("orders").
+		Retries("orders", FixedRetry(3, time.Minute))
+
+	for _, name := range []string{"orders.dlq", "orders.parked", "orders.retry.1m"} {
+		args := queueIn(t, topology, name).Spec.Args
+		if _, set := args[ArgQueueType]; set {
+			t.Errorf("%s was declared with %v; it has to be classic, and classic is the "+
+				"absence of %s", name, args, ArgQueueType)
+		}
+	}
+
+	// And the source queue above them is not.
+	if got := queueIn(t, topology, "orders").Spec.Args[ArgQueueType]; got != string(QueueQuorum) {
+		t.Errorf("orders was declared %s=%v, want %q", ArgQueueType, got, QueueQuorum)
+	}
+}
+
+// Declaring one queue by hand takes the same default as declaring it in a
+// topology. Two entry points that disagreed would be a service whose queue's
+// type depended on which one its author happened to reach for.
+func TestDeclareQueueTakesTheSameDefaultAsATopology(t *testing.T) {
+	ctx := context.Background()
+	mq, err := Connect(ctx, "memory://queue-type-default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mq.Close() }()
+
+	if err := mq.DeclareQueue(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	// The memory transport refuses a redeclaration whose arguments differ, as
+	// RabbitMQ does, so the topology's own declaration of orders being accepted
+	// is the two of them agreeing.
+	if err := NewTopology().Queue("orders").Apply(ctx, mq); err != nil {
+		t.Fatalf("a topology could not redeclare a queue DeclareQueue had made: %v", err)
+	}
+	if err := NewTopology().Queue("orders", OfType(QueueClassic)).Apply(ctx, mq); err == nil {
+		t.Fatal("redeclaring the same queue as classic was accepted, so the default is not " +
+			"being compared at all")
+	}
+}
+
+// The plan names the type of every queue in words, including the classic ones,
+// because a plan that mentioned the type only when it was quorum would make the
+// queues that must not be quorum look like queues nobody had thought about.
+func TestThePlanNamesEveryQueuesType(t *testing.T) {
+	topology := NewTopology().Queue("orders").DeadLetters("orders")
+
+	plan := topology.String()
+	for _, want := range []string{
+		"queue orders (durable, quorum,",
+		"queue orders.dlq (durable, classic)",
+		"queue orders.parked (durable, classic)",
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("the plan does not contain %q:\n%s", want, plan)
+		}
+	}
+	// And not twice: the word is the argument, so the argument is not listed
+	// again beside it.
+	if strings.Contains(plan, ArgQueueType) {
+		t.Errorf("the plan lists %s as well as naming the type:\n%s", ArgQueueType, plan)
 	}
 }

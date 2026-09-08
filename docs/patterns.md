@@ -50,7 +50,11 @@ timeout is the absence of an answer, and the work may well have been done —
 which is why a request that changes anything should be idempotent.
 
 By default replies come back on an exclusive, auto-deleting queue that goes away
-with the process. `patterns.ReplyTo("queue")` names one that survives a restart.
+with the process. It is a classic queue and has to be: RabbitMQ allows a quorum
+queue to be neither exclusive nor auto-deleting.
+`patterns.ReplyTo("queue")` names one that survives a restart, and a named one
+is durable, so it is quorum like any other durable queue — see [quorum, classic
+and streams](topology.md#quorum-classic-and-streams).
 
 ## Idempotency
 

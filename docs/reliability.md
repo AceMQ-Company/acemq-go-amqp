@@ -53,10 +53,13 @@ names, and declares `orders` itself with
 
 | argument | value |
 |---|---|
+| `x-queue-type` | `quorum` |
 | `x-dead-letter-exchange` | `acemq.dlx` |
 | `x-dead-letter-routing-key` | `orders.dlq` |
 
-which is the same table Java, .NET, Python and Ruby write. It has to be, because
+which is the same table Java, .NET, Python and Ruby write. `orders.dlq` and
+`orders.parked` are classic, with no `x-queue-type` at all — see
+[quorum, classic and streams](topology.md#quorum-classic-and-streams). It has to be, because
 it is part of the declaration of `orders`: two services consuming that queue both
 declare it, and a disagreement about these arguments is answered with
 `PRECONDITION_FAILED` — the second service cannot consume at all. The routing key
@@ -225,6 +228,11 @@ same rung by name, so different arguments mean the second is refused with
 | `x-message-ttl` | the delay in milliseconds |
 | `x-dead-letter-exchange` | `acemq.RetryExchange` |
 | `x-dead-letter-routing-key` | the source queue |
+
+Three, and no `x-queue-type`: a rung is a classic queue, and classic is the
+absence of that argument in all five libraries. The source queue above it is
+quorum, and a rung is not, because nothing consumes a rung and replicating a
+queue whose whole purpose is to wait buys nothing.
 
 A consumer whose rungs are missing still retries — it waits in the process
 instead — and counts `acemq.MetricRungMissing` each time, because a topology that

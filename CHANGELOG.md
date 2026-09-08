@@ -29,6 +29,33 @@ While the version is `0.x` the public API may change in any release.
 > and two services on one queue that disagree about its arguments cannot both
 > consume it.
 
+> ### ⚠ Migrating: a durable queue is now a quorum queue
+>
+> **`mq.DeclareQueue(...)` and `Topology.Queue(...)` now declare a durable queue
+> with `x-queue-type: quorum`.** Java, .NET, Python and Ruby all do, and
+> `x-queue-type` is compared by the broker as strictly as any other argument: a
+> Go service and a Java service consuming `orders` both declare `orders`, and
+> until now they disagreed about what `orders` is.
+>
+> **A queue that already exists as classic cannot be redeclared as quorum.** A
+> queue's type is fixed when it is created, so the declaration is refused with
+> `PRECONDITION_FAILED` and the service does not start. There is no in-place
+> conversion and no flag that performs one. Drain the queue and recreate it, or
+> keep it as it is by declaring it `acemq.OfType(acemq.QueueClassic)`.
+>
+> Quorum rather than classic because Java has been declaring source queues
+> quorum since before the other libraries existed and has deployments with
+> quorum queues on real brokers — and a queue that exists as quorum cannot be
+> redeclared as anything else. Classic was never still available as the answer
+> all five could give.
+>
+> Three things stay classic and need no action:
+> `{queue}.retry.{delay}`, `{queue}.dlq` and `{queue}.parked`, which Java
+> declares classic too; anything `Exclusive()`, `AutoDelete()` or `Transient()`,
+> because RabbitMQ allows a quorum queue to be none of the three — this covers
+> the reply queue a `patterns.Requester` generates and the health probe; and
+> anything that names its own type.
+
 ### Added
 
 - **A retry ladder.** Delays at or above 30 seconds wait in the broker, in a
@@ -55,6 +82,17 @@ While the version is `0.x` the public API may change in any release.
 - **`FixedRetry` no longer applies jitter.** It defaulted to 0.2, which the
   Python and Ruby libraries do not; avoiding the spread is the reason to ask for
   a fixed policy in the first place.
+- **A durable queue is declared quorum**, matching the other four libraries. See
+  the migration note. `acemq.OfType(acemq.QueueClassic)` asks for classic, and
+  now sends no `x-queue-type` argument at all rather than `x-queue-type:
+  classic` — which is what classic is on the wire everywhere else, so a rung
+  declared by a Java service and redeclared here produces the identical argument
+  table rather than an equivalent one.
+- **A topology plan names every queue's type in words**, classic ones included,
+  so that the queues that must not be quorum do not read as queues nobody
+  thought about: `declare queue orders (durable, quorum, …)` beside `declare
+  queue orders.dlq (durable, classic)`. `x-queue-type` is no longer listed among
+  the arguments, since it would be that same word twice.
 
 ### Fixed
 

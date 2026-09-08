@@ -108,6 +108,97 @@ func removeAtEnd(t *testing.T, queues []string, exchanges []string) {
 	})
 }
 
+// declaredElsewhere declares a queue from a connection of its own and returns
+// what the broker said.
+//
+// The only way to ask AMQP what a queue looks like is to declare it and see
+// whether the answer is PRECONDITION_FAILED, and a refusal kills the channel it
+// arrived on — so every question gets a connection to itself. It is also the
+// honest shape of the question being asked: this is a second service starting
+// up against a queue somebody else created.
+func declaredElsewhere(t *testing.T, queue string, args amqp091.Table) error {
+	t.Helper()
+	conn, err := amqp091.Dial(brokerURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	_, err = ch.QueueDeclare(queue, true, false, false, false, args)
+	return err
+}
+
+// mustBeQuorum fails unless the broker holds this queue as a quorum queue.
+//
+// Asked by declaring it as quorum and requiring acceptance, then as classic and
+// requiring PRECONDITION_FAILED. The second half is what makes the first mean
+// anything: a broker that ignored x-queue-type would accept both.
+func mustBeQuorum(t *testing.T, queue string, args amqp091.Table) {
+	t.Helper()
+
+	quorum := amqp091.Table{"x-queue-type": "quorum"}
+	classic := amqp091.Table{}
+	for k, v := range args {
+		quorum[k] = v
+		classic[k] = v
+	}
+
+	if err := declaredElsewhere(t, queue, quorum); err != nil {
+		t.Fatalf("%s is not a quorum queue: declaring it as one was refused with %v", queue, err)
+	}
+	err := declaredElsewhere(t, queue, classic)
+	if err == nil || !strings.Contains(err.Error(), "x-queue-type") {
+		t.Fatalf("declaring %s as classic was answered %v, want PRECONDITION_FAILED naming "+
+			"x-queue-type; without that refusal the acceptance above proves nothing", queue, err)
+	}
+	t.Logf("%s is quorum on the broker, and a classic declaration of it is refused: %v", queue, err)
+}
+
+// mustBeClassic fails unless the broker holds this queue as a classic queue.
+//
+// Classic on the wire is the absence of x-queue-type, which is what Java's
+// QueueType.CLASSIC sends, so that is what is offered here.
+func mustBeClassic(t *testing.T, queue string, args amqp091.Table) {
+	t.Helper()
+
+	classic := amqp091.Table{}
+	quorum := amqp091.Table{"x-queue-type": "quorum"}
+	for k, v := range args {
+		classic[k] = v
+		quorum[k] = v
+	}
+
+	if err := declaredElsewhere(t, queue, classic); err != nil {
+		t.Fatalf("%s is not a classic queue: declaring it as one was refused with %v", queue, err)
+	}
+	err := declaredElsewhere(t, queue, quorum)
+	if err == nil || !strings.Contains(err.Error(), "x-queue-type") {
+		t.Fatalf("declaring %s as quorum was answered %v, want PRECONDITION_FAILED naming "+
+			"x-queue-type", queue, err)
+	}
+	t.Logf("%s is classic on the broker, and a quorum declaration of it is refused: %v", queue, err)
+}
+
+// printTopology puts the whole plan in the test output, so that the queues,
+// their types, their arguments, both exchanges and every binding can be read
+// beside the same topology in the other four languages.
+func printTopology(t *testing.T, what string, topology *acemq.Topology) {
+	t.Helper()
+	plan, err := topology.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("the topology this library declares for %s:", what)
+	for _, action := range plan {
+		t.Logf("  %s", action)
+	}
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
@@ -349,9 +440,24 @@ func TestALongRetryWaitsInTheBrokerAndComesBack(t *testing.T) {
 	}
 
 	topology := acemq.NewTopology().Queue(queue).DeadLetters(queue).Retries(queue, policy)
+	printTopology(t, queue, topology)
 	if err := topology.Apply(ctx, mq); err != nil {
 		t.Fatal(err)
 	}
+
+	// The types, before any of the mechanism runs. The source queue is quorum
+	// and every queue underneath it is classic, and a quorum queue is not a
+	// classic one with more replicas: it dead-letters through its own
+	// implementation, and whether an expired rung message comes home to one is
+	// a question only the broker can answer. The rest of this test is that
+	// answer.
+	mustBeQuorum(t, queue, amqp091.Table{
+		acemq.ArgDeadLetterExchange:   acemq.DeadLetterExchange,
+		acemq.ArgDeadLetterRoutingKey: acemq.DeadLetterQueue(queue),
+	})
+	mustBeClassic(t, rung, amqp091.Table(ladder.Rungs[0].Args))
+	mustBeClassic(t, acemq.DeadLetterQueue(queue), nil)
+	mustBeClassic(t, acemq.ParkedQueue(queue), nil)
 
 	failed := make(chan int, 4)
 	sub, err := acemq.Consume(ctx, mq, queue,
@@ -1181,25 +1287,31 @@ func TestTheSourceQueueIsDeclaredIdenticallyInEveryLanguage(t *testing.T) {
 	topology := acemq.NewTopology().Queue(queue).DeadLetters(queue)
 
 	// Printed whole so it can be put beside the other four libraries' by eye:
-	// every queue, both exchanges, every binding, and the arguments on the
-	// source queue.
-	plan, err := topology.Plan()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("the topology this library declares for %s:", queue)
-	for _, action := range plan {
-		t.Logf("  %s", action)
-	}
+	// every queue with its type, both exchanges, every binding, and the
+	// arguments on the source queue.
+	printTopology(t, queue, topology)
 
 	if err := topology.Apply(ctx, mq); err != nil {
 		t.Fatal(err)
 	}
 
+	// The two queues underneath it are classic, as they are in Java, and this is
+	// the broker being asked rather than the plan being reread.
+	mustBeClassic(t, dlq, nil)
+	mustBeClassic(t, parked, nil)
+
 	// What every other AceMQ library writes for this queue, spelled out here
 	// rather than taken from the constants, so that a change to the constants
 	// cannot quietly change what this claims to be compatible with.
-	python := amqp091.Table{
+	//
+	// x-queue-type is in the table because Java has always put it there:
+	// Topology.Builder.queue declares a durable quorum queue, and a Java service
+	// with an orders queue already has a quorum one. The other three libraries
+	// followed Java rather than the other way round, because a queue that exists
+	// as quorum cannot be redeclared as anything else — there was no version of
+	// this agreement where the four of them chose classic.
+	otherLibraries := amqp091.Table{
+		"x-queue-type":              "quorum",
 		"x-dead-letter-exchange":    "acemq.dlx",
 		"x-dead-letter-routing-key": queue + ".dlq",
 	}
@@ -1219,11 +1331,12 @@ func TestTheSourceQueueIsDeclaredIdenticallyInEveryLanguage(t *testing.T) {
 	}
 	defer func() { _ = agreeing.Close() }()
 
-	if _, err := agreeing.QueueDeclare(queue, true, false, false, false, python); err != nil {
+	if _, err := agreeing.QueueDeclare(queue, true, false, false, false, otherLibraries); err != nil {
 		t.Fatalf("a second service declaring %s the way the other four libraries do was "+
 			"refused: %v", queue, err)
 	}
-	t.Logf("a second connection declared %s with %v and the broker accepted it", queue, python)
+	t.Logf("a second connection declared %s with %v and the broker accepted it",
+		queue, otherLibraries)
 
 	// And one argument different is refused, which is what would happen to the
 	// second of two services if this table ever drifted again.
@@ -1234,6 +1347,7 @@ func TestTheSourceQueueIsDeclaredIdenticallyInEveryLanguage(t *testing.T) {
 	defer func() { _ = disagreeing.Close() }()
 
 	_, err = disagreeing.QueueDeclare(queue, true, false, false, false, amqp091.Table{
+		"x-queue-type":              "quorum",
 		"x-dead-letter-exchange":    "acemq.dlx",
 		"x-dead-letter-routing-key": queue + ".dead",
 	})
@@ -1245,6 +1359,31 @@ func TestTheSourceQueueIsDeclaredIdenticallyInEveryLanguage(t *testing.T) {
 		t.Errorf("the broker refused with %v, want PRECONDITION_FAILED", err)
 	}
 	t.Logf("the same queue with x-dead-letter-routing-key=%s.dead was refused: %v", queue, err)
+
+	// The type is the argument this library changed, so it gets its own refusal.
+	// Declaring the same queue classic — which is what this library did before
+	// the five agreed, and what a service still on an older release would send —
+	// has to be rejected, or the acceptance above would prove only that the
+	// broker ignores x-queue-type.
+	asClassic, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = asClassic.Close() }()
+
+	_, err = asClassic.QueueDeclare(queue, true, false, false, false, amqp091.Table{
+		"x-dead-letter-exchange":    "acemq.dlx",
+		"x-dead-letter-routing-key": queue + ".dlq",
+	})
+	if err == nil {
+		t.Fatal("the broker accepted a classic declaration of a quorum queue, which would mean " +
+			"x-queue-type is not part of what two services have to agree about")
+	}
+	if !strings.Contains(err.Error(), "PRECONDITION_FAILED") ||
+		!strings.Contains(err.Error(), "x-queue-type") {
+		t.Errorf("the broker refused with %v, want PRECONDITION_FAILED naming x-queue-type", err)
+	}
+	t.Logf("the same queue declared classic was refused: %v", err)
 }
 
 // TestSomethingElseRejectingAMessageStillReachesTheDeadLetterQueue is the

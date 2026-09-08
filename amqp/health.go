@@ -79,6 +79,12 @@ func (c *Conn) Health(ctx context.Context) HealthReport {
 	// A queue named for this moment, exclusive and auto-deleting, so the check
 	// leaves nothing behind and cannot collide with another instance running
 	// the same check.
+	//
+	// Classic, necessarily: RabbitMQ allows a quorum queue to be neither
+	// exclusive nor auto-deleting, so a probe that took the durable default
+	// would be refused by the broker and report every healthy broker as down.
+	// The spec is built here rather than through [Conn.DeclareQueue] and its
+	// options, so the default does not reach it in the first place.
 	probe := "acemq-health-" + newID()
 	started := time.Now()
 

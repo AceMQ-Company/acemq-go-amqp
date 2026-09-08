@@ -69,6 +69,14 @@ const (
 
 	// ArgDeadLetterRoutingKey is the key it is sent under.
 	ArgDeadLetterRoutingKey = "x-dead-letter-routing-key"
+
+	// ArgQueueType is the argument RabbitMQ picks a queue implementation with.
+	//
+	// It is part of a queue's identity as strictly as any other argument: a
+	// service declaring orders as classic against a broker where orders is
+	// already quorum is answered PRECONDITION_FAILED and cannot consume at all.
+	// See [OfType].
+	ArgQueueType = "x-queue-type"
 )
 
 // retryReturn is where a rung sends a message when its time is up.
@@ -256,7 +264,11 @@ func (l RetryLadder) Declare(ctx context.Context, conn *Conn) error {
 	}
 
 	for _, rung := range l.Rungs {
-		opts := make([]QueueOption, 0, len(rung.Args))
+		// Classic, said out loud, for the reason given in [Topology.Retries]: a
+		// durable queue is quorum unless it says otherwise, and a rung declared
+		// quorum here is one a Java service redeclaring it cannot match.
+		opts := make([]QueueOption, 0, len(rung.Args)+1)
+		opts = append(opts, OfType(QueueClassic))
 		for name, value := range rung.Args {
 			opts = append(opts, QueueArg(name, value))
 		}
