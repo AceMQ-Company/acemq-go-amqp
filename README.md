@@ -16,6 +16,9 @@ the [Java](https://github.com/AceMQ-Company/acemq-java-amqp) and
 reserved headers, the same defaults, the same retry semantics. A Go consumer
 reads what a Java producer writes, and fixtures generated from the Java
 implementation pin that rather than leaving it to be discovered in production.
+Two of them, carried byte for byte by all five libraries: one for the headers on
+the wire, one for the retry schedule, the queue names and the topology. See
+[how we know the five libraries agree](https://acemq.org/acemq-go-amqp/testing.html#how-we-know-the-five-libraries-agree).
 
 ```bash
 go get github.com/AceMQ-Company/acemq-go-amqp
