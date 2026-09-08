@@ -6,6 +6,56 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## [Unreleased]
+
+### Added
+
+- **`patterns.Saga`, for work that spans services.** Steps run in order and the
+  completed ones are undone in reverse when one fails, because that is the order
+  the world was changed in. A step whose `Undo` is nil is skipped rather than
+  refused — a step that only read something needs no undo — and a compensation
+  that itself fails does not stop the others: it is collected into
+  `SagaResult.Unresolved`, which is the list to alert on, because those are
+  real-world effects that happened, were meant to be undone, were not, and that
+  no retry will resolve.
+
+  `Run` returns a `SagaResult` rather than an error, matching Java's decision
+  and for its reason: a failed saga is not an exceptional condition to a caller
+  that has to decide what happens next. A step that panics is treated as a step
+  that failed, so everything before it is still compensated.
+
+  Nothing is published and no header is set, so this is the same idea as Java's
+  `Saga` rather than the other end of one conversation. What matches is the
+  behaviour.
+
+- **`patterns.Scheduler`, for delivering a message later.** A ladder of classic
+  queues with uniform times to live — `acemq.schedule.1h`, `.10m`, `.1m`, `.10s`,
+  `.1s` — bound to the `acemq.schedule` direct exchange and dead-lettering into
+  `acemq.schedule.due`, where the scheduler either delivers the message or moves
+  it to the largest rung that does not overshoot what is left. A one-day delay is
+  twenty-four hops and a one-minute delay is one.
+
+  Not a per-message expiration, which is the usual suggestion and is wrong for
+  anything but a single fixed delay: a classic queue expires messages only at its
+  head, so a one-minute message behind a four-hour one is delivered in four hours
+  and nothing reports it.
+
+  Every name and argument is the cross-language contract Java already writes.
+  Each rung carries exactly `x-message-ttl`, `x-dead-letter-exchange` and
+  `x-dead-letter-routing-key` and is classic — which is the absence of
+  `x-queue-type`, not `x-queue-type=classic` — so a Go service and a Java service
+  scheduling on one broker declare the identical queue rather than an equivalent
+  one. A message carries `x-schedule-exchange`, `x-schedule-routing-key`,
+  `x-schedule-due-at` (epoch milliseconds, as Java's `Instant.toEpochMilli`
+  writes it) and `x-schedule-content-type`, deliberately outside the reserved
+  `x-acemq-` namespace, which the envelope drops on the way in. None of the four
+  reaches the consumer.
+
+  The control consumer reads raw bytes at prefetch 50 and never decodes a
+  payload. `patterns.ScheduleTopology()` is the whole declaration, exported so a
+  deployment can apply it up front or compare it with another AceMQ library's by
+  eye.
+
 ## [0.3.0] - 2026-09-08
 
 ### Changed

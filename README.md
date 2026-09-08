@@ -127,7 +127,7 @@ A package per concern, with nothing at the module root:
 | `amqp/` | envelopes, codecs, publishing, consuming, retry, the in-memory transport. No dependencies outside the standard library. Named `acemq`. |
 | `rabbitmq/` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go`. |
 | `security/` | TLS modes, trusted authorities, credentials. No dependencies either. |
-| `patterns/` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, streams, consumer groups, schema registry, SQL-backed stores. |
+| `patterns/` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, sagas, delayed delivery, streams, consumer groups, schema registry, SQL-backed stores. |
 | `actuator/` | metrics, health and info over HTTP, on the same paths as Java and .NET. |
 | `crypto/` | encrypted message bodies, AES-GCM. Standard library only. |
 | `codec/xml`, `codec/yaml`, `codec/toml`, `codec/protobuf`, `codec/avro` | one module each, so the core keeps its single dependency. |
@@ -346,6 +346,59 @@ each message to attempt one unless `KeepAttempts` says otherwise. Without the
 reset a message dead-lettered on the last attempt of a five-attempt policy is
 dead-lettered again before any handler sees it, and the operator who has just
 fixed the bug has moved two thousand messages from one queue to the same queue.
+
+## Undoing what already happened
+
+Work that spans services has no transaction to roll back, and doing half of it
+and hoping is how a customer ends up charged for an order that was never placed.
+A saga runs steps in order and undoes the completed ones in reverse when one
+fails:
+
+```go
+saga, err := patterns.NewSaga("place-order", []patterns.SagaStep[*Order]{
+	{Name: "reserve-stock", Do: reserveStock, Undo: releaseStock},
+	{Name: "take-payment", Do: takePayment, Undo: refund},
+	{Name: "confirm", Do: confirm},
+})
+
+result := saga.Run(ctx, order)
+if result.HasUnresolved() {
+	alert("could not undo: %v", result.Unresolved)
+}
+```
+
+`Run` returns a result rather than an error, because a failed saga is not an
+exceptional condition to a caller that has to decide what happens next. A step
+with no `Undo` is skipped rather than refused, and a compensation that itself
+fails does not stop the others — it is collected into `Unresolved`, **the one
+list worth alerting on**: those are effects that happened, were meant to be
+undone, were not, and that no retry will resolve.
+
+None of this touches a broker. See [patterns](docs/patterns.md#sagas).
+
+## Delivering a message later
+
+```go
+scheduler, err := patterns.NewScheduler(ctx, mq)
+defer scheduler.Close()
+
+scheduler.In(ctx, 4*time.Hour, "billing", "invoice.due", invoice)
+```
+
+Not a per-message time to live, which is what most articles suggest and is wrong
+for anything but a single fixed delay: a classic queue expires messages only at
+its head, so a one-minute message queued behind a four-hour one is delivered in
+four hours and nothing reports it. Instead, a ladder of queues each with a
+*uniform* time to live — `acemq.schedule.1h`, `.10m`, `.1m`, `.10s`, `.1s` —
+dead-lettering into `acemq.schedule.due`, where the message either goes out or
+moves to the largest rung that does not overshoot. A one-day delay is
+twenty-four hops and a one-minute delay is one.
+
+Those names, the three arguments on each rung and the four `x-schedule-*` headers
+are a cross-language contract: Java, .NET, Python, Ruby and this library declare
+the same objects, and a rung redeclared with a different argument table is
+answered `PRECONDITION_FAILED`. `patterns.ScheduleTopology()` prints the whole
+thing. See [delayed delivery](docs/patterns.md#delayed-delivery).
 
 ## Running the tests
 

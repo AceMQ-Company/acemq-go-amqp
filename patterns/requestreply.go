@@ -14,7 +14,7 @@
 
 // Package patterns holds the message-flow patterns that sit above publishing
 // and consuming: request and reply, idempotency, the outbox, pipelines, ordered
-// consumption and replay.
+// consumption, replay, sagas and delayed delivery.
 //
 // They are here rather than in the core package because none of them is needed
 // to send a message, and a core that carries everything is a core nobody can

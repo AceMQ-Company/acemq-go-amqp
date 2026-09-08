@@ -263,6 +263,60 @@ that is wrong is discovered one hop at a time. Worth it when the steps vary per
 message; not worth it when every message goes the same way, where a fixed chain
 of consumers is simpler to follow.
 
+## Sagas
+
+Work that spans services, where a database transaction is not available and the
+alternative — doing half of it and hoping — is how a customer ends up charged for
+an order that was never placed:
+
+```go
+saga, err := patterns.NewSaga("place-order", []patterns.SagaStep[*Order]{
+	{Name: "reserve-stock", Do: reserveStock, Undo: releaseStock},
+	{Name: "take-payment", Do: takePayment, Undo: refund},
+	{Name: "confirm", Do: confirm},
+})
+
+result := saga.Run(ctx, order)
+```
+
+Steps run in order. When one fails, the steps that already completed are undone
+in **reverse** order, because that is the order the world was changed in and a
+compensation often depends on state a later step has not yet altered.
+
+`Undo` is optional, and a completed step without one is skipped rather than
+treated as an error — a step that only read something needs no undo. It is a
+mistake on a step that changed something, and nothing here can tell the two
+apart, which is the argument for writing `Undo` first and `Do` second.
+
+`Run` returns a result rather than an error. A failed saga is not an exceptional
+condition to a caller that has to decide what happens next, and the interesting
+part is not the failure anyway:
+
+```go
+if result.HasUnresolved() {
+	alert("could not undo: %v", result.Unresolved)
+}
+```
+
+**`Unresolved` is the list to alert on.** A compensation that fails does not stop
+the others — stopping would leave more undone than continuing — so it is
+reported, its step collected, and the rest still run. What ends up in
+`Unresolved` is real-world effects that happened, were meant to be undone, and
+were not. Nothing else in the system knows about them and no retry resolves
+them; a person has to.
+
+The compensations run with the context `Run` was given. If the failure you
+expect is a cancellation, hand them one that outlives it with
+`context.WithoutCancel`, or every compensation lands in `Unresolved`.
+
+A step that panics is a step that failed, and everything before it is still
+compensated: unwinding past the compensation is the one outcome this pattern
+exists to prevent.
+
+**Nothing here touches a broker.** It is in-process coordination, so a Go saga
+and a Java one are the same idea rather than two ends of one conversation. What
+matches across the libraries is the behaviour, not a wire format.
+
 ## Consumer groups
 
 ```go
@@ -351,3 +405,94 @@ for you.
 
 Retention is unbounded by default, which for a stream means "until the disk is
 full". Set `MaxAge` or `MaxBytes` on anything that runs for long.
+
+## Delayed delivery
+
+Deliver a message later:
+
+```go
+scheduler, err := patterns.NewScheduler(ctx, mq)
+defer scheduler.Close()
+
+scheduler.In(ctx, 4*time.Hour, "billing", "invoice.due", invoice)
+scheduler.At(ctx, renewal, "policies", "policy.renew", policy)
+```
+
+### Why not a per-message time to live
+
+The obvious implementation is to set an expiration on the message, drop it in a
+queue nobody consumes, and let it dead-letter to its destination. It is what most
+articles suggest and it is wrong for anything but a single fixed delay, because
+**a classic queue expires messages only at its head**. Put a four-hour message
+in, then a one-minute message behind it, and the one-minute message is delivered
+in four hours. Nothing reports it: the queue looks healthy, the message is not
+lost, it is simply late by a factor nobody predicted — and it fails in production
+under mixed load rather than in testing under uniform load.
+
+### What this does instead
+
+A ladder of queues, each with a *uniform* time to live, and a message hops
+through them until it is due:
+
+| Queue | `x-message-ttl` |
+| --- | --- |
+| `acemq.schedule.1h` | 3600000 |
+| `acemq.schedule.10m` | 600000 |
+| `acemq.schedule.1m` | 60000 |
+| `acemq.schedule.10s` | 10000 |
+| `acemq.schedule.1s` | 1000 |
+
+Every message in a rung has the same delay, so the head is always the one due
+soonest and head-of-line expiry is harmless. Each rung is classic and carries
+exactly three arguments — the time to live above, `x-dead-letter-exchange` of
+`acemq.schedule` and `x-dead-letter-routing-key` of `acemq.schedule.due` — and is
+bound to the `acemq.schedule` direct exchange under its own name. An expired
+message lands on `acemq.schedule.due`, where the scheduler either delivers it or
+puts it on the largest rung that does not overshoot what is left. A one-day delay
+is twenty-four hops and a one-minute delay is one, which is the right way round.
+
+`patterns.ScheduleTopology()` is the whole thing, exported so a deployment can
+declare it up front or compare it with what another AceMQ library declares:
+
+```go
+fmt.Println(patterns.ScheduleTopology())
+```
+
+Those names and arguments are a **cross-language contract**, not a preference.
+Java, .NET, Python, Ruby and this library declare the same objects, and a queue
+redeclared with a different argument table is answered `PRECONDITION_FAILED` —
+the second service to start cannot consume at all.
+
+### What travels with the message
+
+Four headers, and deliberately not in the reserved `x-acemq-` namespace: that one
+is the engine's, and a header carrying it is dropped from the application's view
+on the way in, so a scheduler header using it would be written on publish and
+gone on consume.
+
+| Header | What it holds |
+| --- | --- |
+| `x-schedule-exchange` | the exchange the message is eventually for |
+| `x-schedule-routing-key` | the routing key it will eventually carry |
+| `x-schedule-due-at` | when it is due, as milliseconds since the Unix epoch |
+| `x-schedule-content-type` | what the payload was encoded as |
+
+The content type is carried because the scheduler republishes bytes rather than
+values, and a consumer picks its codec from it. Publishing pre-encoded bytes
+under `application/octet-stream` produces a message the intended consumer cannot
+decode: it arrives, it is the right bytes, and nothing can read it.
+
+None of the four reaches the consumer. They are bookkeeping, and a consumer
+depending on them would be depending on how a message got to it.
+
+### What it costs
+
+A long delay is several broker round trips rather than one, and delivery is
+accurate to about the smallest rung rather than to the second — the last hop is
+skipped when under a second is left, because another hop would cost more than the
+accuracy it buys. Something that must fire at 09:00:00.000 exactly is a
+scheduler, not a message broker.
+
+The alternative is RabbitMQ's delayed-message-exchange plugin, which does this
+properly and is a plugin — so it is not available everywhere, and a library that
+silently required it would be a library that works on your laptop.

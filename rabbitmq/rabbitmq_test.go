@@ -1633,3 +1633,279 @@ func TestSomethingElseRejectingAMessageStillReachesTheDeadLetterQueue(t *testing
 	}
 	t.Logf("a rejection from something that is not this library reached %s by itself", dlq)
 }
+
+// ---- the scheduler, against a real broker ----------------------------
+//
+// The ladder needs a broker that actually expires messages and dead-letters
+// them. The in-memory transport does neither, so everything below is here
+// rather than in the patterns package: a test that only checked the queues were
+// declared would prove nothing about delivery.
+
+// The scheduler's own queues and exchange are deliberately not cleaned up, the
+// same way acemq.dlx is not. They are shared, permanent objects named by the
+// cross-language contract, and every library declares them idempotently: a Java
+// or Python service scheduling against this broker owns them just as much as
+// this test does, and deleting them from under one is how a running service
+// loses the queue its messages are waiting in. Redeclaring them on the next run
+// is free, so nothing here needs them gone.
+//
+// What each test does remove is the queues and exchanges it invented for itself.
+
+func TestAScheduledMessageArrivesLateAndIntact(t *testing.T) {
+	ctx := context.Background()
+
+	target := queueName(t)
+	exchange := target + "-exchange"
+	const routingKey = "invoice.due"
+
+	removeAtEnd(t, []string{target}, []string{exchange})
+
+	// A codec that is neither JSON nor bytes, so that "the content type came
+	// through" is a claim with something behind it: a scheduler that lost the
+	// content type would deliver application/octet-stream, and one that encoded
+	// the payload a second time would deliver application/json.
+	mq := connect(t, acemq.WithCodec(acemq.StringCodec{}))
+
+	if err := acemq.NewTopology().
+		Exchange(exchange, "direct").
+		Queue(target).
+		Binding(target, exchange, routingKey).
+		Apply(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+
+	scheduler, err := patterns.NewScheduler(ctx, mq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = scheduler.Close() }()
+
+	const payload = "invoice INV-9 is due"
+	const delay = 4 * time.Second
+
+	sent := time.Now()
+	if err := scheduler.In(ctx, delay, exchange, routingKey, payload); err != nil {
+		t.Fatal(err)
+	}
+
+	// Not delivered early. Half the delay in, the target queue is still empty —
+	// which is the half of the claim a test that only waits for the message
+	// never makes.
+	time.Sleep(delay / 2)
+	early, err := mq.MessageCount(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if early != 0 {
+		t.Fatalf("%s already holds %d message(s) after %s of a %s delay",
+			target, early, delay/2, delay)
+	}
+	t.Logf("after %s of a %s delay, %s is still empty", delay/2, delay, target)
+
+	waitFor(t, "the scheduled message to come due", func() bool {
+		n, err := mq.MessageCount(ctx, target)
+		return err == nil && n == 1
+	})
+	waited := time.Since(sent)
+
+	// Read with a plain AMQP client. Nothing about this knows AceMQ exists, so
+	// what it sees is what any consumer in any language would see.
+	conn, err := amqp091.Dial(brokerURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	delivery, ok, err := ch.Get(target, true)
+	if err != nil || !ok {
+		t.Fatalf("Get from %s: %v, found=%v", target, err, ok)
+	}
+
+	if string(delivery.Body) != payload {
+		t.Errorf("delivered %q, want %q", delivery.Body, payload)
+	}
+	if delivery.ContentType != acemq.TextContentType {
+		t.Errorf("content type %q, want %q — the scheduler must carry it across",
+			delivery.ContentType, acemq.TextContentType)
+	}
+	if delivery.RoutingKey != routingKey {
+		t.Errorf("routing key %q, want %q", delivery.RoutingKey, routingKey)
+	}
+	if delivery.Exchange != exchange {
+		t.Errorf("exchange %q, want %q", delivery.Exchange, exchange)
+	}
+	for _, header := range []string{
+		patterns.HeaderScheduleExchange, patterns.HeaderScheduleRoutingKey,
+		patterns.HeaderScheduleDueAt, patterns.HeaderScheduleContentType,
+	} {
+		if _, carried := delivery.Headers[header]; carried {
+			t.Errorf("%s reached the consumer; it is the scheduler's bookkeeping", header)
+		}
+	}
+
+	// Accurate to about the smallest rung, which is the accuracy the ladder
+	// promises and not a second better: the last hop is skipped when what is
+	// left is under a second, because another hop would cost more than the
+	// accuracy it buys. Java skips it on the same condition, so a four-second
+	// delay arrives at about three seconds in both.
+	if waited < delay-2*time.Second {
+		t.Errorf("delivered after %s, which is early even for a ladder whose smallest rung is %s",
+			waited, patterns.ScheduleRungs()[len(patterns.ScheduleRungs())-1])
+	}
+	if waited > delay+5*time.Second {
+		t.Errorf("delivered after %s, which is late for a %s delay", waited, delay)
+	}
+
+	t.Logf("a %s delay was delivered after %s in %d hops (scheduled %d, delivered %d)",
+		delay, waited.Round(time.Millisecond),
+		scheduler.Hops(), scheduler.Scheduled(), scheduler.Delivered())
+}
+
+// The topology is a wire contract, so what matters is not that this library can
+// declare it but that the broker accepts the identical declaration from
+// something else — which is what a Java service starting against the same
+// broker is.
+func TestTheSchedulerTopologyIsTheOneJavaDeclares(t *testing.T) {
+	ctx := context.Background()
+
+	mq := connect(t)
+	scheduler, err := patterns.NewScheduler(ctx, mq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = scheduler.Close() }()
+
+	t.Logf("the scheduler declared:\n%s", patterns.ScheduleTopology())
+
+	// A second connection, and a raw AMQP client rather than this library, so
+	// the argument tables below are literal rather than whatever this library
+	// happens to build.
+	conn, err := amqp091.Dial(brokerURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Exactly what org.acemq.amqp.patterns.Scheduler.declareTopology writes:
+	// x-message-ttl, x-dead-letter-exchange, x-dead-letter-routing-key, and a
+	// classic queue, which is the absence of x-queue-type rather than
+	// x-queue-type=classic.
+	java := map[string]amqp091.Table{
+		"acemq.schedule.1h": {
+			"x-message-ttl":             int64(3_600_000),
+			"x-dead-letter-exchange":    "acemq.schedule",
+			"x-dead-letter-routing-key": "acemq.schedule.due",
+		},
+		"acemq.schedule.10m": {
+			"x-message-ttl":             int64(600_000),
+			"x-dead-letter-exchange":    "acemq.schedule",
+			"x-dead-letter-routing-key": "acemq.schedule.due",
+		},
+		"acemq.schedule.1m": {
+			"x-message-ttl":             int64(60_000),
+			"x-dead-letter-exchange":    "acemq.schedule",
+			"x-dead-letter-routing-key": "acemq.schedule.due",
+		},
+		"acemq.schedule.10s": {
+			"x-message-ttl":             int64(10_000),
+			"x-dead-letter-exchange":    "acemq.schedule",
+			"x-dead-letter-routing-key": "acemq.schedule.due",
+		},
+		"acemq.schedule.1s": {
+			"x-message-ttl":             int64(1_000),
+			"x-dead-letter-exchange":    "acemq.schedule",
+			"x-dead-letter-routing-key": "acemq.schedule.due",
+		},
+		"acemq.schedule.due": {},
+	}
+
+	for name, args := range java {
+		ch, err := conn.Channel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Passive would only ask whether it exists. A full declaration is the
+		// question that matters: does the broker agree that what is there is
+		// what Java would have created.
+		if _, err := ch.QueueDeclare(name, true, false, false, false, args); err != nil {
+			t.Errorf("the broker refused Java's declaration of %s: %v", name, err)
+		} else {
+			t.Logf("the broker accepted Java's declaration of %s: %v", name, args)
+		}
+		_ = ch.Close()
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ch.ExchangeDeclare(
+		"acemq.schedule", "direct", true, false, false, false, nil); err != nil {
+		t.Errorf("the broker refused Java's declaration of the acemq.schedule exchange: %v", err)
+	}
+	_ = ch.Close()
+
+	// And the other half of the claim: a table that is not this one is refused,
+	// so the acceptance above is the broker comparing rather than shrugging.
+	for _, wrong := range []struct {
+		what string
+		args amqp091.Table
+	}{
+		{
+			"a different time to live",
+			amqp091.Table{
+				"x-message-ttl":             int64(60_000),
+				"x-dead-letter-exchange":    "acemq.schedule",
+				"x-dead-letter-routing-key": "acemq.schedule.due",
+			},
+		},
+		{
+			"a different dead-letter routing key",
+			amqp091.Table{
+				"x-message-ttl":             int64(600_000),
+				"x-dead-letter-exchange":    "acemq.schedule",
+				"x-dead-letter-routing-key": "acemq.schedule.late",
+			},
+		},
+		{
+			"an extra argument",
+			amqp091.Table{
+				"x-message-ttl":             int64(600_000),
+				"x-dead-letter-exchange":    "acemq.schedule",
+				"x-dead-letter-routing-key": "acemq.schedule.due",
+				"x-max-length":              int64(1_000),
+			},
+		},
+		{
+			"a quorum queue",
+			amqp091.Table{
+				"x-message-ttl":             int64(600_000),
+				"x-dead-letter-exchange":    "acemq.schedule",
+				"x-dead-letter-routing-key": "acemq.schedule.due",
+				"x-queue-type":              "quorum",
+			},
+		},
+	} {
+		// A refused declaration closes the channel, so each one gets its own.
+		ch, err := conn.Channel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = ch.QueueDeclare("acemq.schedule.10m", true, false, false, false, wrong.args)
+		if err == nil {
+			t.Errorf("the broker accepted %s on acemq.schedule.10m", wrong.what)
+		} else {
+			if !strings.Contains(err.Error(), "PRECONDITION_FAILED") &&
+				!strings.Contains(err.Error(), "inequivalent") {
+				t.Errorf("%s was refused, but not for the reason expected: %v", wrong.what, err)
+			}
+			t.Logf("the broker refused %s: %v", wrong.what, err)
+		}
+		_ = ch.Close()
+	}
+}

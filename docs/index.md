@@ -103,7 +103,7 @@ The module is a package per concern, with nothing at its root:
 | `.../acemq-go-amqp/amqp` | envelopes, codecs, publishing, consuming, retry, the in-memory transport |
 | `.../acemq-go-amqp/rabbitmq` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go` |
 | `.../acemq-go-amqp/security` | TLS modes, trusted authorities, credentials |
-| `.../acemq-go-amqp/patterns` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, streams, consumer groups, schema registry, SQL stores |
+| `.../acemq-go-amqp/patterns` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, sagas, delayed delivery, streams, consumer groups, schema registry, SQL stores |
 | `.../acemq-go-amqp/actuator` | metrics, health and info over HTTP |
 | `.../acemq-go-amqp/crypto` | encrypted message bodies |
 | `.../acemq-go-amqp/codec/...` | XML, YAML, TOML, Protocol Buffers, Avro — a module each |
@@ -153,7 +153,8 @@ elsewhere.
 - [Exchanges, queues and bindings](topology.md)
 - [Security](security.md) — TLS, trust and credentials
 - [Retries, redelivery and shutdown](reliability.md)
-- [Patterns](patterns.md) — request-reply, idempotency, outbox, ordering, replay
+- [Patterns](patterns.md) — request-reply, idempotency, outbox, ordering, replay,
+  sagas, delayed delivery
 - [Metrics and health](observability.md)
 - [Testing without a broker](testing.md)
 - [API reference](https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp) on
