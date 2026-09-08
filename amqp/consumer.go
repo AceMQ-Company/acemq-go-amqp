@@ -164,6 +164,25 @@ func Consume[T any](
 		work:   make(chan Delivery, cfg.concurrency),
 	}
 
+	// The consumer's half of the topology, before the first delivery can arrive.
+	//
+	// {queue}.dlq and {queue}.parked are where this consumer puts a message it
+	// gives up on, and it puts them there by publishing to a queue by name. A
+	// publish to a queue nobody declared is unroutable, and an unroutable
+	// message is discarded by the broker without a trace — so a service that
+	// never applied its [Topology] would lose exactly the messages it had
+	// already decided were worth keeping. Declaring here costs a few idempotent
+	// declarations once per consumer and removes that path entirely. Java's
+	// consumer has always done this; see [RetryLadder.Declare].
+	//
+	// It is refused rather than ignored on failure. A declaration this consumer
+	// cannot make is one that disagrees with what is on the broker, and a
+	// consumer that started anyway would be running against a topology it does
+	// not understand.
+	if err := c.ladder.Declare(ctx, conn); err != nil {
+		return nil, err
+	}
+
 	if err := conn.track(c); err != nil {
 		return nil, err
 	}

@@ -40,12 +40,22 @@ the original is removing the copy that has been dealt with. Rejecting it instead
 would either requeue it into a hot loop or, with a dead-letter exchange on the
 queue, send it somewhere this library did not choose and without the reason.
 
-Declare both with the topology, or a consumer that gives up has nowhere to put
-the message and falls back to rejecting it:
+Declare both with the topology:
 
 ```go
 acemq.NewTopology().Queue("orders").DeadLetters("orders")
 ```
+
+`acemq.Consume` also declares `{queue}.dlq`, `{queue}.parked` and the `acemq.dlx`
+exchange they hang off, once, when the consumer starts, and with the same
+arguments this call uses — so the two agree in either order and neither is
+refused. That is a backstop rather than a reason to skip the topology, and it is
+there because the failure it prevents leaves nothing to look at: republishing
+into a queue nobody declared is an unroutable publish, and the broker discards an
+unroutable message without recording that it existed. What the topology adds on
+top is the source queue's own dead-letter arguments, which no consumer declares
+and which catch what this library never sees — see
+[two paths, and why both](#two-paths-and-why-both) below.
 
 That one call declares more than the two queues. It also declares the shared
 `acemq.dlx` exchange, binds `orders.dlq` and `orders.parked` to it on their own
@@ -234,9 +244,13 @@ absence of that argument in all five libraries. The source queue above it is
 quorum, and a rung is not, because nothing consumes a rung and replicating a
 queue whose whole purpose is to wait buys nothing.
 
-A consumer whose rungs are missing still retries — it waits in the process
-instead — and counts `acemq.MetricRungMissing` each time, because a topology that
-declares the queue and forgets its rungs otherwise looks like it works.
+`acemq.Consume` declares the rungs of the policy it is given when it starts, so a
+consumer normally finds them there. One can still go missing afterwards —
+somebody deletes it, a broker is restored from a backup taken before it existed —
+and a consumer whose rung is missing still retries, waiting in the process
+instead, and counts `acemq.MetricRungMissing` each time. Degraded rather than
+fatal, but never silent: a broker that has lost a rung otherwise looks like it
+works.
 
 ## When the connection drops
 

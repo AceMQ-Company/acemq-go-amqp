@@ -690,7 +690,8 @@ func TestGivingUpPutsTheMessageInTheDeadLetterQueueWithTheReason(t *testing.T) {
 	ctx := context.Background()
 	mq := brokerFor(t, WithRetry(FixedRetry(2, 0)))
 	declare(t, mq, "orders")
-	declare(t, mq, "orders.dlq")
+	// orders.dlq is deliberately not declared here. Consume declares it, and
+	// every other test below leans on the same thing.
 
 	sub, err := Consume(ctx, mq, "orders",
 		func(_ context.Context, m Message[OrderPlaced]) Ack {
@@ -742,7 +743,6 @@ func TestARejectedMessageSaysWhoRejectedIt(t *testing.T) {
 	ctx := context.Background()
 	mq := brokerFor(t, WithRetry(FixedRetry(5, 0)))
 	declare(t, mq, "orders")
-	declare(t, mq, "orders.dlq")
 
 	sub, err := Consume(ctx, mq, "orders",
 		func(_ context.Context, m Message[OrderPlaced]) Ack {
@@ -782,8 +782,6 @@ func TestABodyThatWillNotDecodeIsParkedRatherThanDeadLettered(t *testing.T) {
 	ctx := context.Background()
 	mq := brokerFor(t, WithRetry(FixedRetry(5, 0)))
 	declare(t, mq, "orders")
-	declare(t, mq, "orders.dlq")
-	declare(t, mq, "orders.parked")
 
 	sub, err := Consume(ctx, mq, "orders",
 		func(_ context.Context, m Message[OrderPlaced]) Ack { return Accept() })
@@ -874,14 +872,13 @@ func TestALongWaitIsHandedToTheBrokerAndNotHeldHere(t *testing.T) {
 func TestARungThatIsNotThereFallsBackToWaitingHere(t *testing.T) {
 	// Degraded rather than fatal. The message is still deliverable and waiting
 	// for it here is what this library did before there were rungs — but it is
-	// counted, because a topology that declares the queue and forgets its rungs
-	// otherwise looks like it works.
+	// counted, because a broker that has lost a rung otherwise looks like it
+	// works.
 	ctx := context.Background()
 	metrics := NewMetrics()
 	policy := FixedRetry(2, 50*time.Millisecond).WaitInBrokerFrom(10 * time.Millisecond)
 	mq := brokerFor(t, WithRetry(policy), WithObserver(metrics))
 	declare(t, mq, "orders")
-	declare(t, mq, "orders.dlq")
 
 	var mu sync.Mutex
 	calls := 0
@@ -897,6 +894,18 @@ func TestARungThatIsNotThereFallsBackToWaitingHere(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sub.Close()
+
+	// Removed after the consumer started, because starting is now the one moment
+	// the rung is certain to be there: Consume declares the whole ladder. A rung
+	// still goes missing — somebody deletes it, a policy changes, a broker is
+	// restored from a backup taken before it existed — and this is that.
+	rung, ok := LadderFor("orders", policy).RungFor(50 * time.Millisecond)
+	if !ok {
+		t.Fatal("the policy has no rung to remove, so this test proves nothing")
+	}
+	if err := mq.DeleteQueue(ctx, rung); err != nil {
+		t.Fatalf("cannot remove the rung %q: %v", rung, err)
+	}
 
 	if err := NewPublisher[OrderPlaced](mq, "", "orders").
 		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {

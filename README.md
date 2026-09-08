@@ -228,6 +228,12 @@ decode goes to `{queue}.parked` instead: a message that failed five times and a
 message nothing could read are different problems, and whoever drains the dead
 letters should not have to sort them by hand.
 
+`acemq.Consume` declares both queues and the `acemq.dlx` exchange that reaches
+them as it starts, with the arguments `DeadLetters` below uses, so the two agree
+in either order. Republishing into a queue nobody declared is an unroutable
+publish, and the broker discards an unroutable message without a trace — the one
+message somebody had just decided was worth keeping.
+
 ### The backstop underneath it
 
 `DeadLetters` declares those two queues, binds them to the shared `acemq.dlx`

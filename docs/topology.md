@@ -213,6 +213,15 @@ topology := acemq.NewTopology().
 	Retries("orders", policy)  // orders.retry.40s, .80s, .160s and their way home
 ```
 
+`acemq.Consume` declares all of them itself when it starts, from the policy it
+was given, with the same arguments this plan uses. The two agree in either order,
+so a service that applies its topology and then starts a consumer is not refused
+and neither is a consumer starting against a broker somebody else set up. Write
+the plan anyway — it is what a person reviews, and it carries the source queue's
+own dead-letter arguments, which no consumer declares — but the failure it used
+to be the only guard against is gone: a publish into a queue nobody declared is
+unroutable, and the broker discards an unroutable message without a trace.
+
 Printing it is the point — this is what `topology.String()` gives:
 
 ```

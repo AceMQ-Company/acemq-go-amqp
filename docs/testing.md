@@ -142,7 +142,7 @@ was green.
 
 ### Disagreements are recorded, not smoothed over
 
-Three differences between this library and the fixture are pinned by tests that
+Two differences between this library and the fixture are pinned by tests that
 say exactly what each side does, so that closing one is a decision somebody makes
 rather than something a green suite hides:
 
@@ -154,13 +154,17 @@ rather than something a green suite hides:
 - **The default message-age limit.** Java's constructors carry a 365-day age
   limit; this library, Python, Ruby and .NET treat no limit as no limit. A
   message a year old has outlived every queue it could be sitting in.
-- **Where the line between the two halves of the topology falls.** The operator
-  declares the source queue and its dead letters through `Topology`; the consumer
-  declares the rungs. Java's consumer half also declares `acemq.dlx`,
-  `{queue}.dlq` and `{queue}.parked`; `RetryLadder.Declare` here declares only
-  the rungs and the binding that brings an expired message home. The union of
-  the two halves is identical in both, and it is what
-  [a topology written the way `Topology` documents](topology.md) produces.
+
+A third was recorded here until ADR-032 closed it. **Where the line between the
+two halves of the topology falls**: the operator declared the source queue and
+its dead letters through `Topology`, and the consumer declared only the rungs, so
+a service that had never applied its topology republished a message it gave up on
+into a queue nobody had declared — and the broker discards an unroutable message
+without a trace. `RetryLadder.Declare` now declares `acemq.dlx`, `{queue}.dlq`
+and `{queue}.parked` with their two bindings as well, `Consume` calls it at
+start-up, and the five entries the fixture marks `declaredBy: "both"` are
+declared by both here too. `TestContractTheConsumerHalfDeclaresTheDeadLetterQueues`
+fails if the split ever reopens.
 
 ### Checking the copies have not drifted
 

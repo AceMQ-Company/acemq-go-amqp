@@ -154,8 +154,9 @@ func (r Rung) String() string { return fmt.Sprintf("%s (ttl %s)", r.Queue, r.Del
 //
 // The rungs are exactly the entries of [RetryPolicy.Schedule] that reach the
 // threshold, which is a finite list known before anything is published — which
-// is what makes them declarable up front, by a [Topology] somebody reviewed,
-// rather than conjured by a consumer at the moment it first fails.
+// is what makes them declarable up front, by a [Topology] somebody reviewed or
+// by [Consume] as it starts, rather than conjured at the moment of the first
+// failure.
 type RetryLadder struct {
 	// Source is the queue being consumed.
 	Source string
@@ -239,19 +240,53 @@ func (l RetryLadder) RungFor(delay time.Duration) (string, bool) {
 	return best, true
 }
 
-// Declare creates the rungs, and whatever brings an expired message home.
+// Declare creates everything a consumer of the source queue needs on its own
+// side: the rungs and whatever brings an expired message home, and the two
+// queues that hold what it gives up on.
 //
-// A [Topology] declares the same thing up front, which is where it belongs: a
-// queue that appears in a plan somebody reviewed. This exists because the cost
-// of a rung being absent is silent — a publish into a queue nobody declared is
-// dropped by the broker — and because a test or a tool sometimes needs the
-// ladder without the rest of a topology. Declaring is idempotent, and a
-// duplicate declaration is a great deal cheaper than a lost message.
+// A [Topology] declares the same things up front, which is where they belong: a
+// queue that appears in a plan somebody reviewed. This runs as well, from
+// [Consume], because the cost of one of them being absent is paid in silence. A
+// publish into a queue nobody declared is unroutable, and an unroutable message
+// is discarded by the broker without a trace — so a service that never applied
+// its topology loses the message it was trying to keep, at the moment it had
+// already decided something was wrong. Declaring is idempotent, and a duplicate
+// declaration is a great deal cheaper than a lost message.
+//
+// The two halves are not conditioned on the same thing, and that is deliberate:
+//
+//   - The dead-letter half — [DeadLetterExchange], {queue}.dlq, {queue}.parked
+//     and their two bindings — is declared whatever the policy says, because it
+//     is reached without one. A rejection, a fatal error, an interceptor that
+//     refuses a message and a body that will not decode all end in one of those
+//     two queues on a consumer with no retry policy at all.
+//   - The retry half — the retry exchange, the rungs and the return binding —
+//     is declared only when there are rungs, because without them nothing is
+//     ever published into one. Java declares its retry exchange unconditionally;
+//     an exchange with nothing bound to it is the same broker either way, and
+//     the empty case here is a consumer whose waits are all short.
+//
+// Everything is declared with the arguments [Topology] uses — the exchanges
+// durable and direct, the queues classic and durable — so that a service which
+// applied a topology first and then started a consumer is redeclaring what is
+// already there rather than contradicting it. That is a contract, not a
+// coincidence: a declaration that disagreed about any of them would be answered
+// PRECONDITION_FAILED and the consumer could not start.
 //
 // The source queue is not declared here. It is the caller's, it usually has
 // arguments of its own, and creating it as a side effect of setting up its
-// retries would be this library guessing at a queue somebody else owns.
+// retries would be this library guessing at a queue somebody else owns. That
+// also means the source queue's own x-dead-letter-exchange is not set here; ask
+// for it where the queue is declared, with [Topology.DeadLetters].
 func (l RetryLadder) Declare(ctx context.Context, conn *Conn) error {
+	if err := l.declareRetryHalf(ctx, conn); err != nil {
+		return err
+	}
+	return l.declareDeadLetterHalf(ctx, conn)
+}
+
+// declareRetryHalf creates the rungs and the way home from one.
+func (l RetryLadder) declareRetryHalf(ctx context.Context, conn *Conn) error {
 	if l.Empty() {
 		return nil
 	}
@@ -283,6 +318,41 @@ func (l RetryLadder) Declare(ctx context.Context, conn *Conn) error {
 		// queue is reachable by its own name from the moment it exists.
 		if err := conn.Bind(ctx, l.Source, exchange, routingKey); err != nil {
 			return fmt.Errorf("acemq: cannot bind %q to %q: %w", l.Source, exchange, err)
+		}
+	}
+	return nil
+}
+
+// declareDeadLetterHalf creates the two queues a message ends in when there is
+// nothing left to try, and the exchange they are reached through.
+//
+// The same three declarations and two bindings [Topology.DeadLetters] makes, and
+// with the same arguments, so whichever of the two runs second is agreeing with
+// the first. Neither queue gets dead-lettering of its own: a dead-letter queue
+// that dead-letters is a loop, and a loop is how a poison message becomes an
+// outage.
+func (l RetryLadder) declareDeadLetterHalf(ctx context.Context, conn *Conn) error {
+	if err := conn.DeclareExchange(ctx, DeadLetterExchange, "direct"); err != nil {
+		return fmt.Errorf("acemq: cannot declare the dead-letter exchange %q: %w",
+			DeadLetterExchange, err)
+	}
+	for _, target := range []string{DeadLetterQueue(l.Source), ParkedQueue(l.Source)} {
+		// Classic, and the same in all five libraries. These hold what nothing
+		// could handle, they are drained by a person rather than consumed, and
+		// neither the replication nor the memory a quorum queue costs buys
+		// anything for that.
+		if err := conn.DeclareQueue(ctx, target, OfType(QueueClassic)); err != nil {
+			return fmt.Errorf("acemq: cannot declare the dead-letter queue %q: %w", target, err)
+		}
+		// Bound on its own name, which is the key the source queue's
+		// x-dead-letter-routing-key sends a message under, so one shared
+		// exchange reaches exactly one queue per service. The consumer's own
+		// path does not come through here at all — it publishes to the queue by
+		// name through the default exchange — but both paths have to end in the
+		// same place or an operator draining dead letters looks in two.
+		if err := conn.Bind(ctx, target, DeadLetterExchange, target); err != nil {
+			return fmt.Errorf("acemq: cannot bind %q to %q: %w",
+				target, DeadLetterExchange, err)
 		}
 	}
 	return nil

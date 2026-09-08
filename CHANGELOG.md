@@ -6,6 +6,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## [Unreleased]
+
+### Changed
+
+- **A consumer declares the dead-letter half of its topology when it starts.**
+  `RetryLadder.Declare` created the retry exchange, the rungs and the binding
+  that brings an expired message home; it now creates `acemq.dlx`,
+  `{queue}.dlq`, `{queue}.parked` and their two bindings as well, and
+  `acemq.Consume` calls it once as the consumer starts. Java's consumer half has
+  always declared them, which is why the cross-language fixture marks all five
+  `declaredBy: "both"` (ADR-032).
+
+  The union of the two halves has not changed, so a service that applies its
+  `Topology` sees the same broker as before — the declarations are idempotent
+  and use the arguments `Topology` uses, in either order. What is gone is the
+  failure mode when the topology was never applied: a consumer that gave up
+  republished into a queue nobody had declared, and the broker discards an
+  unroutable message without a trace. The one message somebody had just decided
+  was worth keeping was the one that vanished.
+
+  The dead-letter half is declared whether or not there is a retry policy,
+  because a rejection, a fatal error, an interceptor that refuses a message and
+  a body that will not decode all reach `{queue}.dlq` or `{queue}.parked`
+  without consulting one. The retry exchange and the rungs are still declared
+  only when the policy has waits long enough to need them.
+
 ## [0.2.0] — 2026-09-07
 
 > ### ⚠ Migrating: a retry is republished, and a dead-lettered queue gains

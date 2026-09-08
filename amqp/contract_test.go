@@ -47,6 +47,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"sort"
 	"strconv"
@@ -1072,11 +1073,11 @@ func (r *contractRecorder) Close() error { return nil }
 // contractHalves is the whole declared topology, and which half declared each
 // part of it.
 //
-// The operator declares the source queue, its two dead-letter queues and the
-// exchange that reaches them, through Topology; the consumer declares the rungs
-// and the exchange that brings expired messages home, through
-// RetryLadder.Declare. Neither half is the whole topology, which is exactly what
-// the contract's declaredBy field is for.
+// The operator declares the source queue and everything around it through
+// Topology; the consumer declares the rungs and the dead-letter queues it will
+// itself publish into, through RetryLadder.Declare. Neither half is the whole
+// topology and the two overlap, which is exactly what the contract's declaredBy
+// field is for: "topology", "consumer" or "both".
 type contractHalves struct {
 	exchangeSpec map[string]ExchangeSpec
 	queueSpec    map[string]QueueSpec
@@ -1152,30 +1153,6 @@ func contractDeclaredTopology(t *testing.T, source string, policy RetryPolicy) *
 		halves.note("binding", key, "consumer")
 	}
 	return halves
-}
-
-// contractHalfDifferences are the five entries this library's consumer half does
-// not declare, where the contract says both halves do.
-//
-// Java's RetryTopology.declare creates the retry exchange and the rungs and then
-// goes on to create acemq.dlx, {queue}.dlq and {queue}.parked with their two
-// bindings, so a Java service that only ever calls declare has a broker that can
-// hold what it gives up on. This library splits the two: RetryLadder.Declare
-// makes the rungs, and Topology.DeadLetters makes the dead-letter half, so a Go
-// service that called only the first would republish a dead letter into a queue
-// nobody declared — and an unroutable publish is dropped by the broker.
-//
-// The union of the two halves is identical in both languages, which is what the
-// rest of the topology test asserts, and it is what a service that uses Topology
-// as the documentation shows gets. What differs is where the line between the
-// halves falls, and it is written down here rather than smoothed over so that
-// closing it is a decision somebody makes.
-var contractHalfDifferences = map[string]bool{
-	"exchange acemq.dlx":                                    true,
-	"queue orders.new.dlq":                                  true,
-	"queue orders.new.parked":                               true,
-	"binding orders.new.dlq acemq.dlx orders.new.dlq":       true,
-	"binding orders.new.parked acemq.dlx orders.new.parked": true,
 }
 
 func TestContractTheDeclaredTopologyIsTheSameInEveryLanguage(t *testing.T) {
@@ -1268,37 +1245,33 @@ func TestContractTheDeclaredTopologyIsTheSameInEveryLanguage(t *testing.T) {
 	}
 }
 
-// contractCheckHalf compares which half declared something, allowing for the
-// five entries recorded in contractHalfDifferences and nothing else.
+// contractCheckHalf compares which half declared something against the contract,
+// with nothing exempted.
+//
+// There used to be a list of five exemptions here — acemq.dlx, {queue}.dlq,
+// {queue}.parked and their two bindings, which the contract says both halves
+// declare and which this library declared from the topology alone. ADR-032
+// closed it: the consumer declares the dead-letter half at start-up too, so
+// there is no difference left to record and nothing here to allow for.
 func contractCheckHalf(t *testing.T, kind, name string, halves *contractHalves, want string) {
 	t.Helper()
 	key := kind + " " + name
-	got := halves.declaredBy[key]
-	if got == want {
-		if contractHalfDifferences[key] {
-			t.Errorf("%s is declared by %s in both now, so the split recorded in "+
-				"contractHalfDifferences has been closed and the note there is out of date",
-				key, got)
-		}
-		return
+	if got := halves.declaredBy[key]; got != want {
+		t.Errorf("%s is declared by %s here and by %s in the contract", key, got, want)
 	}
-	if contractHalfDifferences[key] {
-		// Recorded rather than resolved. See contractHalfDifferences.
-		if got != "topology" {
-			t.Errorf("%s is declared by %s here; the recorded difference is that this "+
-				"library declares it from the topology alone where the contract says %s",
-				key, got, want)
-		}
-		return
-	}
-	t.Errorf("%s is declared by %s here and by %s in the contract", key, got, want)
 }
 
-// TestContractTheConsumerHalfDoesNotDeclareTheDeadLetterQueues pins the
-// difference contractHalfDifferences describes, from the other direction: it
-// asserts what this library's consumer half does declare, so that the difference
-// cannot quietly grow or quietly close.
-func TestContractTheConsumerHalfDoesNotDeclareTheDeadLetterQueues(t *testing.T) {
+// TestContractTheConsumerHalfDeclaresTheDeadLetterQueues pins ADR-032 from the
+// other direction: it asserts exactly what this library's consumer half
+// declares, so that the split which used to be recorded here cannot reopen
+// without a test saying so.
+//
+// The half used to stop at the rungs. A Go service that never applied a Topology
+// would then republish a message it had given up on into a queue nobody had
+// declared, and an unroutable publish is discarded by the broker without a
+// trace: the one message anybody wanted kept, lost in silence. Java's consumer
+// half declared the dead-letter queues from the start; this one now does too.
+func TestContractTheConsumerHalfDeclaresTheDeadLetterQueues(t *testing.T) {
 	fixtures := loadContract(t)
 	source := fixtures.Topology.SourceQueue
 
@@ -1308,46 +1281,91 @@ func TestContractTheConsumerHalfDoesNotDeclareTheDeadLetterQueues(t *testing.T) 
 		t.Fatalf("declaring the ladder failed: %v", err)
 	}
 
-	if len(recorder.exchanges) != 1 || recorder.exchanges[0].Name != RetryExchange {
-		names := make([]string, 0, len(recorder.exchanges))
-		for _, e := range recorder.exchanges {
-			names = append(names, e.Name)
+	gotExchanges := map[string]bool{}
+	for _, e := range recorder.exchanges {
+		gotExchanges[e.Name] = true
+		if e.Spec.Kind != "direct" || !e.Spec.Durable {
+			t.Errorf("the consumer half declares %q as %s durable=%v; both exchanges are "+
+				"direct and durable in every language", e.Name, e.Spec.Kind, e.Spec.Durable)
 		}
-		t.Errorf("the consumer half declares the exchanges %v; it declares only %q, and "+
-			"the contract has Java's consumer half declare %q as well",
-			names, RetryExchange, DeadLetterExchange)
+	}
+	wantExchanges := map[string]bool{RetryExchange: true, DeadLetterExchange: true}
+	if !maps.Equal(gotExchanges, wantExchanges) {
+		t.Errorf("the consumer half declares the exchanges %v, and the contract says %v",
+			sortedKeys(gotExchanges), sortedKeys(wantExchanges))
 	}
 
-	for _, queue := range recorder.queues {
-		if !strings.HasPrefix(queue.Name, source+RetryInfix) {
-			t.Errorf("the consumer half declares %q, which is not a rung", queue.Name)
-		}
+	gotQueues := map[string]bool{}
+	for _, q := range recorder.queues {
+		gotQueues[q.Name] = true
 	}
-	if len(recorder.queues) != len(policy.BrokerRungs()) {
-		t.Errorf("the consumer half declares %d queues for %d rungs",
-			len(recorder.queues), len(policy.BrokerRungs()))
+	wantQueues := map[string]bool{
+		DeadLetterQueue(source): true,
+		ParkedQueue(source):     true,
 	}
+	for _, rung := range LadderFor(source, policy).Queues() {
+		wantQueues[rung] = true
+	}
+	if !maps.Equal(gotQueues, wantQueues) {
+		t.Errorf("the consumer half declares the queues %v, and the contract says %v",
+			sortedKeys(gotQueues), sortedKeys(wantQueues))
+	}
+
+	// The two the split used to leave out, spelled again on their own, so that a
+	// regression here reads as what it is rather than as a set that differs.
 	for _, name := range []string{DeadLetterQueue(source), ParkedQueue(source)} {
-		for _, queue := range recorder.queues {
-			if queue.Name == name {
-				t.Errorf("the consumer half now declares %q, so the difference recorded "+
-					"in contractHalfDifferences has been closed and that note is out of "+
-					"date", name)
+		if !gotQueues[name] {
+			t.Errorf("the consumer half no longer declares %q; a consumer that gives up "+
+				"would republish into a queue nobody declared, and the broker discards "+
+				"an unroutable message without a trace", name)
+			continue
+		}
+		for _, q := range recorder.queues {
+			if q.Name != name {
+				continue
+			}
+			// Classic and durable: the same declaration Topology.DeadLetters
+			// makes, so whichever runs second agrees with the first instead of
+			// being answered PRECONDITION_FAILED.
+			if got := queueTypeOf(q.Spec); got != QueueClassic {
+				t.Errorf("the consumer half declares %q as %s, and Topology declares it "+
+					"classic; the second of the two to run would be refused", name, got)
+			}
+			if !q.Spec.Durable {
+				t.Errorf("the consumer half declares %q transient", name)
+			}
+			if len(contractArgs(q.Spec.Args)) != 0 {
+				t.Errorf("the consumer half declares %q with %s, and Topology declares it "+
+					"with no arguments at all", name, showArgs(contractArgs(q.Spec.Args)))
 			}
 		}
 	}
 
-	if len(recorder.bindings) != 1 {
-		t.Errorf("the consumer half declares %d bindings, and it declares only the one "+
-			"that brings an expired message home", len(recorder.bindings))
+	gotBindings := map[string]bool{}
+	for _, b := range recorder.bindings {
+		gotBindings[contractBindingKey(b.Queue, b.Exchange, b.RoutingKey)] = true
 	}
-	if len(recorder.bindings) == 1 {
-		got := recorder.bindings[0]
-		want := BindingSpec{Queue: source, Exchange: RetryExchange, RoutingKey: source}
-		if got != want {
-			t.Errorf("the consumer half binds %v, and the contract says %v", got, want)
-		}
+	wantBindings := map[string]bool{
+		contractBindingKey(source, RetryExchange, source): true,
+		contractBindingKey(DeadLetterQueue(source), DeadLetterExchange,
+			DeadLetterQueue(source)): true,
+		contractBindingKey(ParkedQueue(source), DeadLetterExchange,
+			ParkedQueue(source)): true,
 	}
+	if !maps.Equal(gotBindings, wantBindings) {
+		t.Errorf("the consumer half declares the bindings %v, and the contract says %v",
+			sortedKeys(gotBindings), sortedKeys(wantBindings))
+	}
+}
+
+// sortedKeys is the set as a list an error message can be read in one order.
+func sortedKeys(set map[string]bool) []string {
+	names := make([]string, 0, len(set))
+	for name := range set {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // -------------------------------------------------------------- queue types

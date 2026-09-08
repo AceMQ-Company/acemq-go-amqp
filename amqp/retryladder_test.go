@@ -232,24 +232,58 @@ func TestDeclaringALadderCreatesTheRungsAndTheirWayHome(t *testing.T) {
 	}
 }
 
-func TestALadderWithNoRungsDeclaresNothing(t *testing.T) {
-	ctx := context.Background()
-	mq := brokerFor(t)
-	declare(t, mq, "orders")
+// TestALadderWithNoRungsStillDeclaresTheDeadLetterHalf pins the one place the
+// two halves of a declaration are conditioned differently.
+//
+// A policy whose waits are all short needs no rungs, and a policy that is not
+// there at all needs none either — but neither of them stops a consumer giving
+// up. A rejection, a fatal error, an interceptor that refuses a message and a
+// body that will not decode all end in {queue}.dlq or {queue}.parked, and none
+// of the four consults the retry policy on the way. So the dead-letter half is
+// declared whatever the policy says and the retry half is not, and a consumer
+// with no policy configured at all — the zero value below — still has somewhere
+// to put what it cannot handle.
+func TestALadderWithNoRungsStillDeclaresTheDeadLetterHalf(t *testing.T) {
+	for _, c := range []struct {
+		what   string
+		policy RetryPolicy
+	}{
+		{"a policy whose waits are all short", FixedRetry(3, time.Second)},
+		{"no policy at all", RetryPolicy{}},
+	} {
+		t.Run(c.what, func(t *testing.T) {
+			ctx := context.Background()
+			mq := brokerFor(t)
+			declare(t, mq, "orders")
 
-	if err := LadderFor("orders", FixedRetry(3, time.Second)).Declare(ctx, mq); err != nil {
-		t.Fatal(err)
-	}
+			ladder := LadderFor("orders", c.policy)
+			if !ladder.Empty() {
+				t.Fatalf("%s needs rungs, so this case proves nothing", c.what)
+			}
+			if err := ladder.Declare(ctx, mq); err != nil {
+				t.Fatal(err)
+			}
 
-	// Not even the exchange: a service whose waits are all short should cost the
-	// broker nothing at all.
-	if RetryExchange != "" {
-		exists, err := mq.QueueExists(ctx, "orders.retry.1s")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if exists {
-			t.Error("a short-wait policy declared a rung queue")
-		}
+			for _, name := range []string{DeadLetterQueue("orders"), ParkedQueue("orders")} {
+				exists, err := mq.QueueExists(ctx, name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !exists {
+					t.Errorf("%s was not declared, and a consumer that gives up "+
+						"republishes into it whether or not it has rungs", name)
+				}
+			}
+
+			// No rung, and nothing that would only exist to serve one: an empty
+			// ladder should cost the broker nothing on the retry side.
+			exists, err := mq.QueueExists(ctx, "orders.retry.1s")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if exists {
+				t.Error("a short-wait policy declared a rung queue")
+			}
+		})
 	}
 }

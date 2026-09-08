@@ -77,8 +77,19 @@ func queueName(t *testing.T) string {
 // twice. A queue that survives a run makes the next one assert against the
 // leftovers of the last, which is a failure that looks like a bug in the
 // library.
+//
+// {queue}.dlq and {queue}.parked go with every queue named here, whether the
+// test asked for them or not: consuming from a queue declares them, because a
+// consumer that gives up has to have somewhere to put the message. Deleting a
+// queue that is not there is a no-op on RabbitMQ, so the two extra names cost a
+// round trip and never a failure.
 func removeAtEnd(t *testing.T, queues []string, exchanges []string) {
 	t.Helper()
+	withDeadLetters := make([]string, 0, len(queues)*3)
+	for _, q := range queues {
+		withDeadLetters = append(withDeadLetters, q, q+".dlq", q+".parked")
+	}
+	queues = withDeadLetters
 	t.Cleanup(func() {
 		conn, err := amqp091.Dial(brokerURL(t))
 		if err != nil {
@@ -219,6 +230,10 @@ func TestAMessageGoesThroughARealBroker(t *testing.T) {
 	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
 		t.Fatal(err)
 	}
+	// The queue deletes itself; its dead-letter queues do not, because the
+	// consumer declares those durable so that a message it gives up on survives
+	// a restart.
+	removeAtEnd(t, []string{queue}, nil)
 
 	got := make(chan acemq.Message[OrderPlaced], 1)
 	sub, err := acemq.Consume(ctx, mq, queue,
@@ -291,6 +306,7 @@ func TestTheAttemptCounterAdvancesAgainstARealBroker(t *testing.T) {
 	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
 		t.Fatal(err)
 	}
+	removeAtEnd(t, []string{queue}, nil)
 
 	var mu sync.Mutex
 	var attempts []int
@@ -689,6 +705,7 @@ func TestClosingWaitsForAHandlerAgainstARealBroker(t *testing.T) {
 	if err := mq.DeclareQueue(ctx, queue, acemq.AutoDelete()); err != nil {
 		t.Fatal(err)
 	}
+	removeAtEnd(t, []string{queue}, nil)
 
 	started := make(chan struct{})
 	var finished bool
@@ -892,6 +909,158 @@ func TestATopologyAppliesToARealBroker(t *testing.T) {
 	case <-got:
 	case <-time.After(15 * time.Second):
 		t.Fatal("the topology was applied but nothing routed through it")
+	}
+}
+
+// TestADeadLetterSurvivesWithNoTopologyOnARealBroker is the reason for ADR-032.
+//
+// Nothing here applies a topology. There is a source queue, put there by hand
+// the way a service that never wrote one has, and a consumer that gives up on
+// the first message it is handed. Giving up means republishing to {queue}.dlq
+// by name, mandatory, through the default exchange — and until this consumer
+// declared that queue itself, there was no such queue: the broker had nowhere
+// to route the message, discarded it, and recorded nothing anywhere. The one
+// message somebody had just decided was worth keeping was the one that went.
+//
+// The assertions are in that order deliberately. The dead-letter queue is not
+// on the broker before Consume is called and is after it returns, so the test
+// says which declaration closed the hole rather than only that it is closed.
+func TestADeadLetterSurvivesWithNoTopologyOnARealBroker(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t, acemq.WithRetry(acemq.FixedRetry(1, 0)))
+	queue := queueName(t)
+	removeAtEnd(t, []string{queue}, nil)
+
+	// The source queue and nothing else: no Topology, no DeadLetters, no
+	// acemq.dlx, no {queue}.dlq.
+	if err := mq.DeclareQueue(ctx, queue); err != nil {
+		t.Fatal(err)
+	}
+	dlq := acemq.DeadLetterQueue(queue)
+	if there, err := mq.QueueExists(ctx, dlq); err != nil {
+		t.Fatal(err)
+	} else if there {
+		t.Fatalf("%s is already on the broker, so this test would prove nothing", dlq)
+	}
+
+	sub, err := acemq.Consume(ctx, mq, queue,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			return acemq.Retry(errors.New("the database timed out"))
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if there, err := mq.QueueExists(ctx, dlq); err != nil {
+		t.Fatal(err)
+	} else if !there {
+		t.Fatalf("%s is still not on the broker after the consumer started, so the "+
+			"message it gives up on has nowhere to go", dlq)
+	}
+
+	if err := acemq.NewPublisher[OrderPlaced](mq, "", queue).
+		Send(ctx, OrderPlaced{OrderID: "o-1"}, acemq.MessageID("m-1")); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		n, err := mq.MessageCount(ctx, dlq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s holds %d messages; the one the consumer gave up on was "+
+				"discarded as unroutable, which is the silent loss this closes", dlq, n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	dead, found, err := mq.Pull(ctx, dlq)
+	if err != nil || !found {
+		t.Fatalf("Pull: %v, found=%v", err, found)
+	}
+	defer func() { _ = dead.Ack() }()
+
+	if dead.Envelope.ID != "m-1" {
+		t.Errorf("the dead letter is message %q, want the one that was published", dead.Envelope.ID)
+	}
+	if !strings.Contains(dead.Envelope.Error, "the database timed out") {
+		t.Errorf("Error = %q, and the reason is the whole point of keeping it",
+			dead.Envelope.Error)
+	}
+	t.Logf("%s holds the message the consumer gave up on, reason %q", dlq, dead.Envelope.Error)
+}
+
+// TestTheTwoHalvesDeclareInEitherOrderOnARealBroker declares the same topology
+// both ways round.
+//
+// A service applies its topology and then starts a consumer; another starts a
+// consumer against a broker somebody else set up. Both orders happen, and both
+// have to be idempotent — a declaration that disagreed about a queue's type, an
+// exchange's kind or an argument is answered PRECONDITION_FAILED, and the
+// second of the two would not start at all. The consumer half declares the
+// dead-letter queues now, so the overlap between the halves is five objects
+// rather than none and this is where it is checked.
+func TestTheTwoHalvesDeclareInEitherOrderOnARealBroker(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+	prefix := queueName(t)
+	policy := acemq.ExponentialRetry(4, time.Second, time.Minute)
+
+	topologyFirst := prefix + "-topology-first"
+	consumerFirst := prefix + "-consumer-first"
+	var leftovers []string
+	for _, queue := range []string{topologyFirst, consumerFirst} {
+		leftovers = append(leftovers, queue)
+		leftovers = append(leftovers, acemq.LadderFor(queue, policy).Queues()...)
+	}
+	removeAtEnd(t, leftovers, nil)
+
+	plan := func(queue string) *acemq.Topology {
+		return acemq.NewTopology().
+			Queue(queue).
+			DeadLetters(queue).
+			Retries(queue, policy)
+	}
+
+	// The operator first, then the consumer, which is the ordinary deployment.
+	if err := plan(topologyFirst).Apply(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+	if err := acemq.LadderFor(topologyFirst, policy).Declare(ctx, mq); err != nil {
+		t.Fatalf("the consumer half is refused by a broker its own topology set up: %v", err)
+	}
+
+	// The consumer first, against a source queue and nothing else. The queue is
+	// declared with the two arguments Topology.DeadLetters stamps on it, because
+	// that is the one part of the plan no consumer ever declares.
+	if err := mq.DeclareQueue(ctx, consumerFirst,
+		acemq.QueueArg(acemq.ArgDeadLetterExchange, acemq.DeadLetterExchange),
+		acemq.QueueArg(acemq.ArgDeadLetterRoutingKey, acemq.DeadLetterQueue(consumerFirst)),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := acemq.LadderFor(consumerFirst, policy).Declare(ctx, mq); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan(consumerFirst).Apply(ctx, mq); err != nil {
+		t.Fatalf("the topology is refused by a broker a consumer of it started against "+
+			"first: %v", err)
+	}
+
+	// And a second time round, because idempotent means twice as well as once.
+	for _, queue := range []string{topologyFirst, consumerFirst} {
+		if err := acemq.LadderFor(queue, policy).Declare(ctx, mq); err != nil {
+			t.Errorf("declaring the consumer half of %s a second time: %v", queue, err)
+		}
+		if err := plan(queue).Apply(ctx, mq); err != nil {
+			t.Errorf("applying the topology of %s a second time: %v", queue, err)
+		}
 	}
 }
 
