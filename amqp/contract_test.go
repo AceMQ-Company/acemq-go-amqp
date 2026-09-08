@@ -41,7 +41,7 @@ package acemq
 // Two disagreements are recorded rather than resolved, each with a test of its
 // own that says what this library does and what the file says:
 // TestContractSubSecondRungNamesDisagreeAcrossLanguages and
-// TestContractGoHasNoDefaultMessageAgeLimitWhereJavaHasOne.
+// TestContractNoPolicyHasADefaultAgeLimitInAnyLanguage.
 
 import (
 	"context"
@@ -78,6 +78,7 @@ type contractSchedule struct {
 	How                       string             `json:"how"`
 	MaxAttempts               int                `json:"maxAttempts"`
 	MaxMessageAgeMillis       int64              `json:"maxMessageAgeMillis"`
+	HasMaxMessageAge          bool               `json:"hasMaxMessageAge"`
 	JitterFactor              float64            `json:"jitterFactor"`
 	BrokerWaitThresholdMillis int64              `json:"brokerWaitThresholdMillis"`
 	ScheduleMillis            []int64            `json:"scheduleMillis"`
@@ -493,7 +494,7 @@ func TestContractExponentialDoublesAndFixedDoesNot(t *testing.T) {
 // The policy is built from the fixture's own maxMessageAgeMillis rather than
 // from the constructor's default, because those two differ: Java's constructors
 // carry a 365-day age limit and this library's carry none. That divergence is
-// pinned on its own in TestContractGoHasNoDefaultMessageAgeLimitWhereJavaHasOne
+// pinned on its own in TestContractNoPolicyHasADefaultAgeLimitInAnyLanguage
 // rather than hidden here — what this test is for is the rule itself, which is
 // the same rule in both.
 func TestContractRetryDecisionsMatchAtEveryLimit(t *testing.T) {
@@ -512,13 +513,23 @@ func TestContractRetryDecisionsMatchAtEveryLimit(t *testing.T) {
 
 				// The rule recomputed from the two limits the fixture states,
 				// so the file is checked as well as the library.
-				expected := decision.Attempt < schedule.MaxAttempts &&
+				//
+				// An age limit of zero means there is no age limit, which is why
+				// the fixture carries hasMaxMessageAge beside the number: read
+				// the zero as a limit and every age is past it, so a policy that
+				// retries for ever looks like one that retries never. Java used
+				// to sidestep this by defaulting to 365 days; it now defaults to
+				// zero like everyone else, and the flag is how the file says
+				// which zero it means.
+				withinAge := !schedule.HasMaxMessageAge ||
 					decision.MessageAgeMillis < schedule.MaxMessageAgeMillis
+				expected := decision.Attempt < schedule.MaxAttempts && withinAge
 				if expected != decision.Retries {
 					t.Errorf("attempt %d at %dms: the contract says retries=%v, but "+
-						"attempts<%d and age<%dms gives %v",
+						"attempts<%d and (no age limit=%v, age<%dms) gives %v",
 						decision.Attempt, decision.MessageAgeMillis, decision.Retries,
-						schedule.MaxAttempts, schedule.MaxMessageAgeMillis, expected)
+						schedule.MaxAttempts, !schedule.HasMaxMessageAge,
+						schedule.MaxMessageAgeMillis, expected)
 				}
 
 				wait, again := policy.NextWait(decision.Attempt, age)
@@ -551,7 +562,7 @@ func TestContractRetryDecisionsMatchAtEveryLimit(t *testing.T) {
 	}
 }
 
-// TestContractGoHasNoDefaultMessageAgeLimitWhereJavaHasOne records a real
+// TestContractNoPolicyHasADefaultAgeLimitInAnyLanguage records a real
 // disagreement rather than resolving it.
 //
 // The fixture reports maxMessageAgeMillis as 31536000000 — 365 days — for every
@@ -565,33 +576,45 @@ func TestContractRetryDecisionsMatchAtEveryLimit(t *testing.T) {
 // it could be sitting in. It is written down because an undocumented difference
 // is the one that surfaces in production, and because whoever settles it should
 // be changing one library rather than four.
-func TestContractGoHasNoDefaultMessageAgeLimitWhereJavaHasOne(t *testing.T) {
+func TestContractNoPolicyHasADefaultAgeLimitInAnyLanguage(t *testing.T) {
 	fixtures := loadContract(t)
 
-	const javaDefaultDays = 365
-	javaDefault := int64(javaDefaultDays * 24 * time.Hour / time.Millisecond)
-
+	// Java used to default every policy to a 365-day age limit while Go, .NET,
+	// Python and Ruby defaulted to none, so a message exactly a year old was
+	// abandoned here and retried there. Java now agrees that zero means no
+	// limit, and this asserts the agreement rather than the divergence.
+	//
+	// The previous version of this test looped over schedules whose limit
+	// equalled 365 days. There are none now, so it passed without executing its
+	// body -- which is the failure this whole suite exists to catch, in the
+	// suite itself.
+	checked := 0
 	for _, schedule := range fixtures.RetrySchedules {
-		if schedule.MaxMessageAgeMillis != javaDefault {
-			// A policy that asked for an age limit of its own. Those agree.
-			continue
+		if schedule.HasMaxMessageAge {
+			continue // asked for a limit of its own; covered elsewhere
+		}
+		if schedule.MaxMessageAgeMillis != 0 {
+			t.Errorf("%s has no age limit but records %dms; zero is how the "+
+				"fixture says unlimited", schedule.Name, schedule.MaxMessageAgeMillis)
 		}
 		policy := contractPolicy(t, schedule.How)
 		if policy.MaxMessageAge != 0 {
-			t.Errorf("%s carries a %s age limit here; this test is written for the "+
-				"unlimited default and needs revisiting", schedule.How, policy.MaxMessageAge)
-			continue
+			t.Errorf("%s carries a %s age limit here, but the contract says none",
+				schedule.How, policy.MaxMessageAge)
 		}
 		if schedule.MaxAttempts < 2 {
-			// none() stops on attempts before age can matter.
-			continue
+			continue // none() stops on attempts before age can matter
 		}
-		if _, again := policy.NextWait(1, time.Duration(javaDefault)*time.Millisecond); !again {
-			t.Errorf("%s gave up on a %d-day-old message; this library has no default "+
-				"age limit, so it should still retry, and the divergence recorded here "+
-				"has been resolved without this test being updated",
-				schedule.How, javaDefaultDays)
+		aYear := 365 * 24 * time.Hour
+		if _, again := policy.NextWait(1, aYear); !again {
+			t.Errorf("%s gave up on a year-old message; with no age limit it "+
+				"should still retry", schedule.How)
 		}
+		checked++
+	}
+
+	if checked == 0 {
+		t.Fatal("no unlimited policy was exercised, so this test proved nothing")
 	}
 }
 
