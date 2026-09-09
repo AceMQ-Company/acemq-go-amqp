@@ -76,7 +76,13 @@ func TestItNeverAnswersForAnUntypedMessage(t *testing.T) {
 	if codec.CanDecode("application/json") {
 		t.Error("it claimed a JSON message")
 	}
-	for _, ct := range []string{"application/yaml", "application/x-yaml", "text/yaml", "application/vnd.acme+yaml"} {
+	// text/x-yaml is here because the Java, Python and Ruby libraries all send
+	// and read it, and this one used to refuse it — so a Ruby publisher's
+	// message was parked as undecodable by a Go consumer.
+	for _, ct := range []string{
+		"application/yaml", "application/x-yaml",
+		"text/yaml", "text/x-yaml", "application/vnd.acme+yaml",
+	} {
 		if !codec.CanDecode(ct) {
 			t.Errorf("it refused %s", ct)
 		}

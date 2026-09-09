@@ -122,6 +122,15 @@ The relay publishes the bytes that were recorded rather than re-encoding, becaus
 a record outlives the process that wrote it and the Go type may not survive a
 deployment.
 
+Every sweep counts what it did through the connection's `acemq.Observer`:
+`acemq.outbox.total` tagged `published` or `failed`, and `acemq.outbox.lag` — how
+long a record waited between being committed and being published, measured from
+the commit rather than from the sweep, because what a lag answers is how long
+somebody has been owed this message. The tracing adapter's
+`outbox.publish_failed` event is *not* written from here and cannot be: a sweep
+runs on a goroutine of the relay's own with no span open. See
+[observability](observability.md).
+
 ## Ordering
 
 A queue delivers in order; `acemq.Concurrency` above one stops honouring that.
@@ -181,6 +190,24 @@ step := patterns.Then(
 The input is accepted only once the output is published. If publishing fails the
 input is retried and the work runs again, so a step that changes anything should
 be idempotent.
+
+### Naming a step, so a finished run is visible
+
+`patterns.InPipeline` and `patterns.AtStep` name a `Then` or a `FollowSlip`, and
+that is what makes it write a `pipeline.run_finished` event onto the delivery's
+span:
+
+```go
+step := patterns.Then(shipments, plan,
+	patterns.InPipeline("fulfilment"), patterns.AtStep("pick"))
+```
+
+A step that returns `false` reports `ended_early` — this message does not
+continue, a decision rather than a failure, and otherwise a thing only a log
+could tell you. `FollowSlip` reports `completed` when it finishes the itinerary,
+and takes the step's name off the slip so it usually needs only `InPipeline`. An
+unnamed step reports nothing at all, rather than an event tagged with two empty
+strings.
 
 ## Replay
 

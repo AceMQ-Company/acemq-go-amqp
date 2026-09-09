@@ -10,6 +10,32 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`pipeline.run_finished` is written by the library rather than only being
+  callable.** `patterns.InPipeline` and `patterns.AtStep` name a `patterns.Then`
+  or a `patterns.FollowSlip`, and a named step writes the event onto the
+  delivery's own span when a message leaves the pipeline: `completed` when
+  `FollowSlip` finishes the itinerary, `ended_early` when a `Then` step returns
+  `false` because this message does not continue. A pipeline step runs inside the
+  handler's span, which is what makes there be something to write onto. An
+  unnamed step reports nothing rather than an event tagged with two empty
+  strings: Go has no `Pipeline` type that owns its steps the way Java's does, so
+  a step that wants to be reported has to say which pipeline it is in.
+
+- **The outbox relay reports what it did.** Every sweep counts
+  `acemq.outbox.total`, tagged `published` or `failed`, and records
+  `acemq.outbox.lag` — measured from when the record was committed rather than
+  from when the sweep claimed it, because what a lag answers is how long somebody
+  has been owed this message. The names are the Java library's.
+
+  The tracing adapter's `outbox.publish_failed` event and its
+  `messaging.acemq.outbox_lag_ms` attribute remain application-callable and are
+  **not** written by the relay. They cannot be: `Sweep` runs on a goroutine of the
+  relay's own with no span open, and opening one per record would produce exactly
+  the zero-length spans that adapter exists to avoid. Counters need no span, which
+  is why the relay reports through them instead. An application that wants the
+  trace side calls `Sweep` from inside a span of its own — see
+  [docs/observability.md](docs/observability.md).
+
 - **`telemetry/otel`, OpenTelemetry spans for publishes and deliveries.** A
   module of its own — `github.com/AceMQ-Company/acemq-go-amqp/telemetry/otel` —
   so `go.opentelemetry.io/otel` never becomes a dependency of anyone who only
@@ -103,6 +129,35 @@ While the version is `0.x` the public API may change in any release.
 
 ### Changed
 
+- **The consume counters classify by the engine's decision, not the handler's
+  request. This changes numbers an existing dashboard may rely on.** A handler
+  asking for a retry is a request: the engine still has to look at the policy,
+  and a message on its last permitted attempt is dead-lettered instead. The
+  counters were classified from the `Ack`, so that message incremented
+  `acemq.messages.retried` — a retry nobody would ever make — *and*
+  `acemq.messages.dead.lettered`, and a dashboard's retry rate included every
+  message about to be given up on.
+
+  **Retries fall and dead letters rise, with no change in what the service
+  does.** The numbers were wrong and are now right. Two smaller corrections come
+  with it: a retry waiting on a rung queue was counted twice, once bare and once
+  under a `rung` label, and is now counted once (the `rung` label lives on
+  `acemq.retry.rung.missing`); and a message nothing could decode is now
+  `acemq.messages.parked` rather than `acemq.messages.rejected`. The .NET library
+  made the same correction, and Python and Ruby are making it too.
+
+  `acemq.messages.consumed` is now counted when a delivery settles rather than
+  when it arrives, and carries an `outcome` tag — `acked`, `retried`, `rejected`,
+  `dead_lettered` or `parked`. Every delivery increments it once and exactly one
+  of the five per-outcome counters, so they add up. `acemq.handler.duration`
+  carries the same tag.
+
+  The tag is the same string `telemetry/otel` writes on that delivery's span as
+  `messaging.acemq.outcome`. Both read `acemq.Settlement.Outcome`, a new field the
+  engine fills in, so there is one derivation rather than two that could drift —
+  and there is a test that fails if a counter and a span disagree about the same
+  deliveries.
+
 - **Breaking change to the wire format: `crypto` now writes the framing Java,
   Python and Ruby write.** A body encrypted by this library up to v0.3.0 is not
   the shape any of the others read, and a body encrypted by any of them was
@@ -163,6 +218,12 @@ While the version is `0.x` the public API may change in any release.
   which those bodies are refused rather than misread.
 
 ### Fixed
+
+- **`codec/yaml` reads `text/x-yaml` again.** `CanDecode` matched
+  `application/x-yaml` and `text/yaml` but not `text/x-yaml`, which the Java,
+  Python and Ruby libraries all send and read. A YAML message from a Ruby
+  publisher was therefore undecodable to a Go consumer — parked, with no codec
+  claiming it, for a spelling difference.
 
 - **`codec/avro` no longer decodes a message written in the other mode into
   nonsense.** `CanDecode` accepted all four Avro content-type spellings whatever

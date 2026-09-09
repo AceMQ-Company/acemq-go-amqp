@@ -249,8 +249,7 @@ func handleDelivery[T any](
 	env := EnvelopeFromWire(d.Headers, d.RoutingKey, d.MessageID)
 
 	observer := c.conn.observer
-	labels := map[string]string{"queue": c.queue}
-	observer.Count(MetricConsumed, 1, labels)
+	labels := map[string]string{TagQueue: c.queue}
 	observer.Gauge(MetricInFlight, c.inFlight(1), labels)
 	defer observer.Gauge(MetricInFlight, c.inFlight(-1), labels)
 
@@ -268,12 +267,11 @@ func handleDelivery[T any](
 				// retried, because an interceptor that says no will say no
 				// again to the same message.
 				reason := "an interceptor refused it: " + describe(err)
-				observer.Count(MetricRejected, 1, labels)
-				observer.Count(MetricDeadLettered, 1, labels)
 				c.deadLetter(ctx, d, env, reason)
-				hook.settled(Settlement{
+				c.settled(hook, Settlement{
 					Queue:    c.queue,
 					Action:   SettledDeadLettered,
+					Outcome:  OutcomeDeadLettered,
 					Envelope: env,
 					Reason:   reason,
 				})
@@ -292,11 +290,11 @@ func handleDelivery[T any](
 		// — one is usually the world, the other is usually a producer — and
 		// whoever drains the dead letters should not have to sort them by hand.
 		reason := "could not be decoded: " + describe(err)
-		observer.Count(MetricRejected, 1, labels)
 		c.park(ctx, d, env, reason)
-		hook.settled(Settlement{
+		c.settled(hook, Settlement{
 			Queue:    c.queue,
 			Action:   SettledParked,
+			Outcome:  OutcomeParked,
 			Envelope: env,
 			Reason:   reason,
 		})
@@ -314,24 +312,39 @@ func handleDelivery[T any](
 		Body:        d.Body,
 	})
 
-	observeConsume(observer, c.queue, ack, time.Since(started))
+	// How long the handler took, kept until the engine has decided: the
+	// duration is tagged with the outcome, and the outcome does not exist yet.
+	// Read before the settling below rather than after, so a short backoff
+	// waited in this process is not folded into "how long the handler took" —
+	// which would make every retrying consumer look slow.
+	took := time.Since(started)
 
 	switch ack.action {
 	case ackAccept:
 		if d.Ack != nil {
 			_ = d.Ack()
 		}
-		hook.settled(Settlement{Queue: c.queue, Action: SettledAccepted, Envelope: env})
+		c.settledAfterHandler(hook, Settlement{
+			Queue:    c.queue,
+			Action:   SettledAccepted,
+			Outcome:  OutcomeAcked,
+			Envelope: env,
+		}, took)
 
 	case ackReject:
+		// Dead-lettered, but counted and traced as rejected. Both end in the
+		// dead-letter queue and only the word keeps them apart: one is a
+		// decision somebody took about this message, the other is the engine
+		// running out of room to try again.
 		reason := "the handler rejected it: " + describe(ack.err)
 		c.deadLetter(ctx, d, env, reason)
-		hook.settled(Settlement{
+		c.settledAfterHandler(hook, Settlement{
 			Queue:    c.queue,
 			Action:   SettledDeadLettered,
+			Outcome:  OutcomeRejected,
 			Envelope: env,
 			Reason:   reason,
-		})
+		}, took)
 
 	case ackRetry:
 		if IsFatal(ack.err) {
@@ -339,14 +352,14 @@ func handleDelivery[T any](
 			// will not change. Honouring the mark rather than the request is
 			// the point of having it.
 			reason := "the handler reported an unprocessable message: " + describe(ack.err)
-			observer.Count(MetricDeadLettered, 1, labels)
 			c.deadLetter(ctx, d, env, reason)
-			hook.settled(Settlement{
+			c.settledAfterHandler(hook, Settlement{
 				Queue:    c.queue,
 				Action:   SettledDeadLettered,
+				Outcome:  OutcomeDeadLettered,
 				Envelope: env,
 				Reason:   reason,
-			})
+			}, took)
 			return
 		}
 
@@ -363,26 +376,27 @@ func handleDelivery[T any](
 			// handler said retry, and what happened is a dead letter. Anything
 			// that stops at the handler reports the first and never the second.
 			reason := c.exhausted(env) + ": " + describe(ack.err)
-			observer.Count(MetricDeadLettered, 1, labels)
 			c.deadLetter(ctx, d, env, reason)
-			hook.settled(Settlement{
+			c.settledAfterHandler(hook, Settlement{
 				Queue:    c.queue,
 				Action:   SettledDeadLettered,
+				Outcome:  OutcomeDeadLettered,
 				Envelope: env,
 				Reason:   reason,
-			})
+			}, took)
 			return
 		}
 
 		// Said before the retry rather than after it, so the delay reported is
 		// the one just chosen and not one already spent — and so a span covering
 		// the handler is not held open across a wait the handler is not doing.
-		hook.settled(Settlement{
+		c.settledAfterHandler(hook, Settlement{
 			Queue:    c.queue,
 			Action:   SettledRetried,
+			Outcome:  OutcomeRetried,
 			Envelope: env.NextAttempt(),
 			Delay:    wait.Delay,
-		})
+		}, took)
 
 		if wait.InBroker && c.retryInBroker(ctx, d, env, wait.Delay) {
 			return
@@ -401,6 +415,27 @@ func handleDelivery[T any](
 		}
 		c.retryAgain(ctx, d, env)
 	}
+}
+
+// settled reports one delivery's fate to both of the places that have to agree
+// about it: the counters, and whatever the handler registered through
+// [OnSettled].
+//
+// One function rather than a pair of calls at each of the six paths out of
+// [handleDelivery], because a path that reported to one and forgot the other is
+// exactly how the counters and the spans came to say different things about the
+// same message. Called after the delivery has physically been settled, so the
+// outcome is what happened rather than what was about to be attempted.
+func (c *Consumer) settled(hook *settlementHook, s Settlement) {
+	observeConsume(c.conn.observer, s.Queue, s.Outcome)
+	hook.settled(s)
+}
+
+// settledAfterHandler is [Consumer.settled] for a delivery that reached a
+// handler, and records how long that took under the outcome the engine chose.
+func (c *Consumer) settledAfterHandler(hook *settlementHook, s Settlement, took time.Duration) {
+	observeHandler(c.conn.observer, s.Queue, s.Outcome, took)
+	c.settled(hook, s)
 }
 
 // exhausted says why there is no next attempt, in words an operator can act on.
@@ -448,12 +483,15 @@ func (c *Consumer) retryInBroker(
 		// like it works, right up until a long backoff quietly becomes a held
 		// prefetch slot.
 		c.conn.observer.Count(MetricRungMissing, 1, map[string]string{
-			"queue": c.queue, "rung": rung})
+			TagQueue: c.queue, TagRung: rung})
 		return false
 	}
 
-	c.conn.observer.Count(MetricRetried, 1, map[string]string{
-		"queue": c.queue, "rung": rung})
+	// Not counted as a retry here. The settlement above already counted this
+	// message once, and counting it again under a rung label would make
+	// acemq.messages.retried sum to twice the number of retries for every
+	// consumer whose policy uses rungs. Which rung a wait went to is what
+	// [MetricRungMissing] answers.
 	if d.Ack != nil {
 		_ = d.Ack()
 	}
@@ -522,7 +560,7 @@ func (c *Consumer) setAside(ctx context.Context, d Delivery, env Envelope, targe
 		// broker's own dead-lettering is the last thing left between this message
 		// and nothing.
 		c.conn.observer.Count(MetricSetAsideFailed, 1, map[string]string{
-			"queue": c.queue, "target": target})
+			TagQueue: c.queue, TagTarget: target})
 		c.nack(d, false)
 		return
 	}

@@ -242,12 +242,25 @@ func (r *OutboxRelay) Start(ctx context.Context) {
 //
 // Exported so a test can drive the relay without waiting for a tick, and so an
 // application can flush the outbox on demand.
+//
+// # What it reports, and what it cannot
+//
+// Every record is counted through the connection's [acemq.Observer], published
+// or failed, and a published one records how long it waited — see
+// [acemq.MetricOutboxLag]. That is the whole of the relay's telemetry, and
+// deliberately so: the tracing adapter has an outbox.publish_failed event and an
+// outbox_lag_ms attribute, and neither can be written from here. A sweep runs on
+// a goroutine of the relay's own with no span open, and opening one per record
+// would produce exactly the zero-length spans that adapter exists to avoid. An
+// application that wants the trace side calls Sweep itself, from inside a span
+// of its own, and calls the adapter's methods with what this returns.
 func (r *OutboxRelay) Sweep(ctx context.Context) (int, error) {
 	records, err := r.store.Pending(ctx, r.batch)
 	if err != nil {
 		return 0, fmt.Errorf("acemq: cannot read the outbox: %w", err)
 	}
 
+	observer := r.conn.Observer()
 	published := 0
 	for _, record := range records {
 		result, err := r.conn.PublishRaw(ctx, record.Exchange, record.RoutingKey, acemq.Outbound{
@@ -261,10 +274,19 @@ func (r *OutboxRelay) Sweep(ctx context.Context) (int, error) {
 			// Left in the outbox. Stopping rather than continuing keeps the
 			// order records were written in, which is usually what the writer
 			// intended.
+			acemq.ObserveOutbox(observer, record.Exchange, record.RoutingKey,
+				acemq.OutcomeFailed, 0)
 			return published, fmt.Errorf(
 				"acemq: cannot publish outbox record %s: %w", record.ID, err)
 		}
 		_ = result
+
+		// Measured from when the record was written rather than from when this
+		// sweep claimed it. What a lag answers is how long somebody has been
+		// owed this message, and the wait for a sweep is part of the answer
+		// rather than the start of it.
+		acemq.ObserveOutbox(observer, record.Exchange, record.RoutingKey,
+			acemq.OutcomePublished, time.Since(record.CreatedAt))
 
 		if err := r.store.MarkPublished(ctx, record.ID); err != nil {
 			// Published but not marked. The next sweep will publish it again,

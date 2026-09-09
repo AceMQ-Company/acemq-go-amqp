@@ -738,6 +738,65 @@ func TestTheOutboxPublishesWhatWasRecorded(t *testing.T) {
 	}
 }
 
+// TestTheRelayCountsWhatItPublishedAndHowFarBehindItWas is the outbox's only
+// telemetry, and deliberately so.
+//
+// The tracing adapter has an outbox.publish_failed event and an outbox_lag_ms
+// attribute, and neither can be written from a sweep: the relay runs on a
+// goroutine of its own with no span open, and opening one per record would
+// produce exactly the zero-length spans that adapter exists to avoid. Counters
+// need no span, so this is what a process gets without wiring anything up.
+func TestTheRelayCountsWhatItPublishedAndHowFarBehindItWas(t *testing.T) {
+	ctx := context.Background()
+	metrics := acemq.NewMetrics()
+	mq := brokerFor(t, acemq.WithObserver(metrics))
+	if err := mq.DeclareQueue(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+
+	store := patterns.NewInMemoryOutboxStore()
+	record, err := patterns.Record(mq, "", "orders", OrderPlaced{OrderID: "o-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Committed a while ago, so the lag is the wait somebody was owed this
+	// message for rather than the microsecond this test took.
+	record.CreatedAt = time.Now().UTC().Add(-2 * time.Second)
+	if err := store.Add(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := patterns.NewOutboxRelay(mq, store).Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var published int64
+	for key, value := range metrics.Counts() {
+		if strings.HasPrefix(key, acemq.MetricOutboxTotal) &&
+			strings.Contains(key, "{outcome=published}") {
+			published += value
+		}
+	}
+	if published != 1 {
+		t.Errorf("%s tagged published = %d, want 1", acemq.MetricOutboxTotal, published)
+	}
+
+	var lag acemq.DurationSummary
+	for key, summary := range metrics.Durations() {
+		if strings.HasPrefix(key, acemq.MetricOutboxLag) {
+			lag = summary
+		}
+	}
+	if lag.Count != 1 {
+		t.Fatalf("%s was recorded %d times, want 1", acemq.MetricOutboxLag, lag.Count)
+	}
+	if lag.Max < 2 {
+		t.Errorf("%s = %vs, want at least the 2s the record waited: "+
+			"the lag is measured from the commit, not from the sweep",
+			acemq.MetricOutboxLag, lag.Max)
+	}
+}
+
 func TestRecordingTheSameMessageTwiceSendsItOnce(t *testing.T) {
 	// A caller retrying its own transaction must not turn one message into two.
 	ctx := context.Background()

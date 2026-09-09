@@ -111,13 +111,129 @@ func TestRetriesAndDeadLetteringAreCounted(t *testing.T) {
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	if got := countFor(metrics, MetricRetried); got < 2 {
-		t.Errorf("%s = %d, want at least 2", MetricRetried, got)
+	// Two attempts, and only the first of them is a retry. The handler asked
+	// for a retry both times; the second ask had no attempt left to spend, and
+	// counting what was asked for rather than what was done is what used to
+	// make this two. A retry that never happens is not a retry.
+	if got := countFor(metrics, MetricRetried); got != 1 {
+		t.Errorf("%s = %d, want 1: only the first of two attempts was retried", MetricRetried, got)
 	}
 	// The point of the metric: a message that ran out of attempts is gone, and
 	// that should be visible without reading a log.
 	if got := countFor(metrics, MetricDeadLettered); got != 1 {
 		t.Errorf("%s = %d, want 1", MetricDeadLettered, got)
+	}
+	// Every delivery is counted once, whatever became of it, so the per-outcome
+	// counters add up to this one.
+	if got := countFor(metrics, MetricConsumed); got != 2 {
+		t.Errorf("%s = %d, want 2", MetricConsumed, got)
+	}
+}
+
+// TestTheOutcomeTagIsTheEnginesDecisionNotTheHandlersRequest pins the tag on the
+// consume counter, which is the half of the agreement this package can see. The
+// other half — that the span for the same delivery carries the same word — is
+// TestTheCounterAndTheSpanAgreeOnEveryOutcome in telemetry/otel.
+func TestTheOutcomeTagIsTheEnginesDecisionNotTheHandlersRequest(t *testing.T) {
+	ctx := context.Background()
+	metrics := NewMetrics()
+	mq := brokerFor(t, WithObserver(metrics), WithRetry(FixedRetry(2, 0)))
+	declare(t, mq, "orders")
+
+	attempts := make(chan struct{}, 10)
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			attempts <- struct{}{}
+			return Retry(errors.New("still broken"))
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		select {
+		case <-attempts:
+		case <-time.After(3 * time.Second):
+			t.Fatal("the message was not retried")
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	counts := metrics.Counts()
+	retried := counts[metricKey(MetricConsumed,
+		map[string]string{TagQueue: "orders", TagOutcome: OutcomeRetried})]
+	deadLettered := counts[metricKey(MetricConsumed,
+		map[string]string{TagQueue: "orders", TagOutcome: OutcomeDeadLettered})]
+
+	if retried != 1 {
+		t.Errorf("%s tagged %s = %d, want 1", MetricConsumed, OutcomeRetried, retried)
+	}
+	if deadLettered != 1 {
+		t.Errorf("%s tagged %s = %d, want 1: the handler asked for a retry it could not have",
+			MetricConsumed, OutcomeDeadLettered, deadLettered)
+	}
+}
+
+// TestEveryDeliveryIsCountedUnderExactlyOneOutcome is what makes the per-outcome
+// counters addable. A delivery counted twice, or under a label that splits it,
+// makes every dashboard built on them wrong in a way nothing reports.
+func TestEveryDeliveryIsCountedUnderExactlyOneOutcome(t *testing.T) {
+	ctx := context.Background()
+	metrics := NewMetrics()
+	mq := brokerFor(t, WithObserver(metrics), WithRetry(FixedRetry(3, 0)))
+	declare(t, mq, "orders")
+
+	seen := make(chan string, 20)
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			seen <- m.Payload.OrderID
+			switch m.Payload.OrderID {
+			case "accept":
+				return Accept()
+			case "reject":
+				return Reject(errors.New("no"))
+			default:
+				return Retry(errors.New("again"))
+			}
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	pub := NewPublisher[OrderPlaced](mq, "", "orders")
+	for _, id := range []string{"accept", "reject", "retry"} {
+		if err := pub.Send(ctx, OrderPlaced{OrderID: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Three messages, and the retrying one is delivered three times.
+	for range 5 {
+		select {
+		case <-seen:
+		case <-time.After(3 * time.Second):
+			t.Fatal("the messages did not all arrive")
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	consumed := countFor(metrics, MetricConsumed)
+	perOutcome := countFor(metrics, MetricAccepted) + countFor(metrics, MetricRetried) +
+		countFor(metrics, MetricRejected) + countFor(metrics, MetricDeadLettered) +
+		countFor(metrics, MetricParked)
+
+	if consumed != perOutcome {
+		t.Errorf("%s = %d but the per-outcome counters add to %d",
+			MetricConsumed, consumed, perOutcome)
+	}
+	if consumed != 5 {
+		t.Errorf("%s = %d, want 5: three messages, one of them delivered three times",
+			MetricConsumed, consumed)
 	}
 }
 

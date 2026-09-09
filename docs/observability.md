@@ -29,17 +29,56 @@ that never reads metrics does not pay for them.
 |---|---|
 | `acemq.messages.published` | handed to the broker |
 | `acemq.messages.publish.failed` | did not get there, including unroutable |
-| `acemq.messages.consumed` | delivered to a handler |
-| `acemq.messages.accepted` / `.retried` / `.rejected` | what handlers decided |
-| `acemq.messages.dead.lettered` | ran out of attempts, or would not decode |
-| `acemq.handler.duration` | seconds per message |
+| `acemq.messages.consumed` | deliveries settled, tagged `outcome` |
+| `acemq.messages.accepted` | the handler accepted it |
+| `acemq.messages.retried` | another attempt was actually scheduled |
+| `acemq.messages.rejected` | the handler gave up on it by name |
+| `acemq.messages.dead.lettered` | the engine gave up on it |
+| `acemq.messages.parked` | nothing could decode it |
+| `acemq.handler.duration` | seconds per message, tagged `outcome` |
 | `acemq.messages.in.flight` | being handled right now |
+| `acemq.outbox.total` | outbox records the relay handled, tagged `outcome` |
+| `acemq.outbox.lag` | seconds between an outbox record being committed and published |
 
-The names match the Java and .NET libraries, so a dashboard built against one
-reads against another.
+The names match the Python and Ruby libraries. The Java and .NET libraries count
+the same things under `acemq.consume.total` and `acemq.consume.duration` with the
+same `outcome` tag; that split is older than this library and is not one it can
+settle on its own.
 
 `acemq.messages.dead.lettered` is the one to alert on. It is the count of
 messages that are gone.
+
+### The outcome is the engine's decision, not the handler's request
+
+Every delivery increments `acemq.messages.consumed` exactly once and exactly one
+of the five outcome counters, so they add up. The `outcome` tag takes one of five
+words:
+
+| `outcome` | |
+|---|---|
+| `acked` | accepted and acknowledged |
+| `retried` | another attempt was scheduled |
+| `rejected` | the handler gave up on it by name |
+| `dead_lettered` | the attempts ran out, the message aged out, the failure was marked unprocessable, or an interceptor refused it |
+| `parked` | nothing could decode the body |
+
+It is the same word the tracing adapter puts on that delivery's span as
+`messaging.acemq.outcome`, taken from the same `acemq.Settlement`, so a dashboard
+filtered to dead letters and a trace search for them return the same set. There
+is a test that asserts exactly that.
+
+> **This changes numbers an existing dashboard may rely on.** Until this release
+> the classification came from what the handler asked for. A handler that asked
+> for a retry on its last permitted attempt was counted as a retry and then
+> *again* as a dead letter, so `acemq.messages.retried` counted retries that
+> never happened and included every message about to be given up on. From this
+> release **retries fall and dead letters rise, with no change in what the
+> service does** — the numbers were wrong and are now right. Two smaller
+> corrections come with it: a retry that waits on a rung queue is no longer
+> counted twice (once bare and once under a `rung` label, which is now only on
+> `acemq.retry.rung.missing`), and a message nothing could decode is counted as
+> `acemq.messages.parked` rather than `acemq.messages.rejected`. The .NET library
+> made the same correction; Python and Ruby are making it too.
 
 ### If you only want the numbers
 
@@ -164,6 +203,43 @@ An event with no span open is dropped rather than opening one for itself. That
 is a legitimate answer: an outbox relay on its own goroutine with no delivery in
 flight has nothing to hang an event on.
 
+Three of the four are written by the library itself. `message.retried` and
+`message.dead_lettered` come from the engine when it settles a delivery, and
+`pipeline.run_finished` from `patterns.FollowSlip` and `patterns.Then` when a run
+leaves the pipeline — a pipeline step runs inside the delivery's span, so there
+is something open to write onto:
+
+```go
+acemq.Consume(ctx, mq, "charge-queue", otel.Handle(tracing, "charge-queue",
+	patterns.FollowSlip(mq, charge, patterns.InPipeline("fulfilment"))))
+```
+
+`InPipeline` is what turns it on, and it has to be given: Go has no `Pipeline`
+type that owns its steps the way the Java library does, so a step that wants to
+be reported has to say which pipeline it belongs to. `FollowSlip` takes the
+step's own name off the routing slip; `patterns.AtStep` overrides it, and `Then`
+needs it. A step that finishes the itinerary reports `completed`; a `Then` whose
+step returns `false` — this message does not continue — reports `ended_early`.
+
+#### The outbox relay is the one seam that stays open
+
+`outbox.publish_failed` and the `messaging.acemq.outbox_lag_ms` attribute are
+still methods you call, and the relay does not call them. It cannot: `Sweep` runs
+on a goroutine of the relay's own with no span open, and opening one per record
+would produce exactly the zero-length spans this adapter avoids. What the relay
+does instead is count — `acemq.outbox.total` and `acemq.outbox.lag` are written
+on every sweep and need no span at all. An application that wants the trace side
+calls `Sweep` itself, from inside a span of its own:
+
+```go
+ctx, span := tracing.Tracer().Start(ctx, "outbox sweep")
+defer span.End()
+
+if _, err := relay.Sweep(ctx); err != nil {
+	tracing.OutboxPublishFailed(ctx, "orders", err.Error())
+}
+```
+
 ### The engine has the last word on a delivery
 
 `message.retried` and `message.dead_lettered` are written by the engine rather
@@ -176,7 +252,12 @@ through `acemq.OnSettled`:
 
 ```go
 acemq.OnSettled(ctx, func(s acemq.Settlement) {
-	// s.Action is accepted, retried, dead_lettered or parked.
+	// s.Action is accepted, retried, dead_lettered or parked — the four
+	//   physical fates a delivery can have.
+	// s.Outcome is the word a counter and a span use: acked, retried,
+	//   rejected, dead_lettered or parked. Finer than Action in one place, a
+	//   message the handler rejected is dead-lettered like an exhausted one
+	//   and only this tells them apart.
 	// s.Delay is the retry delay the engine actually chose.
 	// s.Reason is why it was given up on.
 })
@@ -199,6 +280,15 @@ the span ended before the engine answered. It now carries `dead_lettered`, with
 `message.dead_lettered` and the reason on it. A handler that rejected a message
 on purpose still carries `rejected` — that decision arrived where it was meant
 to — with the dead-letter event alongside it.
+
+The span does not work the outcome out for itself. It writes `s.Outcome`, which
+is the same string the engine tagged `acemq.messages.consumed` with for this
+delivery, so there is one derivation rather than two that could drift. The one
+exception is a handler that *panics* while running directly, with no consumer
+around it: there is no engine to settle the delivery and the span says `failed`.
+Under a consumer the panic is recorded on the span as an exception and the
+outcome stays the engine's word, which is `rejected` — a handler that panics is
+dead-lettered rather than retried, because a bug repeats.
 
 ### Trace context for a message this library does not publish
 

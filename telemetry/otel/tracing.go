@@ -86,6 +86,7 @@ import (
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+	"github.com/AceMQ-Company/acemq-go-amqp/patterns"
 	otelapi "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -144,13 +145,20 @@ const (
 
 // The outcomes, which are the values of the messaging.acemq.outcome attribute
 // and are shared with the metric tag of the same name in every AceMQ library.
+//
+// The consume outcomes are taken from the core package rather than written out
+// again here. The engine decides them, tags [acemq.MetricConsumed] with them and
+// hands them to this adapter on the [acemq.Settlement]; a second copy of the
+// spellings would be a second thing to keep in step, and a counter and a span
+// that disagree about one delivery is the bug this arrangement exists to
+// prevent.
 const (
 	// OutcomeConfirmed is the broker taking responsibility for the message.
 	OutcomeConfirmed = "confirmed"
 
 	// OutcomePublished is a message that went out with nothing promised about
 	// it. Publisher confirms were not on.
-	OutcomePublished = "published"
+	OutcomePublished = acemq.OutcomePublished
 
 	// OutcomeUnroutable is a message that reached no queue at all, which the
 	// broker does not consider an error and which is very often the whole
@@ -158,19 +166,24 @@ const (
 	OutcomeUnroutable = "unroutable"
 
 	// OutcomeFailed is a publish or a handler that returned an error or panicked.
-	OutcomeFailed = "failed"
+	OutcomeFailed = acemq.OutcomeFailed
 
 	// OutcomeAcked is a handler accepting the message.
-	OutcomeAcked = "acked"
+	OutcomeAcked = acemq.OutcomeAcked
 
-	// OutcomeRetried is a handler asking for another attempt.
-	OutcomeRetried = "retried"
+	// OutcomeRetried is another attempt actually being scheduled.
+	OutcomeRetried = acemq.OutcomeRetried
 
 	// OutcomeRejected is a handler refusing the message outright.
-	OutcomeRejected = "rejected"
+	OutcomeRejected = acemq.OutcomeRejected
 
 	// OutcomeDeadLettered is a message that ran out of attempts or was given up on.
-	OutcomeDeadLettered = "dead_lettered"
+	OutcomeDeadLettered = acemq.OutcomeDeadLettered
+
+	// OutcomeParked is a message nothing could decode. It never reaches a
+	// handler, so it never appears on a consume span — it is here so that the
+	// outcome vocabulary a reader sees in one place is the whole of it.
+	OutcomeParked = acemq.OutcomeParked
 
 	// OutcomeAnswered is a request that got its reply.
 	OutcomeAnswered = "answered"
@@ -178,6 +191,12 @@ const (
 	// OutcomeTimedOut is a request that did not, which is the absence of an
 	// answer rather than evidence that nothing happened.
 	OutcomeTimedOut = "timed_out"
+
+	// OutcomeCompleted and OutcomeEndedEarly are how a pipeline run finished:
+	// through its last step, or stopped before it by a step that decided this
+	// message does not continue.
+	OutcomeCompleted  = patterns.OutcomeCompleted
+	OutcomeEndedEarly = patterns.OutcomeEndedEarly
 )
 
 // The event names.

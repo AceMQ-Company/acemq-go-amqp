@@ -173,71 +173,88 @@ func finishPublish(span *Span, result acemq.PublishResult, err error) {
 // the retry and dead-letter events are written where the decision is taken. A
 // handler called directly rather than run by a consumer gets no engine and no
 // handover, and its span ends here as it always did.
+// # One word for the counter and the span
+//
+// The outcome written here is [acemq.Settlement.Outcome] — the same string the
+// engine tags acemq.messages.consumed with for this delivery. It is not derived
+// again from the handler's Ack, so a dashboard filtered to dead-lettered
+// messages and a trace search for the same thing cannot return different sets.
 func Handle[T any](t *Tracing, queue string, next acemq.Handler[T]) acemq.Handler[T] {
 	return func(ctx context.Context, m acemq.Message[T]) acemq.Ack {
 		ctx, span := t.StartConsume(ctx, queue, m.Envelope)
 
-		// What the handler asked for, which the settlement below needs in order
-		// to tell a message the handler gave up on from one the engine did.
-		// Assigned after next returns; the closure reads it then.
-		var asked string
-		if !acemq.OnSettled(ctx, func(s acemq.Settlement) {
-			t.settled(ctx, span, asked, s)
-		}) {
+		// A pipeline step running inside this handler has a span to write
+		// pipeline.run_finished onto, and this is where it is offered one.
+		ctx = patterns.WithRunObserver(ctx, t.PipelineRunFinished)
+
+		engine := acemq.OnSettled(ctx, func(s acemq.Settlement) {
+			t.settled(ctx, span, s)
+		})
+		if !engine {
 			defer span.End()
 		}
 
-		// A handler that panics is a handler that failed, and the span has to
-		// say so before the panic carries on to whoever handles it.
+		// A handler that panics is recorded as an exception here and settled by
+		// the engine as a rejection, so the outcome stays the engine's word and
+		// the span is still an error. Ending it here instead would close it
+		// before the settlement arrived, and would leave the span saying failed
+		// where the counter said rejected. With no engine there is nothing to
+		// wait for and failed is all there is to say.
 		defer func() {
 			if r := recover(); r != nil {
-				span.Outcome(OutcomeFailed)
+				if !engine {
+					span.Outcome(OutcomeFailed)
+				}
 				span.Failed(fmt.Errorf("acemq: the handler panicked: %v", r))
-				span.End()
 				panic(r)
 			}
 		}()
 
 		ack := next(ctx, m)
-		// Ack keeps its decision unexported — returning a value rather than
-		// calling a method is what stops a handler forgetting to decide — so
-		// String is what there is to read it by.
-		asked = ack.String()
-		switch asked {
-		case "retry":
-			// Not an error. The message will be tried again, and very often
-			// succeeds; the reason is still worth carrying, as an exception
-			// event without an error status.
-			span.Outcome(OutcomeRetried).Note(ack.Err())
-		case "reject":
-			span.Outcome(OutcomeRejected).Note(ack.Err())
-		default:
-			span.Outcome(OutcomeAcked)
+
+		// What the handler asked for, on a span that has to be finished here
+		// because nothing else will. Under an engine the settlement below
+		// replaces all of this with what actually happened; Ack keeps its
+		// decision unexported — returning a value rather than calling a method
+		// is what stops a handler forgetting to decide — so String is what there
+		// is to read it by.
+		if !engine {
+			switch ack.String() {
+			case "retry":
+				// Not an error. The message will be tried again, and very often
+				// succeeds; the reason is still worth carrying, as an exception
+				// event without an error status.
+				span.Outcome(OutcomeRetried).Note(ack.Err())
+			case "reject":
+				span.Outcome(OutcomeRejected).Note(ack.Err())
+			default:
+				span.Outcome(OutcomeAcked)
+			}
+			return ack
 		}
+		span.Note(ack.Err())
 		return ack
 	}
 }
 
 // settled writes what the engine did onto the handler's span and ends it.
 //
-// asked is what the handler wanted, and it decides whether the outcome the
-// handler set is overwritten. A handler that rejected a message on purpose keeps
-// rejected even though the engine dead-letters it: that is the handler's
-// decision arriving where it was meant to, and marking it as an error is how a
-// trace view fills with red and stops meaning anything. A handler that asked for
-// a retry and got a dead letter is the opposite case — what it asked for did not
-// happen, and the span has to say what did.
-func (t *Tracing) settled(ctx context.Context, span *Span, asked string, s acemq.Settlement) {
+// The outcome comes off the settlement rather than being worked out again from
+// the handler's Ack. Working it out twice is how the two came apart: a message
+// that used its last attempt asked to be retried and was dead-lettered, and a
+// span that reported the request said retried for a message nobody would ever
+// try again. A rejection still reads rejected rather than dead_lettered — both
+// end in the dead-letter queue, and the engine keeps them apart on the
+// settlement so that this adapter does not have to.
+func (t *Tracing) settled(ctx context.Context, span *Span, s acemq.Settlement) {
 	switch s.Action {
 	case acemq.SettledRetried:
 		t.MessageRetried(ctx, s.Queue, s.Envelope, s.Delay)
 
 	case acemq.SettledDeadLettered, acemq.SettledParked:
 		t.MessageDeadLettered(ctx, s.Queue, s.Envelope, s.Reason)
-		if asked != "reject" {
-			span.Outcome(OutcomeDeadLettered)
-		}
 	}
+	span.Outcome(s.Outcome)
 	span.End()
 }
 

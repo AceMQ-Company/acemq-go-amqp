@@ -70,8 +70,11 @@ func (Codec) CanDecode(contentType string) bool {
 	}
 	lower := strings.ToLower(contentType)
 	return strings.HasPrefix(lower, ContentType) ||
-		// Both were in use long before application/yaml was registered.
+		// All three were in use long before application/yaml was registered,
+		// and the Java, Python and Ruby libraries read all three. A message a
+		// Ruby publisher sent as text/x-yaml has to be readable here.
 		strings.HasPrefix(lower, "application/x-yaml") ||
+		strings.HasPrefix(lower, "text/x-yaml") ||
 		strings.HasPrefix(lower, "text/yaml") ||
 		strings.Contains(lower, "+yaml")
 }

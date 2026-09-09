@@ -22,6 +22,95 @@ import (
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
 )
 
+// The outcomes of a pipeline run, which are the words every AceMQ library
+// writes on a pipeline.run_finished event.
+const (
+	// OutcomeCompleted is a message that went through the last step of its
+	// route.
+	OutcomeCompleted = "completed"
+
+	// OutcomeEndedEarly is a message a step stopped before the end of the
+	// route. A decision, not a failure — and worth telling from a completed run
+	// because "how many were filtered out" is otherwise a question only a log
+	// can answer.
+	OutcomeEndedEarly = "ended_early"
+)
+
+// RunObserver is told when a message leaves a pipeline, whether it went through
+// the last step or was stopped before it.
+//
+// age is how long the message had existed, taken from the envelope, so it is
+// the whole run rather than this step: the envelope was created when the message
+// entered the pipeline and carried through every hop.
+//
+// The tracing adapter's Tracing.PipelineRunFinished has exactly this shape, and
+// [Tracing.Handle] installs it on the context it gives the handler. That is what
+// makes the event land somewhere: a pipeline step runs inside the delivery's own
+// span, so there is something open to write the event onto — which is not true
+// of the outbox relay, and is why the relay reports through counters instead.
+type RunObserver func(ctx context.Context, pipeline, step, outcome string, age time.Duration)
+
+type runObserverKey struct{}
+
+// WithRunObserver returns a context that reports pipeline runs to f.
+//
+// Called by the tracing adapter around a handler. An application that traces
+// nothing never calls it, and [Then] and [FollowSlip] then find nothing to
+// report to and do not build the arguments for it.
+func WithRunObserver(ctx context.Context, f RunObserver) context.Context {
+	if f == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, runObserverKey{}, f)
+}
+
+// pipelineID is what a step calls itself on the event.
+//
+// Both names are needed and neither can be worked out: Go has no Pipeline type
+// that owns its steps the way the Java library does, so a step that wants to be
+// reported has to say which pipeline it belongs to. Unnamed means unreported,
+// rather than an event tagged with two empty strings.
+type pipelineID struct{ pipeline, step string }
+
+// PipelineOption names the pipeline a [Then] or [FollowSlip] step belongs to.
+type PipelineOption func(*pipelineID)
+
+// InPipeline names the pipeline, which is what turns the run reporting on.
+//
+//	handler := patterns.Then(shipments, pick,
+//		patterns.InPipeline("fulfilment"), patterns.AtStep("pick"))
+func InPipeline(name string) PipelineOption {
+	return func(id *pipelineID) { id.pipeline = name }
+}
+
+// AtStep names this step within the pipeline.
+//
+// [FollowSlip] defaults to the name the routing slip gives the step it has just
+// done, so it usually needs only [InPipeline].
+func AtStep(name string) PipelineOption {
+	return func(id *pipelineID) { id.step = name }
+}
+
+func pipelineIDFrom(opts []PipelineOption) pipelineID {
+	var id pipelineID
+	for _, opt := range opts {
+		opt(&id)
+	}
+	return id
+}
+
+// reportRun tells the observer, when there is one and the step is named.
+func (id pipelineID) reportRun(ctx context.Context, outcome string, age time.Duration) {
+	if id.pipeline == "" {
+		return
+	}
+	observer, _ := ctx.Value(runObserverKey{}).(RunObserver)
+	if observer == nil {
+		return
+	}
+	observer(ctx, id.pipeline, id.step, outcome, age)
+}
+
 // Middleware wraps a handler.
 //
 // The order matters and reads outside-in: the first middleware given is the
@@ -154,10 +243,17 @@ func WithOrdering[T any](key PartitionKey[T]) Middleware[T] {
 // The message is accepted only once the next one is published. If publishing
 // fails the input is retried, so the work runs again — which is why a step that
 // changes anything should be idempotent.
+//
+// Name the step with [InPipeline] and [AtStep] and a run stopped here is
+// reported as ended_early. This is the only place that outcome can be seen: a
+// step that publishes onwards does not know whether the message it sent was the
+// last of the route, so completed is reported by [FollowSlip], which does.
 func Then[In, Out any](
 	publisher *acemq.Publisher[Out],
 	step func(context.Context, acemq.Message[In]) (Out, bool, error),
+	opts ...PipelineOption,
 ) acemq.Handler[In] {
+	id := pipelineIDFrom(opts)
 	return func(ctx context.Context, m acemq.Message[In]) acemq.Ack {
 		out, publish, err := step(ctx, m)
 		if err != nil {
@@ -167,6 +263,7 @@ func Then[In, Out any](
 			return acemq.Retry(err)
 		}
 		if !publish {
+			id.reportRun(ctx, OutcomeEndedEarly, m.Envelope.Age())
 			return acemq.Accept()
 		}
 

@@ -935,3 +935,253 @@ func TestARejectedMessageKeepsItsOwnOutcome(t *testing.T) {
 			tracing.EventMessageDeadLettered)
 	}
 }
+
+// TestTheCounterAndTheSpanAgreeOnEveryOutcome is the property the whole
+// settlement seam exists for.
+//
+// A counter and a trace are read by the same person minutes apart, and a
+// dashboard that says a thousand dead letters next to a trace search that finds
+// none is worse than either number alone. So this asserts the agreement
+// directly: for every delivery, the outcome tag on acemq.messages.consumed and
+// the messaging.acemq.outcome attribute on that delivery's span are the same
+// word. It covers all four outcomes a handler can produce, including the one
+// that used to disagree — a handler that asked for a retry it could not have.
+//
+// Both sides come from acemq.Settlement.Outcome, which is what makes the
+// agreement structural rather than two derivations that happen to match today.
+func TestTheCounterAndTheSpanAgreeOnEveryOutcome(t *testing.T) {
+	ctx := context.Background()
+	r := record(t)
+	metrics := acemq.NewMetrics()
+	mq := brokerFor(t,
+		acemq.WithObserver(metrics),
+		acemq.WithPublishInterceptor(r.tracing.PublishInterceptor()),
+		// One attempt, so a handler asking for a retry is dead-lettered on the
+		// spot and the retried case has to come from somewhere else.
+		acemq.WithRetry(acemq.FixedRetry(1, 0)))
+
+	// One queue, four messages, one outcome each.
+	//
+	//	accept  -> acked
+	//	reject  -> rejected
+	//	give-up -> dead_lettered, having asked to be retried
+	//	slow    -> retried on its first delivery, accepted on its second
+	seen := make(chan string, 20)
+	handle := func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+		seen <- m.Payload.OrderID
+		switch m.Payload.OrderID {
+		case "accept":
+			return acemq.Accept()
+		case "reject":
+			return acemq.Reject(errors.New("no such customer"))
+		default:
+			return acemq.Retry(errors.New("the pricing service is down"))
+		}
+	}
+	sub, err := acemq.Consume(ctx, mq, "orders", tracing.Handle(r.tracing, "orders", handle))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	orders := tracing.NewPublisher[OrderPlaced](r.tracing, mq, "", "orders")
+	for _, id := range []string{"accept", "reject", "give-up"} {
+		if err := orders.Send(ctx, OrderPlaced{OrderID: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 3 {
+		select {
+		case <-seen:
+		case <-time.After(3 * time.Second):
+			t.Fatal("the messages did not all arrive")
+		}
+	}
+	// Three publishes and three deliveries.
+	waitForSpans(t, r, 6)
+	sub.Close()
+
+	// Every process span exported, counted by the word it carries.
+	spanOutcomes := map[string]int64{}
+	for _, span := range r.spans() {
+		if span.Name != "orders process" {
+			continue
+		}
+		spanOutcomes[attr(t, span, tracing.AttrOutcome).AsString()]++
+	}
+
+	counterOutcomes := map[string]int64{}
+	for key, value := range metrics.Counts() {
+		outcome, ok := consumedOutcome(key)
+		if !ok {
+			continue
+		}
+		counterOutcomes[outcome] += value
+	}
+
+	want := map[string]int64{
+		tracing.OutcomeAcked:        1,
+		tracing.OutcomeRejected:     1,
+		tracing.OutcomeDeadLettered: 1,
+	}
+	for outcome, count := range want {
+		if spanOutcomes[outcome] != count {
+			t.Errorf("%d spans say %s, want %d", spanOutcomes[outcome], outcome, count)
+		}
+	}
+	if len(spanOutcomes) != len(counterOutcomes) {
+		t.Errorf("the spans use %v and the counters use %v", spanOutcomes, counterOutcomes)
+	}
+	for outcome, spanCount := range spanOutcomes {
+		if counterCount := counterOutcomes[outcome]; counterCount != spanCount {
+			t.Errorf("%d spans say %s but the counter says %d: "+
+				"a dashboard and a trace search disagree about the same deliveries",
+				spanCount, outcome, counterCount)
+		}
+	}
+}
+
+// TestAFinishedPipelineRunWritesItsEventWithoutBeingAsked is the second seam:
+// pipeline.run_finished used to be a method nothing in the library called, so
+// the event never appeared in a trace unless an application wrote it by hand.
+//
+// A pipeline step runs inside the delivery's span, which is what makes this one
+// closable where the outbox relay's is not — the relay sweeps on a goroutine
+// with nothing open to write onto.
+func TestAFinishedPipelineRunWritesItsEventWithoutBeingAsked(t *testing.T) {
+	ctx := context.Background()
+	r := record(t)
+	mq := brokerFor(t, acemq.WithPublishInterceptor(r.tracing.PublishInterceptor()))
+
+	done := make(chan struct{}, 1)
+	step := func(_ context.Context, m acemq.Message[OrderPlaced]) (OrderPlaced, error) {
+		defer func() { done <- struct{}{} }()
+		return m.Payload, nil
+	}
+	sub, err := acemq.Consume(ctx, mq, "orders", tracing.Handle(r.tracing, "orders",
+		patterns.FollowSlip(mq, step, patterns.InPipeline("fulfilment"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	slip := patterns.NewRoutingSlip().Then("", "orders", "charge")
+	if err := patterns.Start(ctx, mq, slip, OrderPlaced{OrderID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the step never ran")
+	}
+	waitForSpans(t, r, 1)
+
+	processed := r.named(t, "orders process")
+	finished := eventNamed(t, processed, tracing.EventPipelineRunFinished)
+	if got := eventAttr(t, finished, tracing.AttrPipeline).AsString(); got != "fulfilment" {
+		t.Errorf("%s = %q, want fulfilment", tracing.AttrPipeline, got)
+	}
+	if got := eventAttr(t, finished, tracing.AttrStep).AsString(); got != "charge" {
+		t.Errorf("%s = %q, want the name off the slip", tracing.AttrStep, got)
+	}
+	if got := eventAttr(t, finished, tracing.AttrEventOutcome).AsString(); got != tracing.OutcomeCompleted {
+		t.Errorf("%s = %q, want %q", tracing.AttrEventOutcome, got, tracing.OutcomeCompleted)
+	}
+}
+
+// A step that decides this message does not continue is the other outcome, and
+// the only place it can be seen: a step that publishes onwards cannot know
+// whether what it sent was the last of the route.
+func TestAPipelineStepThatStopsSaysEndedEarly(t *testing.T) {
+	ctx := context.Background()
+	r := record(t)
+	mq := brokerFor(t, acemq.WithPublishInterceptor(r.tracing.PublishInterceptor()))
+
+	done := make(chan struct{}, 1)
+	step := func(_ context.Context, m acemq.Message[OrderPlaced]) (OrderPlaced, bool, error) {
+		defer func() { done <- struct{}{} }()
+		return OrderPlaced{}, false, nil
+	}
+	shipments := acemq.NewPublisher[OrderPlaced](mq, "", "orders")
+	sub, err := acemq.Consume(ctx, mq, "orders", tracing.Handle(r.tracing, "orders",
+		patterns.Then(shipments, step,
+			patterns.InPipeline("fulfilment"), patterns.AtStep("pick"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	orders := tracing.NewPublisher[OrderPlaced](r.tracing, mq, "", "orders")
+	if err := orders.Send(ctx, OrderPlaced{OrderID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the step never ran")
+	}
+	waitForSpans(t, r, 2)
+
+	finished := eventNamed(t, r.named(t, "orders process"), tracing.EventPipelineRunFinished)
+	if got := eventAttr(t, finished, tracing.AttrEventOutcome).AsString(); got != tracing.OutcomeEndedEarly {
+		t.Errorf("%s = %q, want %q", tracing.AttrEventOutcome, got, tracing.OutcomeEndedEarly)
+	}
+	if got := eventAttr(t, finished, tracing.AttrStep).AsString(); got != "pick" {
+		t.Errorf("%s = %q, want pick", tracing.AttrStep, got)
+	}
+}
+
+// An unnamed step reports nothing rather than an event tagged with two empty
+// strings. Go has no Pipeline type that owns its steps, so a step that wants to
+// be reported has to say which pipeline it is in.
+func TestAnUnnamedPipelineStepWritesNoEvent(t *testing.T) {
+	ctx := context.Background()
+	r := record(t)
+	mq := brokerFor(t, acemq.WithPublishInterceptor(r.tracing.PublishInterceptor()))
+
+	done := make(chan struct{}, 1)
+	step := func(_ context.Context, m acemq.Message[OrderPlaced]) (OrderPlaced, error) {
+		defer func() { done <- struct{}{} }()
+		return m.Payload, nil
+	}
+	sub, err := acemq.Consume(ctx, mq, "orders", tracing.Handle(r.tracing, "orders",
+		patterns.FollowSlip(mq, step)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	slip := patterns.NewRoutingSlip().Then("", "orders", "charge")
+	if err := patterns.Start(ctx, mq, slip, OrderPlaced{OrderID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the step never ran")
+	}
+	waitForSpans(t, r, 1)
+
+	if hasEvent(r.named(t, "orders process"), tracing.EventPipelineRunFinished) {
+		t.Errorf("an unnamed step wrote a %s event", tracing.EventPipelineRunFinished)
+	}
+}
+
+// consumedOutcome reads the outcome tag back out of a acemq.Metrics key, which
+// is the metric name followed by its labels in sorted order.
+func consumedOutcome(key string) (string, bool) {
+	const marker = "{outcome="
+	if !strings.HasPrefix(key, "acemq.messages.consumed{") {
+		return "", false
+	}
+	at := strings.Index(key, marker)
+	if at < 0 {
+		return "", false
+	}
+	rest := key[at+len(marker):]
+	end := strings.Index(rest, "}")
+	if end < 0 {
+		return "", false
+	}
+	return rest[:end], true
+}

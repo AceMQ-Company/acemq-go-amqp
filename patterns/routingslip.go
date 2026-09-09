@@ -194,9 +194,15 @@ func Start[T any](
 // The message is accepted only once the next one is out, so a failure to
 // publish retries the step — which is why a step that changes anything should
 // be idempotent.
+//
+// Name the pipeline with [InPipeline] and the end of the itinerary is reported
+// as a completed run. The step's own name comes off the slip, so [AtStep] is
+// only needed to override it.
 func FollowSlip[T any](
 	conn *acemq.Conn, step func(context.Context, acemq.Message[T]) (T, error),
+	opts ...PipelineOption,
 ) acemq.Handler[T] {
+	id := pipelineIDFrom(opts)
 	return func(ctx context.Context, m acemq.Message[T]) acemq.Ack {
 		slip, present, err := SlipFrom(m.Envelope)
 		if err != nil {
@@ -216,11 +222,20 @@ func FollowSlip[T any](
 			return acemq.Retry(err)
 		}
 
+		// The step just finished, named before the slip advances past it.
+		done := id
+		if done.step == "" && len(slip.Steps) > 0 {
+			done.step = slip.Steps[0].String()
+		}
+
 		advanced := slip.Advance()
 		next, more := advanced.Next()
 		if !more {
 			// The end of the itinerary. Nothing to publish, and the work is
-			// done.
+			// done. The age is the envelope's, so what is reported is the whole
+			// run rather than this step: the envelope was made when the message
+			// entered the pipeline and has carried through every hop.
+			done.reportRun(ctx, OutcomeCompleted, m.Envelope.Age())
 			return acemq.Accept()
 		}
 

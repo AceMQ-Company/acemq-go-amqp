@@ -21,9 +21,11 @@ import (
 
 // SettlementAction is what the engine did with a delivery.
 //
-// The values are the outcome names the tracing adapters and the metric tags in
-// every AceMQ library already use, so a reader does not have to learn two
-// vocabularies for the same four things.
+// Four values for four physical fates: acknowledged, put back for another
+// attempt, moved to the dead-letter queue, moved to the parked queue. What a
+// counter or a span calls that is [Settlement.Outcome], which is not quite the
+// same thing — a message the handler rejected and one that ran out of attempts
+// both end up dead-lettered, and only the outcome keeps them apart.
 type SettlementAction string
 
 const (
@@ -61,6 +63,17 @@ type Settlement struct {
 
 	// Action is what happened to it.
 	Action SettlementAction
+
+	// Outcome is the word for it, from the vocabulary every AceMQ library
+	// shares: [OutcomeAcked], [OutcomeRetried], [OutcomeRejected],
+	// [OutcomeDeadLettered] or [OutcomeParked].
+	//
+	// The engine writes it here and tags [MetricConsumed] with the same string,
+	// so an adapter that puts it on the span cannot disagree with the counter
+	// for the same delivery. It is finer-grained than [Settlement.Action] in one
+	// place: a message the handler rejected by name is dead-lettered like an
+	// exhausted one, and this is what tells them apart.
+	Outcome string
 
 	// Envelope is the message. For [SettledRetried] it is the envelope as it
 	// goes back on the queue, with the attempt already advanced, which is the
