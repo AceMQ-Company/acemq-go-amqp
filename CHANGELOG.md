@@ -101,23 +101,82 @@ While the version is `0.x` the public API may change in any release.
   deployment can apply it up front or compare it with another AceMQ library's by
   eye.
 
+### Changed
+
+- **Breaking change to the wire format: `crypto` now writes the framing Java,
+  Python and Ruby write.** A body encrypted by this library up to v0.3.0 is not
+  the shape any of the others read, and a body encrypted by any of them was
+  refused here. That is fixed by changing what Go writes, because Go was the
+  outlier:
+
+  ```
+  0xAE   0x01   len   key id   12-byte nonce   ciphertext + 16-byte tag
+  ```
+
+  Magic byte, version, a **one-byte** key id length — previously two, big-endian,
+  with no magic byte at all. The header is still authenticated as associated data
+  and the cipher is still AES-GCM with a 128-bit tag, so only the bytes in front
+  of the nonce moved.
+
+  The magic byte is the point of the exercise. The old framing began `0x01`,
+  which is a plausible first byte of a protobuf or an Avro body, so a consumer
+  configured to decrypt and pointed at a plaintext queue could not tell it had
+  been: it reported a decryption failure for a message that was never encrypted.
+  `0xAE` is not a plausible first byte of anything else this library writes, so
+  that message is now refused as what it is.
+
+  The test suite pins the vector the other libraries pin — key `00 01 … 1f`,
+  key id `2026-01`, nonce `00 01 … 0b`, plaintext `hello` — and this library
+  produces it byte for byte. It was checked against the compiled Java
+  `EncryptedCodec` and against Ruby's implementation, in both directions.
+
+  **What to do.** Upgrade consumers before producers, as with any format change:
+  a consumer on this version reads both framings, a consumer on v0.3.0 reads
+  neither this one's nor Java's. Then drain or re-encrypt anything still holding
+  the old framing before v0.5.0 removes the ability to read it.
+
+- **A `crypto` key may be 16, 24 or 32 bytes.** It had to be exactly 32. Java,
+  Python and Ruby all take the three lengths AES takes, and refusing the other
+  two meant a key that already worked in Java had to be re-issued to be used
+  here. `crypto.NewKey` still draws 32, and `crypto.KeySize` is still 32 — it now
+  documents what `NewKey` produces rather than the only length accepted. A key of
+  any other length is still refused rather than padded or hashed into shape.
+
+- **A `crypto` key id is at most 255 UTF-8 bytes**, refused by `Keyring.Add`
+  rather than truncated by the single length byte into the name of a key nobody
+  holds.
+
+### Deprecated
+
+- **Reading the legacy Go encryption framing, which goes away in v0.5.0.**
+  v0.3.0 is released, so queues can be holding bodies framed as version, two-byte
+  big-endian key id length, key id, nonce, ciphertext. `crypto.Codec.Decode` and
+  `crypto.KeyIDOf` still read them: a body beginning `0xAE` is the current
+  framing, a body beginning `0x01` is the legacy one, and anything else is
+  refused as before. The two are unambiguously distinguishable, which is what
+  makes reading both safe.
+
+  **Nothing writes the legacy framing, and nothing can be made to.** There is no
+  option, no constructor and no environment variable for it, because two writers
+  is how a divergence survives being fixed. It is a migration affordance with an
+  end date: drain those queues or re-encrypt their contents before v0.5.0, after
+  which those bodies are refused rather than misread.
+
 ### Fixed
 
 - **`crypto.ContentType` no longer claims an interoperability that does not
   exist.** Its documentation said the content type was "what Java and .NET
-  write", which is true of the string and of nothing after it. This package
-  frames a message as version, key id length (two bytes), key id, nonce,
-  ciphertext; Java, Python and Ruby put a `0xAE` magic byte first and use a
-  one-byte key id length; .NET does not use AES-GCM at all, but AES-256-CBC with
-  a separate HMAC-SHA-256. All four write
-  `application/vnd.acemq.encrypted` and mean four different things by it.
+  write", which is true of the string and of nothing after it. All five libraries
+  write `application/vnd.acemq.encrypted`, and until this release four of them
+  meant three different things by it.
 
-  Nothing on the wire changed — a framing change is not backwards compatible with
-  itself, and would strand everything already encrypted — only the comment, which
-  now says plainly that an encrypted body is not portable between the libraries.
-  The security guide said the library did not encrypt bodies at all, which has
-  been untrue since `crypto` landed; it now describes what is really there,
-  including the incompatibility.
+  The comment was corrected first and the framing second — see the breaking
+  change above, which is what actually closes the gap for Java, Python and Ruby.
+  .NET remains genuinely incompatible: it does not use AES-GCM at all, but
+  AES-256-CBC with a separate HMAC-SHA-256, and the documentation now says so
+  rather than implying the whole family diverges. The security guide said the
+  library did not encrypt bodies at all, which had been untrue since `crypto`
+  landed; it now describes what is really there.
 
 ## [0.3.0] - 2026-09-08
 

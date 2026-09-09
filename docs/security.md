@@ -198,21 +198,49 @@ error from a failed login.
 - The broker account has the narrowest permissions that do the job. This library
   does not manage broker users; that is the broker's own configuration.
 - Message bodies travel in the clear unless you wrap the codec in `crypto.Wrap`.
-  If the payload needs protecting at rest inside the broker, wrap it — and read
-  the next paragraph before assuming another language can open the result.
+  If the payload needs protecting at rest inside the broker, wrap it.
 
-## Encrypted bodies are not portable between the libraries
+## Encrypted bodies are portable, except .NET's
 
 `crypto` and the Java, .NET, Python and Ruby equivalents all write
-`application/vnd.acemq.encrypted`, and that string is all they share. This
-package frames a message as version, key id length, key id, nonce, ciphertext;
-Java, Python and Ruby put a `0xAE` magic byte first and use a one-byte key id
-length; .NET does not use AES-GCM at all, but AES-256-CBC with a separate
-HMAC-SHA-256. A body encrypted by one of them will not open in another.
+`application/vnd.acemq.encrypted`. This package frames a message the way Java,
+Python and Ruby do, byte for byte:
 
-Encrypt on one side of a queue that the other side of it also decrypts, in the
-same language, and the arrangement holds. Do not plan on a Java producer and a
-Go consumer sharing a key.
+```
+0xAE   0x01   len   key id   12-byte nonce   ciphertext + 16-byte tag
+```
+
+Magic byte, version, a one-byte key id length, the key id in UTF-8, the nonce,
+and AES-GCM's ciphertext with its 128-bit tag. The header is authenticated as
+associated data but not encrypted, so an altered key id makes the message fail
+to open rather than quietly opening as something else, and `crypto.KeyIDOf`
+reads it back without needing any key. A Java producer and a Go consumer can
+share a key, and the test suites of all four libraries pin the same vector.
+
+An AES key here is 16, 24 or 32 bytes, the same three lengths the other
+libraries accept, so a key that already works in Java works here unchanged.
+`crypto.NewKey` draws 32.
+
+**.NET is still the exception.** It does not use AES-GCM at all, but AES-256-CBC
+with a separate HMAC-SHA-256, and neither library can read the other's bodies.
+Do not plan on a .NET producer and a Go consumer sharing a key.
+
+### Reading what v0.3.0 wrote
+
+Up to v0.3.0 this library framed a message as version, a two-byte big-endian key
+id length, key id, nonce, ciphertext — no magic byte, and no other AceMQ library
+could read it. Bodies in that framing can be sitting in a queue, so `Decode`
+still reads them: a body beginning `0xAE` is the current framing, a body
+beginning `0x01` is the legacy one, and anything else is refused as it was
+before. The two cannot be confused.
+
+**Nothing writes the legacy framing.** It is read and never produced, because
+two writers is how a divergence survives being fixed.
+
+**This is deprecated and goes away in v0.5.0.** Drain the queues holding those
+bodies, or re-encrypt them, before upgrading past it. After that they are
+refused rather than misread — which is the safe direction, but it is still a
+message nobody can open.
 
 ## What this library does not do
 
