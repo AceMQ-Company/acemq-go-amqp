@@ -70,7 +70,13 @@ func WithRunObserver(ctx context.Context, f RunObserver) context.Context {
 // that owns its steps the way the Java library does, so a step that wants to be
 // reported has to say which pipeline it belongs to. Unnamed means unreported,
 // rather than an event tagged with two empty strings.
-type pipelineID struct{ pipeline, step string }
+type pipelineID struct {
+	pipeline, step string
+
+	// route resolves a declared route's step names into somewhere to publish.
+	// Only [FollowSlip] uses it, and only for a slip in [FormSteps].
+	route *Route
+}
 
 // PipelineOption names the pipeline a [Then] or [FollowSlip] step belongs to.
 type PipelineOption func(*pipelineID)
@@ -89,6 +95,32 @@ func InPipeline(name string) PipelineOption {
 // done, so it usually needs only [InPipeline].
 func AtStep(name string) PipelineOption {
 	return func(id *pipelineID) { id.step = name }
+}
+
+// AlongRoute tells a [FollowSlip] step which declared pipeline the step names on
+// a Java-shaped routing slip belong to.
+//
+//	route := patterns.NewRoute("orders", "validate", "charge", "ship")
+//
+//	sub, err := acemq.Consume(ctx, mq, route.QueueFor("charge"),
+//		patterns.FollowSlip(mq, charge, patterns.AlongRoute(route)))
+//
+// A slip in [FormSteps] carries names and no destinations, so without this a
+// step name cannot be turned into an exchange and a routing key. [FollowSlip]
+// refuses such a message rather than publishing it somewhere nobody named.
+//
+// Unnecessary for the JSON slip this library writes by default, which carries
+// every step's exchange and routing key on the message.
+//
+// It also names the pipeline for run reporting, so [InPipeline] is only needed
+// to call the pipeline something other than the route's own name.
+func AlongRoute(route *Route) PipelineOption {
+	return func(id *pipelineID) {
+		id.route = route
+		if id.pipeline == "" && route != nil {
+			id.pipeline = route.Name()
+		}
+	}
 }
 
 func pipelineIDFrom(opts []PipelineOption) pipelineID {

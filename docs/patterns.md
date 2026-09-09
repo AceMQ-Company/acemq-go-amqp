@@ -321,6 +321,72 @@ that is wrong is discovered one hop at a time. Worth it when the steps vary per
 message; not worth it when every message goes the same way, where a fixed chain
 of consumers is simpler to follow.
 
+### Two forms on the wire, and both are read
+
+The family writes a slip in two shapes. **Go reads either and writes the JSON one
+unless asked otherwise.**
+
+| | `acemq-routing-slip` | `x-acemq-route` + `-position` + `-id` |
+|---|---|---|
+| Shape | JSON: every step's exchange and routing key | the step names, comma joined, and a position |
+| Written by | Go, Python, Ruby | Java |
+| `patterns.SlipForm` | `FormJSON` (the default) | `FormSteps` |
+| Needs a declaration | no | yes — a `patterns.Route` |
+| Route varies per message | yes | no |
+
+The JSON slip is self-describing: a message carries its whole itinerary, so any
+consumer can send it onwards with nothing declared anywhere, an operator reading
+a dead-letter queue can see where it was going, and the route can differ per
+message — which is the reason to use a slip rather than a fixed chain at all.
+
+The declared form is smaller and stays readable in a management console —
+`validate,charge,ship` at position `1` says where a message is without anybody
+decoding anything — at the cost of meaning nothing without the declaration.
+
+**A slip keeps the form it arrived in.** A Go step in a Java-declared pipeline
+answers in the shape the next Java step is looking for, without being told to.
+
+### Being one step of a Java pipeline
+
+Java's `Pipeline` names its steps and resolves them against a declaration: the
+pipeline's name is the exchange, a step's name is the routing key, and the queue
+behind a step is `{pipeline}.{step}`. Declare the same route in Go and a Go
+consumer is one of its steps:
+
+```go
+route := patterns.NewRoute("orders", "validate", "charge", "ship")
+
+sub, err := acemq.Consume(ctx, mq, route.QueueFor("charge"),
+	patterns.FollowSlip(mq, func(ctx context.Context, m acemq.Message[Order]) (Order, error) {
+		return charge(ctx, m.Payload)
+	}, patterns.AlongRoute(route)))
+```
+
+The Go step publishes to the `orders` exchange keyed on the next step's name with
+the position advanced and the run identifier carried through — exactly what the
+Java step after it is waiting for.
+
+`patterns.AlongRoute` also names the pipeline for run reporting, so
+`patterns.InPipeline` is only needed to call it something other than the route's
+own name.
+
+> **Without `AlongRoute`, a declared route is refused rather than followed.** The
+> names carry no destinations, so publishing with an empty exchange would send the
+> message to a queue named for the step instead of to the pipeline's — quietly,
+> and to the wrong place. The rejection is fatal, because a missing declaration
+> will still be missing on the fourth attempt, and it names `AlongRoute` in the
+> error.
+
+To start a run that Java steps will follow, use the route:
+
+```go
+slip := route.Start()                  // at validate, with a fresh run id
+err := patterns.Start(ctx, mq, slip, order)
+```
+
+`slip.AsSteps(route)` converts a hand-built slip to the declared form, and
+`slip.AsJSON()` converts one back — neither is a one-way door.
+
 ## Sagas
 
 Work that spans services, where a database transaction is not available and the

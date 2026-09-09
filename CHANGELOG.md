@@ -10,6 +10,58 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **A routing slip can be read and written in either of the family's two forms,
+  so a Go step can be one step of a Java-declared pipeline.**
+
+  Java writes `x-acemq-route` — the step names comma-joined — with
+  `x-acemq-route-position` and `x-acemq-route-id`, resolved against a `Pipeline`
+  declared in code. This library, Python and Ruby write `acemq-routing-slip`, a
+  JSON document holding every step's exchange and routing key. Neither could read
+  the other, so a Go consumer could not take part in a Java pipeline at all.
+
+  **Go now reads both and still writes JSON by default.** Three of the five
+  libraries write the JSON slip and it is the self-describing one — a message
+  carries its whole itinerary, so any consumer can send it onwards with nothing
+  declared, and the route can differ per message. The declared form is smaller
+  and stays readable in a management console, at the cost of meaning nothing
+  without the declaration.
+
+  A slip keeps the form it arrived in, so a Go step in a Java pipeline answers in
+  the shape the next Java step expects without being told to.
+
+  ```go
+  route := patterns.NewRoute("orders", "validate", "charge", "ship")
+
+  sub, err := acemq.Consume(ctx, mq, route.QueueFor("charge"),
+      patterns.FollowSlip(mq, charge, patterns.AlongRoute(route)))
+  ```
+
+  `patterns.Route` mirrors Java's `Pipeline` topology — the name is the exchange,
+  a step name is the routing key, the queue is `{route}.{step}` — and
+  `patterns.AlongRoute` is what turns a step name back into somewhere to publish.
+  Without it a declared route is **rejected fatally** rather than followed: the
+  names carry no destinations, and publishing with an empty exchange would send
+  the message to a queue named for the step instead of to the pipeline's, quietly
+  and to the wrong place. The error names `AlongRoute`.
+
+  `Route.Start` begins a run Java steps will follow, `slip.AsSteps(route)` and
+  `slip.AsJSON()` convert between the forms, and `slip.Form()` and `slip.RunID()`
+  say what a slip is.
+
+  The three route headers are materialised onto `acemq.Envelope` as `Route`,
+  `RoutePosition` and `RouteID`, with `Envelope.RouteSteps()` and the
+  `acemq.Route(steps, position, runID)` option. **That was the part that had to
+  change for any of this to work:** `x-acemq-` is a reserved prefix and the
+  engine drops any header in it that this version does not know, so a
+  Java-declared route reaching a Go consumer arrived on the wire and vanished
+  before the handler saw it. Looking for it in `Envelope.Headers` would have found
+  nothing for ever.
+
+  `patterns.SlipFrom` takes an optional `*Route` and is otherwise unchanged. The
+  JSON on the wire is byte-identical to what earlier versions wrote — the new
+  fields on `RoutingSlip` are unexported, so `encoding/json` ignores them. See
+  [docs/patterns.md](docs/patterns.md#two-forms-on-the-wire-and-both-are-read).
+
 - **A handler can park a message.** `acemq.Park(err)` joins `Accept`, `Retry` and
   `Reject` in the vocabulary a handler returns. The engine could already park —
   it does so for a body no codec would decode — but a handler could not ask for

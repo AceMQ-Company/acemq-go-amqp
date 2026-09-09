@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
 	"github.com/AceMQ-Company/acemq-go-amqp/patterns"
@@ -145,6 +146,300 @@ func TestASlipThatWillNotParseIsFatal(t *testing.T) {
 	}
 	if !acemq.IsFatal(err) {
 		t.Errorf("a slip that will not parse is not fatal, so it would be retried for ever: %v", err)
+	}
+}
+
+// ---- the Java-declared form ------------------------------------------
+
+// javaRouteHeaders is what org.acemq.amqp.api.RoutingSlip.toHeaders() puts on a
+// message: the step names comma-joined, the position as an integer, the run
+// identifier as a string.
+//
+// Written out here rather than produced by this library's own Route, because
+// what is being proved is that Go reads what *Java* writes. A test that
+// round-trips Go's own output through Go's own reader proves the two halves
+// agree with each other and nothing about whether either matches the wire.
+func javaRouteHeaders(route string, position int, runID string) map[string]any {
+	return map[string]any{
+		"x-acemq-route":          route,
+		"x-acemq-route-position": position,
+		"x-acemq-route-id":       runID,
+		"x-acemq-id":             "m-java-1",
+		"x-acemq-type":           "order.placed",
+	}
+}
+
+// TestAJavaShapedRouteSurvivesTheWire is the first half of reading a Java slip,
+// and it is the half that used to fail invisibly.
+//
+// x-acemq- is a reserved prefix: the engine materialises a header it knows onto
+// the Envelope and drops every other one from the application's headers. Go knew
+// nothing of x-acemq-route, so a Java-declared route arrived on the wire and was
+// thrown away before any handler could see it. Reading it required the envelope
+// to carry it, not just the slip code to look for it.
+func TestAJavaShapedRouteSurvivesTheWire(t *testing.T) {
+	headers := javaRouteHeaders("validate,charge,ship", 1, "run-7")
+
+	env := acemq.EnvelopeFromWire(headers, "charge", "m-java-1")
+
+	if env.Route != "validate,charge,ship" {
+		t.Errorf("Route = %q, want the comma-joined step names", env.Route)
+	}
+	if env.RoutePosition != 1 {
+		t.Errorf("RoutePosition = %d, want 1", env.RoutePosition)
+	}
+	if env.RouteID != "run-7" {
+		t.Errorf("RouteID = %q, want run-7", env.RouteID)
+	}
+	if got := env.RouteSteps(); strings.Join(got, "|") != "validate|charge|ship" {
+		t.Errorf("RouteSteps = %v", got)
+	}
+	// And it stays out of the application's headers, like every reserved header.
+	if _, leaked := env.Headers["x-acemq-route"]; leaked {
+		t.Error("a reserved header reached the application's headers")
+	}
+}
+
+// TestAJavaShapedRouteIsReadAsASlip is the second half: the three headers become
+// the same RoutingSlip a JSON slip would, positioned where Java left it.
+func TestAJavaShapedRouteIsReadAsASlip(t *testing.T) {
+	route := patterns.NewRoute("orders", "validate", "charge", "ship")
+	env := acemq.EnvelopeFromWire(
+		javaRouteHeaders("validate,charge,ship", 1, "run-7"), "charge", "m-java-1")
+
+	slip, present, err := patterns.SlipFrom(env, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !present {
+		t.Fatal("a message carrying a declared route was read as having no slip")
+	}
+
+	// Position 1 means this message is for charge: validate is behind it and
+	// charge and ship are still to come.
+	if len(slip.Done) != 1 || slip.Done[0].Name != "validate" {
+		t.Errorf("Done = %v, want validate behind it", slip.Done)
+	}
+	next, ok := slip.Next()
+	if !ok || next.Name != "charge" {
+		t.Errorf("Next = %v, want charge", next)
+	}
+	// The names resolve against the declaration: the pipeline's name is the
+	// exchange and the step's name is the routing key, which is how Java's
+	// Pipeline publishes between its steps.
+	if next.Exchange != "orders" || next.RoutingKey != "charge" {
+		t.Errorf("next step is %s/%s, want orders/charge", next.Exchange, next.RoutingKey)
+	}
+	if slip.Form() != patterns.FormSteps {
+		t.Errorf("Form = %s, want steps: a slip has to remember what it arrived as",
+			slip.Form())
+	}
+	if slip.RunID() != "run-7" {
+		t.Errorf("RunID = %q, want run-7 carried through", slip.RunID())
+	}
+}
+
+// TestAGoStepFollowsAJavaDeclaredPipeline is the whole point of reading the
+// other form: a Go consumer sits in the middle of a pipeline Java declared, does
+// its step, and hands the message to the Java step after it in the shape that
+// step is waiting for.
+//
+// The message is put in at orders.charge with position 1, exactly as a Java
+// validate step would have published it. What comes out has to arrive at
+// orders.ship carrying x-acemq-route at position 2 — not a JSON slip, which the
+// Java step would not recognise at all.
+func TestAGoStepFollowsAJavaDeclaredPipeline(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+	route := patterns.NewRoute("orders", "validate", "charge", "ship")
+
+	if err := mq.DeclareExchange(ctx, route.Name(), "direct"); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range route.Steps() {
+		queue := route.QueueFor(step)
+		if err := mq.DeclareQueue(ctx, queue); err != nil {
+			t.Fatal(err)
+		}
+		if err := mq.Bind(ctx, queue, route.Name(), step); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The Go step: the charge step of a Java pipeline.
+	charged := make(chan struct{}, 1)
+	sub, err := acemq.Consume(ctx, mq, route.QueueFor("charge"),
+		patterns.FollowSlip(mq,
+			func(_ context.Context, m acemq.Message[OrderPlaced]) (OrderPlaced, error) {
+				charged <- struct{}{}
+				return m.Payload, nil
+			}, patterns.AlongRoute(route)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	// Standing in for the Java step after it, so what it receives is what a Java
+	// step would have received.
+	arrived := make(chan acemq.Envelope, 1)
+	shipped, err := acemq.Consume(ctx, mq, route.QueueFor("ship"),
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			arrived <- m.Envelope
+			return acemq.Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shipped.Close()
+
+	// Published the way Java's validate step would have: to the pipeline's
+	// exchange, keyed on the next step's name, carrying the route at position 1.
+	err = acemq.NewPublisher[OrderPlaced](mq, route.Name(), "charge").Send(ctx,
+		OrderPlaced{OrderID: "o-1"},
+		acemq.Route([]string{"validate", "charge", "ship"}, 1, "run-7"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-charged:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the Go step never received the message")
+	}
+
+	var onwards acemq.Envelope
+	select {
+	case onwards = <-arrived:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the Go step did not send the message on to the next step")
+	}
+
+	if onwards.Route != "validate,charge,ship" {
+		t.Errorf("Route = %q, want the route carried through unchanged", onwards.Route)
+	}
+	// Two, not one: charge is done. A position that did not advance would send
+	// the message round the same step for ever.
+	if onwards.RoutePosition != 2 {
+		t.Errorf("RoutePosition = %d, want 2 now that charge is done", onwards.RoutePosition)
+	}
+	// The run identifier is what ties every hop of one run together in a trace,
+	// so a step that minted a fresh one would split the run in two.
+	if onwards.RouteID != "run-7" {
+		t.Errorf("RouteID = %q, want run-7 carried through", onwards.RouteID)
+	}
+	// And in the form it arrived in. A JSON slip here would be correct Go and
+	// unreadable to the Java step that receives it.
+	if _, wrongForm := onwards.Headers[patterns.HeaderRoutingSlip]; wrongForm {
+		t.Errorf("the message went on as a JSON slip; a Java step would not follow it")
+	}
+}
+
+// TestADeclaredRouteWithNoDeclarationIsRefused is the failure that has to be
+// loud. A slip in the declared form carries names and no destinations; publishing
+// with an empty exchange would send the message to a queue named for the step
+// rather than to the pipeline's, quietly and to the wrong place.
+func TestADeclaredRouteWithNoDeclarationIsRefused(t *testing.T) {
+	handler := patterns.FollowSlip[OrderPlaced](nil,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) (OrderPlaced, error) {
+			return m.Payload, nil
+		}) // no AlongRoute
+
+	env := acemq.EnvelopeFromWire(
+		javaRouteHeaders("validate,charge,ship", 1, "run-7"), "charge", "m-java-1")
+	ack := handler(context.Background(), acemq.Message[OrderPlaced]{Envelope: env})
+
+	if ack.String() != "reject" {
+		t.Errorf("got %s, want reject", ack)
+	}
+	// Fatal, because a missing declaration will still be missing on the fourth
+	// attempt and a message carrying one has to stop rather than circle.
+	if !acemq.IsFatal(ack.Err()) {
+		t.Errorf("not fatal, so it would be retried for ever: %v", ack.Err())
+	}
+	if !strings.Contains(ack.Err().Error(), "AlongRoute") {
+		t.Errorf("the error does not say how to fix it: %v", ack.Err())
+	}
+}
+
+// TestTheJSONSlipIsStillWhatGoWrites pins the default. Three of the five
+// libraries write the JSON slip and it is the self-describing one, so gaining
+// the ability to write the other form must not have changed which one is used
+// when nobody asks.
+func TestTheJSONSlipIsStillWhatGoWrites(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	if err := mq.DeclareQueue(ctx, "validate"); err != nil {
+		t.Fatal(err)
+	}
+
+	arrived := make(chan acemq.Envelope, 1)
+	sub, err := acemq.Consume(ctx, mq, "validate",
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			arrived <- m.Envelope
+			return acemq.Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	slip := patterns.NewRoutingSlip().Then("", "validate", "validate")
+	if slip.Form() != patterns.FormJSON {
+		t.Errorf("a fresh slip is in %s form, want json", slip.Form())
+	}
+	if err := patterns.Start(ctx, mq, slip, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var env acemq.Envelope
+	select {
+	case env = <-arrived:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the message never arrived")
+	}
+
+	if _, ok := env.Headers[patterns.HeaderRoutingSlip]; !ok {
+		t.Errorf("no JSON slip on the message; headers were %v", env.Headers)
+	}
+	if env.Route != "" {
+		t.Errorf("Route = %q, want empty: a JSON slip writes no declared route", env.Route)
+	}
+}
+
+// TestASlipCanBeAskedForTheDeclaredForm covers the other direction — a Go
+// publisher starting a run that Java steps will follow.
+func TestASlipCanBeAskedForTheDeclaredForm(t *testing.T) {
+	route := patterns.NewRoute("orders", "validate", "charge", "ship")
+
+	started := route.Start()
+	if started.Form() != patterns.FormSteps {
+		t.Errorf("Route.Start gave a %s slip, want steps", started.Form())
+	}
+	if started.RunID() == "" {
+		t.Error("a started route has no run identifier, so its hops cannot be tied together")
+	}
+	next, ok := started.Next()
+	if !ok || next.Exchange != "orders" || next.RoutingKey != "validate" {
+		t.Errorf("first step is %v, want orders/validate", next)
+	}
+
+	// Two runs of the same route are two runs.
+	if route.Start().RunID() == started.RunID() {
+		t.Error("two runs of the same route share a run identifier")
+	}
+
+	// And converting a hand-built slip over.
+	converted := patterns.NewRoutingSlip().
+		Then("orders", "charge", "charge").
+		Then("orders", "ship", "ship").
+		AsSteps(route)
+	if converted.Form() != patterns.FormSteps || converted.RunID() == "" {
+		t.Errorf("AsSteps gave form %s and run %q", converted.Form(), converted.RunID())
+	}
+	// AsJSON goes back, so neither form is a one-way door.
+	if converted.AsJSON().Form() != patterns.FormJSON {
+		t.Error("AsJSON did not return a JSON slip")
 	}
 }
 

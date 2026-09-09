@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -66,6 +67,22 @@ type Envelope struct {
 	// reads it; the patterns package's Serve does, after its own acemq-reply-to
 	// header. See [ReplyTo].
 	ReplyTo string
+
+	// Route, RoutePosition and RouteID carry a declared pipeline's itinerary:
+	// the ordered step names, which of them this message is for, and the
+	// identifier of the run.
+	//
+	// Java's shape, and materialised here rather than left among Headers for a
+	// reason that is not tidiness: the reserved prefix means the engine drops
+	// them from the application's headers, so a Java-shaped route reaching a Go
+	// consumer would arrive on the wire and vanish before the handler saw it.
+	//
+	// Empty Route means the message is not travelling a declared route, which is
+	// the usual case — this library's own routing slip is a JSON header outside
+	// the reserved namespace. patterns.SlipFrom reads either. See [RouteSteps].
+	Route         string
+	RoutePosition int
+	RouteID       string
 
 	// Headers are the application's own. Never contains anything in the reserved
 	// namespace.
@@ -124,6 +141,38 @@ func FirstSeen(t time.Time) EnvelopeOption {
 // Origin names the publishing process. Defaults to acemq@{hostname}.
 func Origin(origin string) EnvelopeOption {
 	return func(b *envelopeBuilder) error { b.env.Origin = origin; return nil }
+}
+
+// Route puts a declared pipeline's itinerary on the message: the ordered step
+// names, which of them this message is for, and the identifier of the run.
+//
+// Java's form. Most Go code reaches for patterns.RoutingSlip instead, which
+// writes the self-describing JSON slip and needs nothing declared anywhere; this
+// is what a Go step uses to answer a Java-declared pipeline in the shape its
+// other steps expect. See patterns.Route.
+func Route(steps []string, position int, runID string) EnvelopeOption {
+	return func(b *envelopeBuilder) error {
+		if len(steps) == 0 {
+			return Fatalf("acemq: a route needs at least one step")
+		}
+		for _, step := range steps {
+			// A comma in a step name would split it into two steps at the next
+			// hop, which sends the message somewhere nobody named. Caught here,
+			// where the route is written, rather than there.
+			if strings.ContainsAny(step, ",") || strings.TrimSpace(step) == "" {
+				return Fatalf(
+					"acemq: %q is not a usable step name; a route is comma separated,"+
+						" so a step name cannot contain a comma or be blank", step)
+			}
+		}
+		if position < 0 {
+			return Fatalf("acemq: a route position cannot be negative, was %d", position)
+		}
+		b.env.Route = strings.Join(steps, ",")
+		b.env.RoutePosition = position
+		b.env.RouteID = runID
+		return nil
+	}
 }
 
 // ReplyTo names the queue an answer to this message should go to, as AMQP's own
@@ -243,8 +292,34 @@ func EnvelopeFromWire(headers map[string]any, routingKey, messageID string) Enve
 		FirstSeen:     time.UnixMilli(headerInt64(headers, HeaderFirstSeen)).UTC(),
 		Origin:        headerString(headers, HeaderOrigin),
 		Error:         headerString(headers, HeaderError),
+		Route:         headerString(headers, HeaderRoute),
+		// Zero when the header is absent or unreadable, which is also the right
+		// answer for a route that has one: a position nobody can read would send
+		// the message to an arbitrary step, and starting the route over is the
+		// only defensible reading. Java does the same.
+		RoutePosition: headerInt(headers, HeaderRoutePosition),
+		RouteID:       headerString(headers, HeaderRouteID),
 		Headers:       application,
 	}
+}
+
+// RouteSteps is the declared route's step names, in order, or nil when the
+// message is not travelling one.
+func (e Envelope) RouteSteps() []string {
+	if e.Route == "" {
+		return nil
+	}
+	parts := strings.Split(e.Route, ",")
+	steps := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			steps = append(steps, trimmed)
+		}
+	}
+	if len(steps) == 0 {
+		return nil
+	}
+	return steps
 }
 
 // envelopeFromDelivery is [EnvelopeFromWire] with the delivery's own AMQP
@@ -287,6 +362,15 @@ func (e Envelope) ToWire() map[string]any {
 	}
 	if e.Error != "" {
 		wire[HeaderError] = e.Error
+	}
+	if e.Route != "" {
+		// All three or none. A route with no position would be read as position
+		// zero by the next hop, which restarts the run rather than continuing it.
+		wire[HeaderRoute] = e.Route
+		wire[HeaderRoutePosition] = e.RoutePosition
+		if e.RouteID != "" {
+			wire[HeaderRouteID] = e.RouteID
+		}
 	}
 
 	for k, v := range e.Headers {

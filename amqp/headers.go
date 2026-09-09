@@ -58,9 +58,37 @@ const (
 	// HeaderOrigin identifies the publishing process, conventionally service@host.
 	HeaderOrigin = HeaderPrefix + "origin"
 
-	// HeaderClaim is the URI of the externalised payload when the claim-check
-	// pattern is in use.
+	// HeaderClaim is where an externalised payload is, when an application
+	// chooses to say so.
+	//
+	// The library's own claim check does not write it. That pattern frames the
+	// body — see patterns.ClaimCheckCodec — because a header can be stripped by a
+	// shovel or a federation link and the body cannot, and because the framing
+	// has to say whether a payload travelled inline or not, which a present-or-
+	// absent header cannot express for a message that predates the codec.
+	//
+	// This header is for an application that wants an operator reading a
+	// dead-letter queue to see where the payload went without decoding anything.
+	// Python and Ruby reserve it the same way and for the same reason.
 	HeaderClaim = HeaderPrefix + "claim"
+
+	// HeaderRoute is the ordered step names of a declared pipeline, comma
+	// separated, and HeaderRoutePosition is which of them the message is for,
+	// counting from zero. HeaderRouteID identifies one run across every hop.
+	//
+	// The form the Java library writes. A step name is resolved against a
+	// pipeline declared in code, so the names alone are enough for a message to
+	// be readable in a management console — validate,enrich,dispatch at position
+	// 1 says where a message is without anybody decoding anything.
+	//
+	// These are materialised onto [Envelope] rather than left among the
+	// application's headers, because the reserved prefix means they would
+	// otherwise be dropped: a Java-shaped route reaching a Go consumer would
+	// vanish between the wire and the handler. See patterns.RoutingSlip for the
+	// JSON form this library writes by default, and for reading either.
+	HeaderRoute         = HeaderPrefix + "route"
+	HeaderRoutePosition = HeaderPrefix + "route-position"
+	HeaderRouteID       = HeaderPrefix + "route-id"
 
 	// HeaderError says why a message was dead-lettered. Present only in a
 	// dead-letter queue.

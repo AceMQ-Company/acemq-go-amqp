@@ -51,6 +51,19 @@ content.
 | `x-acemq-first-seen` | `FirstSeen`, epoch milliseconds |
 | `x-acemq-origin` | `Origin`, omitted when empty |
 | `x-acemq-error` | `Error`, omitted when empty. Present only in a dead-letter queue. |
+| `x-acemq-route` | `Route`, the ordered step names of a declared pipeline, comma joined. All three below are omitted together when empty. |
+| `x-acemq-route-position` | `RoutePosition`, an integer, counting from zero |
+| `x-acemq-route-id` | `RouteID`, identifying one run across every hop |
+
+The three route headers are Java's form of a routing slip. They are on the
+envelope rather than among the application's headers for a reason that is not
+tidiness: the reserved prefix means the engine drops any `x-acemq-` header it
+does not know, so a Java-declared route reaching a Go consumer used to arrive on
+the wire and vanish before the handler saw it.
+
+`Envelope.RouteSteps()` splits `Route` into the names.
+[`patterns.SlipFrom`](patterns.md#two-forms-on-the-wire-and-both-are-read) reads
+either these or this library's own JSON slip, which is what Go writes by default.
 
 `ReplyTo` is deliberately not in that table. It is AMQP's own `reply-to`
 *property* rather than a header, which is where Java and .NET read it from — see
