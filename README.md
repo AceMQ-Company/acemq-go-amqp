@@ -128,7 +128,7 @@ A package per concern, with nothing at the module root:
 | `amqp/` | envelopes, codecs, publishing, consuming, retry, the in-memory transport. No dependencies outside the standard library. Named `acemq`. |
 | `rabbitmq/` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go`. |
 | `security/` | TLS modes, trusted authorities, credentials. No dependencies either. |
-| `patterns/` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, sagas, delayed delivery, streams, consumer groups, schema registry, SQL-backed stores. |
+| `patterns/` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, claim check, sagas, delayed delivery, streams, consumer groups, schema registry, SQL-backed stores. |
 | `actuator/` | metrics, health and info over HTTP, on the same paths as Java and .NET. |
 | `crypto/` | encrypted message bodies, AES-GCM. Standard library only. |
 | `codec/xml`, `codec/yaml`, `codec/toml`, `codec/protobuf`, `codec/avro` | one module each, so the core keeps its single dependency. |

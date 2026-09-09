@@ -103,7 +103,7 @@ The module is a package per concern, with nothing at its root:
 | `.../acemq-go-amqp/amqp` | envelopes, codecs, publishing, consuming, retry, the in-memory transport |
 | `.../acemq-go-amqp/rabbitmq` | the RabbitMQ transport, on `github.com/rabbitmq/amqp091-go` |
 | `.../acemq-go-amqp/security` | TLS modes, trusted authorities, credentials |
-| `.../acemq-go-amqp/patterns` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, sagas, delayed delivery, streams, consumer groups, schema registry, SQL stores |
+| `.../acemq-go-amqp/patterns` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, claim check, sagas, delayed delivery, streams, consumer groups, schema registry, SQL stores |
 | `.../acemq-go-amqp/actuator` | metrics, health and info over HTTP |
 | `.../acemq-go-amqp/crypto` | encrypted message bodies |
 | `.../acemq-go-amqp/codec/...` | XML, YAML, TOML, Protocol Buffers, Avro — a module each |

@@ -387,6 +387,116 @@ err := patterns.Start(ctx, mq, slip, order)
 `slip.AsSteps(route)` converts a hand-built slip to the declared form, and
 `slip.AsJSON()` converts one back — neither is a one-way door.
 
+## Claim check
+
+A payload too large for a broker goes to a store, and the message carries the
+key:
+
+```go
+store := patterns.NewFilesystemClaimCheckStore("/mnt/claims")
+checked := patterns.ClaimCheck(acemq.JSONCodec{}, store)
+
+mq, err := acemq.Connect(ctx, url, acemq.WithCodec(checked))
+```
+
+A scanned medical report is tens of megabytes. Putting it on a queue is possible
+and is a mistake: it fills the broker's memory, it is copied to every bound
+queue, it makes a dead-letter queue impossible to inspect, and **it turns a
+broker into a filesystem with worse tools**.
+
+### Only above the threshold
+
+Below `patterns.DefaultClaimCheckThreshold` — 64 KiB — the payload travels
+inline, exactly as it would without the codec. That matters more than it sounds:
+offloading a two-hundred-byte message turns one broker round trip into a store
+round trip *and* a broker round trip, so an unconditional claim check makes the
+common case slower to fix the rare one.
+
+`patterns.OffloadAbove(n)` changes it; zero offloads everything.
+
+### What is on the wire
+
+```
+0xAC  0x01  0x00  payload   inline, and identical to what the delegate wrote
+0xAC  0x01  0x01  key       a claim check
+```
+
+Three bytes, and the third is how a consumer decides whether it is holding a
+payload or a reference to one. **The framing rather than a header is the
+contract:** a header can be stripped by a shovel or a federation link, and the
+body cannot — and a header that is present or absent cannot say whether a
+payload travelled inline, which is what makes the threshold changeable without a
+flag day.
+
+These are the same three bytes Java, Python and Ruby write, and the key is the
+store's key as **bare UTF-8** — not a URI, not a scheme, nothing wrapped around
+it. A Go consumer pointed at the same store reads a document a Java publisher
+checked in.
+
+A body with no framing is read as the delegate would read it, which is what makes
+adding this codec to a live queue safe.
+
+The content type is the delegate's, unchanged. A claim-checked message is still a
+document; it is a document that is somewhere else.
+
+> **`x-acemq-claim` is not written by this codec.** That header is reserved for
+> an application that wants an operator reading a dead-letter queue to see where
+> a payload went. Python and Ruby reserve it the same way. To read the key out of
+> a body without fetching it — *which object does this need, and is it still
+> there?* — use `patterns.ClaimKeyOf(body)`.
+
+### The store
+
+```go
+type ClaimCheckStore interface {
+	Put(content []byte) (string, error)
+	Get(key string) (content []byte, found bool, err error)
+	Delete(key string) error
+}
+```
+
+Three methods, so a store in front of S3 or Azure Blob Storage is a small type.
+Nothing in it knows about messaging.
+
+`Get` tells **not found** from **failed**, and the codec treats them differently:
+a store that timed out may well answer next time, so that is retryable; a key the
+store does not hold never will be, so that is fatal and the message stops rather
+than circling.
+
+Two are supplied. `patterns.NewInMemoryClaimCheckStore()` is for tests — the
+payloads are in the publisher's own memory, so a consumer in another process
+finds nothing, which is the pattern failing rather than working.
+`patterns.NewFilesystemClaimCheckStore(dir)` is a real store where the filesystem
+is shared and durable; writes go to a temporary file and are renamed into place,
+because a consumer fast enough to read the key before the writer finished would
+otherwise get a truncated payload.
+
+There is no context on the store: `acemq.Codec` has none to pass on. **A store
+doing network I/O must carry its own timeout**, because without one a hung object
+store hangs a consumer's whole delivery.
+
+> ### Retention is the part that goes wrong
+>
+> The store and the queue have different lifetimes and nothing enforces a
+> relationship between them. A message replayed a month later carries a key, and
+> if the store expired that key the replay produces a message nobody can read —
+> **worse than a lost message, because it looks like a message** and fails deep
+> inside a consumer rather than visibly.
+>
+> The store's retention must exceed every retention that could bring a message
+> back: queue TTLs, dead-letter queues, and however long somebody might sit on a
+> message before replaying it by hand. When in doubt, longer.
+>
+> `Delete` is never called by the codec. Deleting on read would break a second
+> consumer of the same message and deleting on acknowledgement would break a
+> replay, so when a payload may be removed is a retention decision — and those
+> belong to whoever owns the data.
+
+A key becomes a path segment in the filesystem store, and a key arriving from a
+message is whatever a publisher put there. Every key the store issues is a UUID,
+so one that is not is refused rather than followed; `../../etc/passwd` is a key
+too.
+
 ## Sagas
 
 Work that spans services, where a database transaction is not available and the

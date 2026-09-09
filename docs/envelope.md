@@ -78,6 +78,13 @@ Two more are read when present, for messages moved by hand:
 `first-seen`, which is an integer — the two timestamps really are encoded
 differently, and matching Java is the point), and `x-acemq-replay-count`.
 
+`x-acemq-claim` is reserved and **written by nothing in this library**. It is for
+an application that wants an operator reading a dead-letter queue to see where a
+payload went. The [claim check](patterns.md#claim-check) frames the body rather
+than setting a header, because a header can be stripped by a shovel or a
+federation link and because a present-or-absent header cannot say whether a
+payload travelled inline. Python and Ruby reserve it the same way.
+
 ## The reserved namespace
 
 Anything beginning `x-acemq-` belongs to the engine. On the way in it is read

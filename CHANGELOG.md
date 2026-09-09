@@ -10,6 +10,72 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **The claim check, so a payload too large for a broker goes to a store and the
+  message carries the key.** Java, Python and Ruby have had one; this library
+  declared `x-acemq-claim` and wrote it nowhere, which is a defined header with
+  no implementation and worse than an absent feature — it looks like support.
+
+  ```go
+  store := patterns.NewFilesystemClaimCheckStore("/mnt/claims")
+  checked := patterns.ClaimCheck(acemq.JSONCodec{}, store)
+
+  mq, err := acemq.Connect(ctx, url, acemq.WithCodec(checked))
+  ```
+
+  The wire contract is the family's, and it is three bytes:
+
+  ```
+  0xAC  0x01  0x00  payload   inline, and identical to what the delegate wrote
+  0xAC  0x01  0x01  key       a claim check
+  ```
+
+  The key is the store's key as bare UTF-8 — not a URI, not a scheme — so a Go
+  consumer pointed at the same store reads a document a Java publisher checked
+  in. `patterns.DefaultClaimCheckThreshold` is 64 KiB and is compared strictly
+  less than, so a payload *at* the threshold is offloaded, which is what the
+  other three do: a payload on the boundary must not be inline from one library
+  and checked from another. `patterns.OffloadAbove(n)` changes it and zero
+  offloads everything. There are tests pinning the magic byte and the boundary,
+  and they fail if either moves.
+
+  Below the threshold the payload travels inline and the content type is the
+  delegate's, unchanged — a claim-checked message is still a document, it is a
+  document that is somewhere else. A body with no framing is read as the delegate
+  would read it, which is what makes adding this codec to a live queue safe.
+
+  **The codec still does not write `x-acemq-claim`,** and that is deliberate
+  rather than unfinished: the framing is the contract because a header can be
+  stripped by a shovel or a federation link, and because a present-or-absent
+  header cannot say whether a payload travelled inline. The header stays reserved
+  for an application that wants to say where a payload went;
+  `patterns.ClaimKeyOf(body)` reads the key without fetching it, which is the
+  question an operator holds in front of a dead-letter queue.
+
+  `patterns.ClaimCheckStore` is three methods, so a store in front of S3 or Azure
+  Blob Storage is a small type. `Get` reports *not found* separately from
+  *failed*, and the codec treats them differently: a store that timed out is
+  retryable, a key it does not hold is fatal and the message stops rather than
+  circling for ever over a payload that will never come back. There is no context
+  on the store because `acemq.Codec` has none to pass on, so a store doing
+  network I/O has to carry its own timeout.
+
+  `patterns.NewInMemoryClaimCheckStore` is for tests and copies on the way in and
+  out, so a codec reusing a buffer cannot change what was stored.
+  `patterns.NewFilesystemClaimCheckStore` writes to a temporary file and renames
+  into place, because a consumer fast enough to read the key before the writer
+  finished would otherwise get a truncated payload — and messaging is exactly the
+  arrangement that makes a consumer that fast normal. A key becomes a path
+  segment, so one arriving from a message is checked against the UUID shape every
+  key it issues has rather than trusted; `../../etc/passwd` is a key too.
+
+  Wrapping an `acemq.CompositeCodec` works: the codec forwards `DecodeAs`, so a
+  queue carrying more than one format still chooses by content type.
+
+  See [docs/patterns.md](docs/patterns.md#claim-check), and read the retention
+  warning there — a store whose retention is shorter than the queue's produces
+  messages nobody can read, which is worse than losing them because they still
+  look like messages.
+
 - **A routing slip can be read and written in either of the family's two forms,
   so a Go step can be one step of a Java-declared pipeline.**
 
