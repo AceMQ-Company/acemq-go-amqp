@@ -23,15 +23,16 @@ mq, err := acemq.Connect(ctx, url, acemq.WithObserver(myObserver))
 **Nothing is measured until you ask.** The default is `NopObserver`, so a program
 that never reads metrics does not pay for them.
 
-> ### Every metric was renamed
+> ### Every metric was renamed in 0.5.0
 >
-> **This breaks every existing Go dashboard, alert rule and recording rule.**
+> **This breaks every Go dashboard, alert rule and recording rule built against
+> 0.3.0 or earlier.**
 >
 > Java's `MetricNames` is the family's vocabulary and Go, Python and Ruby have
-> moved onto it. Until now the four libraries emitted disjoint sets of names, so
+> moved onto it. Up to 0.3.0 the four libraries emitted disjoint sets of names, so
 > the promise this page used to make — that a dashboard reads the same against
-> another AceMQ library — was simply untrue. It is true now, and it costs one
-> editing pass over whatever you have built.
+> another AceMQ library — was simply untrue. It is true from 0.5.0 on, and it
+> costs one editing pass over whatever you have built.
 >
 > | Old | New |
 > |---|---|
@@ -95,7 +96,7 @@ messages that are gone.
 
 #### Named but not written
 
-Four more names are part of the family vocabulary and are declared in
+Five more names are part of the family vocabulary and are declared in
 `amqp/telemetry.go` so an `Observer` can be written against one list — but this
 library does not emit them, and says so rather than leaving you to wonder why the
 series is empty.
@@ -130,7 +131,7 @@ an application writing its own tags should not invent a second one.
 > tag vocabulary against the Prometheus label grammar, so a third dotted tag
 > cannot reach a scrape endpoint unnoticed.
 
-> **`routing.key` was `key` until the previous release.** Java and .NET already
+> **`routing.key` was `key` up to 0.3.0 and changed in 0.5.0.** Java and .NET already
 > wrote `routing.key`; Go and Python wrote `key`, and neither reading was wrong.
 > The fully-qualified name says *which* key it means next to a tag called
 > `queue`, and Java is the library the others are ported from, so the two moved
@@ -306,7 +307,7 @@ fills with red and stops meaning anything.
 ### Every failure has an outcome
 
 `Span.Failed` writes `messaging.acemq.outcome = failed` as well as recording the
-exception and the `ERROR` status. Before this release it wrote neither the
+exception and the `ERROR` status. Before 0.5.0 it wrote neither the
 attribute nor anything else a query could group by, so a publish that threw was
 counted as `failed` and carried a span with no outcome at all — the counter and
 the trace disagreeing about the same message, which is the one thing this shared

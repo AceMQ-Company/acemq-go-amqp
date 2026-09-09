@@ -153,8 +153,9 @@ elsewhere.
 - [Exchanges, queues and bindings](topology.md)
 - [Security](security.md) — TLS, trust and credentials
 - [Retries, redelivery and shutdown](reliability.md)
-- [Patterns](patterns.md) — request-reply, idempotency, outbox, ordering, replay,
-  sagas, delayed delivery
+- [Patterns](patterns.md) — request-reply, idempotency, outbox, ordering,
+  pipelines, replay, routing slips, claim check, sagas, delayed delivery,
+  streams, consumer groups, schema registry
 - [Metrics, tracing and health](observability.md)
 - [Testing without a broker](testing.md)
 - [API reference](https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp) on

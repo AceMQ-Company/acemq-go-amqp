@@ -950,6 +950,62 @@ func TestReplayMovesMessagesBack(t *testing.T) {
 		if m.Envelope.Headers[patterns.HeaderReplayedFrom] != "orders-dead" {
 			t.Errorf("no replay stamp: %v", m.Envelope.Headers)
 		}
+
+		// The stamps have to reach the handler, which is what the unprefixed
+		// names buy. Reading them out of Envelope.Headers is the whole contract:
+		// anything in the reserved prefix would have been dropped by now.
+		at, ok := m.Envelope.Headers[patterns.HeaderReplayedAt].(string)
+		if !ok {
+			t.Fatalf("%s is %T, want a string: %v",
+				patterns.HeaderReplayedAt, m.Envelope.Headers[patterns.HeaderReplayedAt],
+				m.Envelope.Headers)
+		}
+		if _, err := time.Parse(time.RFC3339, at); err != nil {
+			t.Errorf("%s = %q, which is not RFC 3339: %v",
+				patterns.HeaderReplayedAt, at, err)
+		}
+
+		if m.Envelope.Headers[patterns.HeaderReplayCount] == nil {
+			t.Errorf("no %s: %v", patterns.HeaderReplayCount, m.Envelope.Headers)
+		}
+	}
+}
+
+// TestTheReplayStampsStayOutOfTheReservedNamespace pins the names themselves.
+//
+// This package declared an x-acemq- set of these until 0.5.0's successor and
+// wrote none of them, which is worse than declaring nothing: a port reads the
+// constants and implements against the wrong three names. The prefix is not a
+// style question. A header in it that the engine does not materialise onto the
+// envelope is dropped on the way in, so a replay stamp written there would reach
+// the wire and never reach a handler.
+func TestTheReplayStampsStayOutOfTheReservedNamespace(t *testing.T) {
+	for _, name := range []string{
+		patterns.HeaderReplayedFrom,
+		patterns.HeaderReplayedAt,
+		patterns.HeaderReplayCount,
+	} {
+		if acemq.IsAceHeader(name) {
+			t.Errorf("%q is in the reserved %q namespace, so it would be dropped "+
+				"before any handler saw it", name, acemq.HeaderPrefix)
+		}
+	}
+
+	// The names Java, Python and Ruby write, spelled out rather than derived, so
+	// that renaming a constant cannot quietly rename the wire contract.
+	for name, want := range map[string]string{
+		"replayed-from": "acemq-replayed-from",
+		"replayed-at":   "acemq-replayed-at",
+		"replay-count":  "acemq-replay-count",
+	} {
+		got := map[string]string{
+			"replayed-from": patterns.HeaderReplayedFrom,
+			"replayed-at":   patterns.HeaderReplayedAt,
+			"replay-count":  patterns.HeaderReplayCount,
+		}[name]
+		if got != want {
+			t.Errorf("%s is %q, want %q", name, got, want)
+		}
 	}
 }
 

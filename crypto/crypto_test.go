@@ -481,7 +481,7 @@ func legacyGoBody(t *testing.T, key Key, plaintext string) []byte {
 // released, so queues can hold bodies in the framing this library used to
 // write, and a consumer upgraded ahead of them has to be able to drain them.
 //
-// It goes away in v0.5.0, and this test goes with it.
+// It goes away in v0.6.0, and this test goes with it.
 func TestTheLegacyGoFramingStillReads(t *testing.T) {
 	key, err := NewKey("2026-01")
 	if err != nil {

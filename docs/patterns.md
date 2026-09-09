@@ -265,6 +265,21 @@ Messages the filter declines stay where they are. Each replayed message is
 stamped `acemq-replayed-from`, `acemq-replayed-at` and `acemq-replay-count`, so a
 consumer that needs to treat them differently can.
 
+Those are the names Java, Python and Ruby write too, and **none of them begins
+`x-acemq-`**. That namespace is the engine's, and a header in it that the engine
+does not put on the envelope is dropped before a handler sees it — so a replay
+stamp written there would arrive on the wire and vanish. Unprefixed, the three
+come through in `Envelope.Headers`. `acemq-replayed-at` is RFC 3339, not the
+epoch milliseconds `x-acemq-first-seen` uses.
+
+> **.NET is the outlier here.** It writes `x-acemq-replayed-from`,
+> `x-acemq-replayed-at` and `x-acemq-replay-count`, and a Go consumer will not see
+> them: the reserved prefix means this library drops all three on the way in. A
+> message replayed by a .NET operator arrives, and it arrives without its stamps.
+> That costs an audit trail rather than a message, and only for a replay somebody
+> did by hand — but do not write a Go consumer that expects to be able to tell a
+> .NET-replayed message from an original.
+
 **Attempts start again.** A replayed message goes back on attempt one with the
 reason it was dead-lettered cleared, because a message dead-lettered on the last
 attempt of a five-attempt policy would otherwise be dead-lettered again before

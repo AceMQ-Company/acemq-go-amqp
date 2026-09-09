@@ -73,10 +73,22 @@ either these or this library's own JSON slip, which is what Go writes by default
 `x-acemq-causation` entirely when there is no causation, and a port that writes
 a null there produces a different message for the same content.
 
-Two more are read when present, for messages moved by hand:
-`x-acemq-replayed-from`, `x-acemq-replayed-at` (an ISO-8601 string, unlike
-`first-seen`, which is an integer — the two timestamps really are encoded
-differently, and matching Java is the point), and `x-acemq-replay-count`.
+**The replay stamps are not in that table and not in this namespace.** A
+[replay](patterns.md#replay) writes `acemq-replayed-from`, `acemq-replayed-at`
+and `acemq-replay-count` — no `x-`, and that is the point. Anything under
+`x-acemq-` that the engine does not put on the envelope is dropped on the way in,
+so a stamp written there would reach the wire and vanish before the handler saw
+it. Unprefixed, the three arrive as ordinary entries in `Envelope.Headers`, which
+is where `patterns.HeaderReplayedFrom` and its two siblings read them.
+
+`acemq-replayed-at` is an **RFC 3339** string — `2026-02-03T04:05:06Z` — unlike
+`x-acemq-first-seen`, which is epoch milliseconds. The two timestamps on the wire
+really are encoded differently. Go, Java, Python and Ruby all write RFC 3339
+here; Java also reads the epoch milliseconds it wrote before 0.5.0.
+
+.NET writes the prefixed `x-acemq-` spellings of all three instead, so its replay
+stamps are dropped on the way in here rather than reaching a handler — see
+[replay](patterns.md#replay).
 
 `x-acemq-claim` is reserved and **written by nothing in this library**. It is for
 an application that wants an operator reading a dead-letter queue to see where a

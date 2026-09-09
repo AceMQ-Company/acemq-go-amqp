@@ -94,19 +94,19 @@ const (
 	// dead-letter queue.
 	HeaderError = HeaderPrefix + "error"
 
-	// HeaderReplayedFrom is the queue a message was replayed from.
-	HeaderReplayedFrom = HeaderPrefix + "replayed-from"
-
-	// HeaderReplayedAt is when the message was last replayed, as an ISO-8601
-	// instant.
+	// There are deliberately no replay headers here.
 	//
-	// A string, unlike [HeaderFirstSeen], which is an integer. The two timestamps
-	// on the wire are encoded differently and it is not an oversight to be tidied
-	// up here: matching the Java implementation is the entire point.
-	HeaderReplayedAt = HeaderPrefix + "replayed-at"
-
-	// HeaderReplayCount is how many times the message has been replayed.
-	HeaderReplayCount = HeaderPrefix + "replay-count"
+	// A replay stamps acemq-replayed-from, acemq-replayed-at and
+	// acemq-replay-count — outside this reserved prefix, which is the whole
+	// point. Anything in HeaderPrefix that this version does not materialise onto
+	// the [Envelope] is dropped before a handler sees it, so a replay stamp put
+	// here would arrive on the wire and vanish. Java, Python and Ruby write the
+	// same three unprefixed names, and the envelope fixtures carry them.
+	//
+	// This package declared x-acemq-replayed-from, x-acemq-replayed-at and
+	// x-acemq-replay-count through 0.5.0 and wrote none of the three, which is
+	// how a port ends up implementing against a header that was never on a
+	// message. See patterns.HeaderReplayedFrom for the names that are.
 
 	// HeaderTraceParent carries W3C trace context.
 	HeaderTraceParent = "traceparent"

@@ -241,12 +241,11 @@ A key is 16, 24 or 32 bytes — the three lengths AES takes, and the same three
 Java, Python and Ruby accept. Anything else is refused rather than padded or
 hashed into shape, because both would make a weak key look like a strong one.
 
-The framing is the Java, Python and Ruby one byte for byte — `0xAE`, a version
-byte, a one-byte key id length, the key id, a 12-byte nonce, then the ciphertext
-and its 16-byte tag — so a Java producer and a Go consumer can share a key. .NET
-is the exception: it uses AES-256-CBC with a separate HMAC rather than AES-GCM.
-See [security](security.md#encrypted-bodies-are-portable-except-nets), which
-also covers reading what v0.3.0 wrote.
+The framing is the family's byte for byte — `0xAE`, a version byte, a one-byte
+key id length, the key id, a 12-byte nonce, then the ciphertext and its 16-byte
+tag — so a producer in Java, .NET, Python or Ruby and a Go consumer can share a
+key. See [security](security.md#encrypted-bodies-are-portable), which also covers
+reading what v0.3.0 wrote and when that stops.
 
 ## Several formats on one queue
 

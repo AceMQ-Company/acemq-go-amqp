@@ -106,14 +106,32 @@ type ReplayFrom struct {
 	KeepAttempts bool
 }
 
-// HeaderReplayedFrom names the queue a message was replayed out of.
-const HeaderReplayedFrom = "acemq-replayed-from"
+// The three headers a replay stamps, and the only ones. Java, Python and Ruby
+// write the same names, and the envelope fixtures carry them.
+//
+// None of them begins x-acemq-, and that is deliberate rather than an
+// oversight to be tidied up: the reserved prefix is the engine's, and a header
+// in it that the engine does not materialise onto an [acemq.Envelope] is
+// dropped before a handler sees it. A replay stamp put there would reach the
+// wire and vanish. There is a test asserting all three stay outside it.
+//
+// .NET writes the x-acemq- spellings, which this library therefore drops on the
+// way in: a message a .NET operator replayed reaches a Go handler without its
+// stamps. That is an audit trail lost, not a message.
+const (
+	// HeaderReplayedFrom names the queue a message was replayed out of.
+	HeaderReplayedFrom = "acemq-replayed-from"
 
-// HeaderReplayedAt is when it was replayed, as RFC 3339.
-const HeaderReplayedAt = "acemq-replayed-at"
+	// HeaderReplayedAt is when it was replayed, as an RFC 3339 string — not
+	// epoch milliseconds, which is how the engine's own x-acemq-first-seen
+	// travels. The two timestamps really are encoded differently on the wire.
+	// All five libraries write RFC 3339 here; Java also reads the epoch
+	// milliseconds it wrote before 0.5.0.
+	HeaderReplayedAt = "acemq-replayed-at"
 
-// HeaderReplayCount is how many times it has been replayed.
-const HeaderReplayCount = "acemq-replay-count"
+	// HeaderReplayCount is how many times it has been replayed.
+	HeaderReplayCount = "acemq-replay-count"
+)
 
 // Replay moves messages from a queue back onto an exchange.
 func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (ReplayResult, error) {

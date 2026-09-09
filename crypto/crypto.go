@@ -24,11 +24,15 @@
 //
 // # Reading and writing with the other libraries
 //
-// The framing is the Java, Python and Ruby one byte for byte, so a Java producer
-// and a Go consumer can share a key. See [ContentType] for the bytes, and the
-// security guide for what to do about anything encrypted by this library up to
-// v0.3.0, whose framing was Go's alone. .NET is the remaining exception: it uses
-// AES-256-CBC with a separate HMAC rather than AES-GCM.
+// The framing is the family's, byte for byte — Java, .NET, Python and Ruby all
+// write it — so a producer in any of them and a Go consumer can share a key. See
+// [ContentType] for the bytes, and the security guide for what to do about
+// anything encrypted by this library up to v0.3.0, whose framing was Go's alone.
+//
+// .NET wrote AES-256-CBC with a separate HMAC up to its own 0.3.0 and moved to
+// AES-GCM in the same round this library moved its framing, so it is no longer
+// the exception it was. Its old bodies are read only by .NET, as this library's
+// old bodies are read only here.
 //
 // # What this does not protect
 //
@@ -274,6 +278,8 @@ func (c *Codec) Inner() acemq.Codec { return c.inner }
 // This is the only framing this library writes. Bodies in the framing Go wrote
 // up to v0.3.0 are still read — see [Codec.Decode] — but never written, because
 // two writers is how a divergence survives being fixed.
+//
+// Java, .NET, Python and Ruby write these same bytes.
 func (c *Codec) Encode(payload any) ([]byte, error) {
 	plaintext, err := c.inner.Encode(payload)
 	if err != nil {
@@ -311,10 +317,10 @@ func (c *Codec) Encode(payload any) ([]byte, error) {
 // Decode decrypts and then decodes.
 //
 // Two framings are read. A body beginning 0xAE is the family framing, which is
-// what this library and Java, Python and Ruby write. A body beginning 0x01 is
-// the legacy Go framing, written by this library up to v0.3.0; it is read so
+// what this library and Java, .NET, Python and Ruby write. A body beginning 0x01
+// is the legacy Go framing, written by this library up to v0.3.0; it is read so
 // that a queue filled before the change can be drained, and nothing writes it
-// any more. Reading it goes away in v0.5.0. Anything else is refused.
+// any more. Reading it goes away in v0.6.0. Anything else is refused.
 //
 // A body that will not decrypt is fatal: the same bytes fail the same way every
 // time, whether they were tampered with, encrypted with a key this process does
@@ -437,7 +443,7 @@ func unframe(body []byte) (keyID string, header, sealed []byte, err error) {
 // that has been upgraded, and it is deliberately never written: two writers is
 // how a divergence survives being fixed.
 //
-// Deprecated: this is a migration affordance and goes away in v0.5.0. Drain or
+// Deprecated: this is a migration affordance and goes away in v0.6.0. Drain or
 // re-encrypt anything still holding these bodies before then. The two framings
 // cannot be confused — the current one begins 0xAE and this one begins 0x01 —
 // so removing it will refuse those bodies rather than misread them.

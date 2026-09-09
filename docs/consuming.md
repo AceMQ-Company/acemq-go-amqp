@@ -83,8 +83,9 @@ func handle(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
 }
 ```
 
-.NET has had `Ack.Park` since its first release; Python and Ruby are adding
-theirs alongside this one.
+.NET has had `Ack.Park` since its first release, and Python's `park()` and Ruby's
+`Ack.park` landed in the same round as this one. All five libraries now let a
+handler ask for it.
 
 ## What the handler receives
 

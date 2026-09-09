@@ -6,6 +6,114 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## [Unreleased]
+
+### Removed
+
+- **`acemq.HeaderReplayedFrom`, `acemq.HeaderReplayedAt` and
+  `acemq.HeaderReplayCount`, which named three headers this library never
+  wrote.** They were `x-acemq-replayed-from`, `x-acemq-replayed-at` and
+  `x-acemq-replay-count`, and no code here has ever put them on a message — nor
+  read one. (.NET does write those spellings, and this library drops them on the
+  way in exactly as it drops any other unrecognised reserved header; see the
+  patterns.md note under Fixed.)
+
+  The real stamps are `patterns.HeaderReplayedFrom`, `HeaderReplayedAt` and
+  `HeaderReplayCount` — `acemq-replayed-from`, `acemq-replayed-at` and
+  `acemq-replay-count`, without the `x-`. `patterns.Replay` has always written
+  those, the envelope fixtures Java generates carry those, and Java moved its own
+  write side onto them in 0.5.0.
+
+  **The missing prefix is the design, not an inconsistency to be tidied up.**
+  `x-acemq-` is the engine's namespace, and any header in it that the engine does
+  not materialise onto `acemq.Envelope` is dropped on the way in. A replay stamp
+  written there would reach the broker and vanish before the handler saw it —
+  which is exactly what a port implementing against the deleted constants would
+  have built. Two names for one thing, one of them fiction, is worse than one
+  name; a constant nothing writes reads as a supported feature.
+
+  The doc comment on the deleted `HeaderReplayedAt` also claimed its value
+  matched Java's. It no longer did: Java writes RFC 3339 there as of 0.5.0,
+  matching what this library, .NET, Python and Ruby already wrote.
+
+  Nothing in this repository referenced the deleted constants, so no code that
+  compiled against 0.5.0 breaks unless it named them directly — in which case it
+  was looking for a header that was never on the wire. `amqp/headers.go` keeps a
+  note where they were, so the next port does not put them back.
+
+### Fixed
+
+- **The legacy `crypto` framing is deprecated until v0.6.0, not v0.5.0.** The
+  0.5.0 entry below, `crypto.Codec.Decode`, the deprecation notice on the legacy
+  constants and [docs/security.md](docs/security.md) all said reading it went
+  away in v0.5.0 — the release that introduced the deprecation. As written the
+  migration window was zero releases long and the promise was already broken on
+  the day it shipped: 0.5.0 reads both framings, as it should. The successor
+  release is where it goes, and every one of those places now says v0.6.0.
+
+- **Documentation said .NET could not read an encrypted body from this
+  library.** `crypto`'s package comment, [docs/security.md](docs/security.md) and
+  [docs/serialization.md](docs/serialization.md) all described .NET as the
+  remaining exception, using AES-256-CBC with a separate HMAC rather than
+  AES-GCM. That was true up to .NET's 0.3.0 and stopped being true in its 0.5.0,
+  which moved to AES-GCM in the family framing in the same round this library
+  moved to it. A .NET producer and a Go consumer can share a key. What still does
+  not cross is either library's *legacy* bodies — both old framings begin `0x01`,
+  so one arriving at the wrong library is refused rather than misread.
+
+- **[docs/envelope.md](docs/envelope.md) documented the replay stamps under the
+  wrong names**, said two and listed three, and described them as read when
+  present, which nothing does. It now names the three that are really written,
+  says they are deliberately outside the reserved namespace and why, and gives
+  `acemq-replayed-at` as RFC 3339 against `x-acemq-first-seen`'s epoch
+  milliseconds.
+
+- **[docs/patterns.md](docs/patterns.md)** names the encoding of
+  `acemq-replayed-at` and the reason the stamps carry no prefix, rather than
+  listing the three names and leaving both to be inferred.
+
+  It also records a divergence found while checking this, which no document in
+  this repository mentioned: **.NET writes the `x-acemq-` spellings of all three
+  replay stamps**, and writes them for real rather than merely declaring them.
+  This library drops them, because that is what the reserved prefix means — so a
+  message a .NET operator replayed by hand reaches a Go handler without its
+  stamps. It costs an audit trail, not a message, and it is the .NET library's to
+  fix; documented here so nobody writes a Go consumer that expects to tell a
+  .NET-replayed message from an original.
+
+- **The patterns list in [docs/index.md](docs/index.md)'s navigation** had not
+  been updated since pipelines, routing slips, claim check, streams, consumer
+  groups and the schema registry landed. The table earlier on the same page
+  listed them all, so the page disagreed with itself.
+
+- **[docs/observability.md](docs/observability.md) counted the metrics that are
+  named but not written as four. There are five** — `acemq.consume.attempts`,
+  `acemq.request.duration`, `acemq.request.total`,
+  `acemq.pipeline.run.duration` and `acemq.pipeline.run.total`. The 0.5.0 entry
+  below called them two. The table itself was right; only the sentence over it
+  was wrong, which is the kind of error that makes a reader stop trusting the
+  table.
+
+- **Three passages dated changes relative to "this release" or "the previous
+  release"**, written while 0.5.0 was still `## [Unreleased]` and wrong from the
+  moment it was tagged: from 0.5.0 the previous release is 0.3.0, and the
+  renaming happened *in* 0.5.0 rather than before it. The metric rename, the
+  `key` to `routing.key` move and `Span.Failed`'s outcome attribute now name
+  0.5.0 outright.
+
+- **[docs/consuming.md](docs/consuming.md) said Python and Ruby were still adding
+  a handler-requested park.** Both shipped theirs in the same round as this one —
+  Python's `park()` and Ruby's `Ack.park` — so all five libraries have it.
+
+### Added
+
+- A test asserting the three replay stamps stay outside the `x-acemq-` namespace
+  and keep their exact spelling, and one asserting a replayed message reaches a
+  handler carrying all three with `acemq-replayed-at` parseable as RFC 3339. The
+  existing test checked only that `acemq-replayed-from` was present, which is why
+  the encoding and the namespace could be described wrongly for so long without
+  anything failing.
+
 ## [0.5.0] - 2026-09-09
 
 ### Added
@@ -326,7 +434,7 @@ While the version is `0.x` the public API may change in any release.
   `failed`. `confirmed` and `published` are likewise told apart, which is the
   difference between the broker's word and having reached the socket.
 
-  Two names Java has and this library does not write are declared anyway, so an
+  Five names Java has and this library does not write are declared anyway, so an
   `Observer` can be written against one list: see
   [docs/observability.md](docs/observability.md#named-but-not-written) for
   `acemq.consume.attempts`, the request metrics and the pipeline metrics, and why
@@ -414,7 +522,7 @@ While the version is `0.x` the public API may change in any release.
   **What to do.** Upgrade consumers before producers, as with any format change:
   a consumer on this version reads both framings, a consumer on v0.3.0 reads
   neither this one's nor Java's. Then drain or re-encrypt anything still holding
-  the old framing before v0.5.0 removes the ability to read it.
+  the old framing before v0.6.0 removes the ability to read it.
 
 - **A `crypto` key may be 16, 24 or 32 bytes.** It had to be exactly 32. Java,
   Python and Ruby all take the three lengths AES takes, and refusing the other
@@ -429,7 +537,7 @@ While the version is `0.x` the public API may change in any release.
 
 ### Deprecated
 
-- **Reading the legacy Go encryption framing, which goes away in v0.5.0.**
+- **Reading the legacy Go encryption framing, which goes away in v0.6.0.**
   v0.3.0 is released, so queues can be holding bodies framed as version, two-byte
   big-endian key id length, key id, nonce, ciphertext. `crypto.Codec.Decode` and
   `crypto.KeyIDOf` still read them: a body beginning `0xAE` is the current
@@ -440,7 +548,7 @@ While the version is `0.x` the public API may change in any release.
   **Nothing writes the legacy framing, and nothing can be made to.** There is no
   option, no constructor and no environment variable for it, because two writers
   is how a divergence survives being fixed. It is a migration affordance with an
-  end date: drain those queues or re-encrypt their contents before v0.5.0, after
+  end date: drain those queues or re-encrypt their contents before v0.6.0, after
   which those bodies are refused rather than misread.
 
 ### Fixed
