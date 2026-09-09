@@ -992,9 +992,11 @@ func TestAHandlerCanParkAMessageItCannotRead(t *testing.T) {
 		t.Errorf("Outcome = %q, want %q", got.Outcome, OutcomeParked)
 	}
 
-	// Parking has no counter of its own — Java settled on the outcome tag and
-	// nothing else, and this library follows it — so the tag is where a park is
-	// visible at all.
+	// Parking has no counter of its own. It is visible two ways, both of them
+	// Java's: tagged onto the consume counter, and folded into the set-aside
+	// counter beside the dead letters — MicrometerTelemetry.messageParked
+	// increments MetricDeadLetteredTotal with outcome=parked, because an
+	// operator asking "how much is this queue giving up on" wants one number.
 	counts := metrics.Counts()
 	parkedCount := counts[metricKey(MetricConsumeTotal,
 		map[string]string{TagQueue: "orders", TagOutcome: OutcomeParked})]
@@ -1007,8 +1009,15 @@ func TestAHandlerCanParkAMessageItCannotRead(t *testing.T) {
 		t.Errorf("%s{outcome=%s} = %d, want 0: a park is not a rejection",
 			MetricConsumeTotal, OutcomeRejected, rejected)
 	}
-	if total := countOf(metrics, MetricDeadLetteredTotal); total != 0 {
-		t.Errorf("%s = %d, want 0", MetricDeadLetteredTotal, total)
+	setAside := counts[metricKey(MetricDeadLetteredTotal,
+		map[string]string{TagQueue: "orders", TagOutcome: OutcomeParked})]
+	if setAside != 1 {
+		t.Errorf("%s{outcome=%s} = %d, want 1: a parked message is set aside"+
+			" and counts with the dead letters, tagged apart",
+			MetricDeadLetteredTotal, OutcomeParked, setAside)
+	}
+	if total := countOf(metrics, MetricDeadLetteredTotal); total != 1 {
+		t.Errorf("%s = %d, want 1", MetricDeadLetteredTotal, total)
 	}
 	if total := countOf(metrics, MetricConsumeTotal); total != 1 {
 		t.Errorf("%s = %d, want 1", MetricConsumeTotal, total)

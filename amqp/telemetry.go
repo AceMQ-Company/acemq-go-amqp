@@ -94,12 +94,19 @@ const (
 	// and is worth an alert of its own.
 	MetricRetriedTotal = "acemq.messages.retried.total"
 
-	// MetricDeadLetteredTotal counts messages the engine gave up on: the
-	// attempts ran out, the message got too old, the handler reported the
-	// failure as unprocessable, or an interceptor refused it.
+	// MetricDeadLetteredTotal counts messages set aside: sent to a dead-letter
+	// queue because the attempts ran out, the message got too old, the handler
+	// reported the failure as unprocessable, or an interceptor refused it -- or
+	// sent to a parking queue because nothing could read it.
 	//
-	// Also visible as MetricConsumeTotal{outcome=dead_lettered}, and standing
-	// alone for the same reason: it is the counter an alert is written against.
+	// Both are here, separated by the outcome tag rather than by a metric of
+	// their own, because an operator asking "how much is this queue giving up
+	// on" wants one number that can then be split. That is Java's rule and the
+	// reason is written in MicrometerTelemetry.messageParked.
+	//
+	// Also visible as MetricConsumeTotal{outcome=dead_lettered|parked}, and
+	// standing alone for the same reason as MetricRetriedTotal: it is the
+	// counter an alert is written against.
 	MetricDeadLetteredTotal = "acemq.messages.dead.lettered.total"
 
 	// MetricSetAsideFailed counts messages that could not be moved to a
@@ -476,7 +483,11 @@ func observeConsume(o Observer, queue, outcome string) {
 	switch outcome {
 	case OutcomeRetried:
 		o.Count(MetricRetriedTotal, 1, labels)
-	case OutcomeDeadLettered:
+	case OutcomeDeadLettered, OutcomeParked:
+		// Parking counts here too, tagged apart. Both are a message set aside,
+		// and Java routes them through this one counter for that reason -- so a
+		// Go service and a Java service answer "how much is this queue giving
+		// up on" with the same number.
 		o.Count(MetricDeadLetteredTotal, 1, labels)
 	}
 }

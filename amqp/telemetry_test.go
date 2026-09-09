@@ -265,11 +265,38 @@ func TestEveryDeliveryIsCountedUnderExactlyOneOutcome(t *testing.T) {
 			" have to agree", MetricRetriedTotal, got, MetricConsumeTotal,
 			OutcomeRetried, retriedTagged)
 	}
-	deadTagged := counts[metricKey(MetricConsumeTotal,
-		map[string]string{TagQueue: "orders", TagOutcome: OutcomeDeadLettered})]
-	if got := countFor(metrics, MetricDeadLetteredTotal); got != deadTagged {
-		t.Errorf("%s = %d but %s{outcome=%s} = %d", MetricDeadLetteredTotal, got,
-			MetricConsumeTotal, OutcomeDeadLettered, deadTagged)
+	// Both outcomes that set a message aside land on this counter, tagged
+	// apart -- Java's rule, so that "how much is this queue giving up on" is
+	// one number in every language rather than one number in some of them.
+	setAsideTagged := counts[metricKey(MetricConsumeTotal,
+		map[string]string{TagQueue: "orders", TagOutcome: OutcomeDeadLettered})] +
+		counts[metricKey(MetricConsumeTotal,
+			map[string]string{TagQueue: "orders", TagOutcome: OutcomeParked})]
+	if got := countFor(metrics, MetricDeadLetteredTotal); got != setAsideTagged {
+		t.Errorf("%s = %d but %s{outcome=%s} plus {outcome=%s} = %d",
+			MetricDeadLetteredTotal, got, MetricConsumeTotal,
+			OutcomeDeadLettered, OutcomeParked, setAsideTagged)
+	}
+}
+
+// TestAParkedMessageCountsAsSetAside pins the half of the rule a
+// dead-lettering alone cannot: parking increments the same counter, tagged
+// parked. Java routes both through MicrometerTelemetry so an operator gets one
+// number; a Go service that counted only dead letters would under-report every
+// message nothing could read.
+func TestAParkedMessageCountsAsSetAside(t *testing.T) {
+	metrics := NewMetrics()
+	observeConsume(metrics, "orders", OutcomeParked)
+
+	if got := countFor(metrics, MetricDeadLetteredTotal); got != 1 {
+		t.Errorf("%s = %d, want 1 -- a parked message is a message set aside",
+			MetricDeadLetteredTotal, got)
+	}
+	tagged := metrics.Counts()[metricKey(MetricDeadLetteredTotal,
+		map[string]string{TagQueue: "orders", TagOutcome: OutcomeParked})]
+	if tagged != 1 {
+		t.Errorf("%s{outcome=%s} = %d, want 1; the two reasons have to stay"+
+			" separable", MetricDeadLetteredTotal, OutcomeParked, tagged)
 	}
 }
 
