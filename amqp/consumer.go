@@ -246,7 +246,7 @@ func handleDelivery[T any](
 	// unbounded across a fleet, and empty again after the restart that the
 	// failing service was about to have. Republishing instead of requeueing is
 	// what lets the counter live on the message, where it belongs.
-	env := EnvelopeFromWire(d.Headers, d.RoutingKey, d.MessageID)
+	env := envelopeFromDelivery(d)
 
 	observer := c.conn.observer
 	labels := map[string]string{TagQueue: c.queue}
@@ -342,6 +342,21 @@ func handleDelivery[T any](
 			Queue:    c.queue,
 			Action:   SettledDeadLettered,
 			Outcome:  OutcomeRejected,
+			Envelope: env,
+			Reason:   reason,
+		}, took)
+
+	case ackPark:
+		// The handler read far enough to know the message is unreadable. The
+		// same destination and the same word as a body the codec could not
+		// decode: whoever drains {queue}.parked is looking for the producer
+		// either way, and which layer noticed is not their question.
+		reason := "the handler parked it: " + describe(ack.err)
+		c.park(ctx, d, env, reason)
+		c.settledAfterHandler(hook, Settlement{
+			Queue:    c.queue,
+			Action:   SettledParked,
+			Outcome:  OutcomeParked,
 			Envelope: env,
 			Reason:   reason,
 		}, took)
@@ -592,6 +607,7 @@ func (c *Consumer) republish(
 		ContentType: d.ContentType,
 		MessageID:   env.ID,
 		Headers:     env.ToWire(),
+		ReplyTo:     env.ReplyTo,
 		Persistent:  true,
 		Mandatory:   true,
 	})

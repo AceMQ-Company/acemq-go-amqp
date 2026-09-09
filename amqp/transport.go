@@ -157,6 +157,15 @@ type Outbound struct {
 	MessageID   string
 	Headers     map[string]any
 
+	// ReplyTo is AMQP's own reply-to property: the queue an answer to this
+	// message should be sent to.
+	//
+	// A property rather than a header because that is where the Java and .NET
+	// libraries read it from, and a Go requester that wrote only the header
+	// could not be answered by either of them. The requester writes both; see
+	// [Envelope.ReplyTo].
+	ReplyTo string
+
 	// Persistent asks the broker to write the message to disk. It is not a
 	// guarantee on its own: a persistent message in a queue that is not durable
 	// still dies with the broker.
@@ -174,6 +183,10 @@ type Delivery struct {
 	RoutingKey  string
 	MessageID   string
 	Headers     map[string]any
+
+	// ReplyTo is AMQP's own reply-to property as it arrived, empty when the
+	// sender set none. It becomes [Envelope.ReplyTo].
+	ReplyTo string
 
 	// Redelivered is the broker saying it has handed this message over before.
 	//

@@ -44,15 +44,19 @@ func brokerFor(t *testing.T) *acemq.Conn {
 
 func TestMetricsAreServedInPrometheusFormat(t *testing.T) {
 	metrics := acemq.NewMetrics()
-	metrics.Count(acemq.MetricPublished, 3, map[string]string{"exchange": "events", "key": "order.placed"})
+	metrics.Count(acemq.MetricPublished, 3, map[string]string{
+		acemq.TagExchange: "events", acemq.TagRoutingKey: "order.placed"})
 	metrics.Gauge(acemq.MetricInFlight, 2, map[string]string{"queue": "orders"})
 	metrics.Observe(acemq.MetricHandlerDuration, 0.25, map[string]string{"queue": "orders"})
 
 	body := get(t, New(Options{Metrics: metrics}), MetricsPath).Body.String()
 
 	// Dots become underscores, and labels are rendered the way Prometheus
-	// wants rather than the way the key stores them.
-	if !strings.Contains(body, `acemq_messages_published{exchange="events",key="order.placed"} 3`) {
+	// wants rather than the way the key stores them. The label name is
+	// converted too: routing.key is a legal AceMQ tag and an illegal
+	// Prometheus label, and one dot left in place makes the whole scrape
+	// unparseable.
+	if !strings.Contains(body, `acemq_messages_published{exchange="events",routing_key="order.placed"} 3`) {
 		t.Errorf("counter not rendered:\n%s", body)
 	}
 	if !strings.Contains(body, `acemq_messages_in_flight{queue="orders"} 2`) {

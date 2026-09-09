@@ -430,6 +430,7 @@ func (t *Transport) Publish(
 		Body:         msg.Body,
 		ContentType:  msg.ContentType,
 		MessageId:    msg.MessageID,
+		ReplyTo:      msg.ReplyTo,
 		Headers:      amqp.Table(msg.Headers),
 		DeliveryMode: delivery,
 	}
@@ -685,6 +686,7 @@ func (s *subscription) run(deliveries <-chan amqp.Delivery, deliver func(acemq.D
 			ContentType: msg.ContentType,
 			RoutingKey:  msg.RoutingKey,
 			MessageID:   msg.MessageId,
+			ReplyTo:     msg.ReplyTo,
 			Headers:     map[string]any(msg.Headers),
 			Redelivered: msg.Redelivered,
 			Ack: func() error {
@@ -1060,6 +1062,7 @@ func (t *Transport) Pull(_ context.Context, queue string) (acemq.Delivery, bool,
 		ContentType: delivery.ContentType,
 		RoutingKey:  delivery.RoutingKey,
 		MessageID:   delivery.MessageId,
+		ReplyTo:     delivery.ReplyTo,
 		Headers:     map[string]any(delivery.Headers),
 		Redelivered: delivery.Redelivered,
 		Ack:         func() error { return delivery.Ack(false) },

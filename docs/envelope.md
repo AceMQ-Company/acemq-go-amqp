@@ -14,6 +14,7 @@ type Envelope struct {
 	FirstSeen     time.Time
 	Origin        string
 	Error         string
+	ReplyTo       string
 	Headers       map[string]any
 }
 ```
@@ -29,6 +30,7 @@ type Envelope struct {
 | `FirstSeen` | when it was first published | now |
 | `Origin` | the publishing process | `acemq@{hostname}` |
 | `Error` | why it was dead-lettered | empty |
+| `ReplyTo` | where an answer should go | empty |
 | `Headers` | your own headers | empty |
 
 Those defaults are part of the wire contract rather than conveniences. A port
@@ -49,6 +51,10 @@ content.
 | `x-acemq-first-seen` | `FirstSeen`, epoch milliseconds |
 | `x-acemq-origin` | `Origin`, omitted when empty |
 | `x-acemq-error` | `Error`, omitted when empty. Present only in a dead-letter queue. |
+
+`ReplyTo` is deliberately not in that table. It is AMQP's own `reply-to`
+*property* rather than a header, which is where Java and .NET read it from — see
+[where the reply address travels](patterns.md#where-the-reply-address-travels).
 
 **An absent value is an absent header, never a null one.** Java omits
 `x-acemq-causation` entirely when there is no causation, and a port that writes

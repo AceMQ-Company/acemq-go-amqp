@@ -34,7 +34,7 @@ that never reads metrics does not pay for them.
 | `acemq.messages.retried` | another attempt was actually scheduled |
 | `acemq.messages.rejected` | the handler gave up on it by name |
 | `acemq.messages.dead.lettered` | the engine gave up on it |
-| `acemq.messages.parked` | nothing could decode it |
+| `acemq.messages.parked` | nothing could read it |
 | `acemq.handler.duration` | seconds per message, tagged `outcome` |
 | `acemq.messages.in.flight` | being handled right now |
 | `acemq.outbox.total` | outbox records the relay handled, tagged `outcome` |
@@ -48,6 +48,29 @@ settle on its own.
 `acemq.messages.dead.lettered` is the one to alert on. It is the count of
 messages that are gone.
 
+### The tag names
+
+| Tag | On | |
+|---|---|---|
+| `queue` | the consume metrics | the queue the delivery arrived on |
+| `outcome` | the consume and outbox metrics | what the engine did |
+| `exchange` | the publish and outbox metrics | where it was sent |
+| `routing.key` | the publish and outbox metrics | the key it went out under |
+| `rung` | `acemq.retry.rung.missing` | the rung queue that is not there |
+| `target` | `acemq.messages.set.aside.failed` | the queue it could not be moved to |
+
+> **`routing.key` was `key` until this release.** Java and .NET already wrote
+> `routing.key`; Go and Python wrote `key`, and neither reading was wrong. The
+> fully-qualified name says *which* key it means next to a tag called `queue`,
+> and Java is the library the others are ported from, so the two moved rather
+> than the four staying split. **A dashboard that groups publishes by `key` has
+> to be edited.** Python is making the same change.
+>
+> The Prometheus endpoint in `actuator` converts label names the way it already
+> converted metric names, so `routing.key` is scraped as `routing_key`. A dot is
+> legal in an AceMQ tag and illegal in a Prometheus label; left in place it would
+> have made the whole scrape unparseable rather than one label wrong.
+
 ### The outcome is the engine's decision, not the handler's request
 
 Every delivery increments `acemq.messages.consumed` exactly once and exactly one
@@ -60,7 +83,7 @@ words:
 | `retried` | another attempt was scheduled |
 | `rejected` | the handler gave up on it by name |
 | `dead_lettered` | the attempts ran out, the message aged out, the failure was marked unprocessable, or an interceptor refused it |
-| `parked` | nothing could decode the body |
+| `parked` | nothing could read it: the codec refused the body, or the handler returned `acemq.Park` |
 
 It is the same word the tracing adapter puts on that delivery's span as
 `messaging.acemq.outcome`, taken from the same `acemq.Settlement`, so a dashboard
@@ -182,11 +205,31 @@ writes the same set.
 
 `unroutable`, `failed` and `dead_lettered` set the span status to `ERROR`.
 
-`acked`, `retried`, `rejected`, `confirmed`, `published`, `answered` and
-`timed_out` do not. A retry is the system working — the message will be tried
+`acked`, `retried`, `rejected`, `parked`, `confirmed`, `published`, `answered`
+and `timed_out` do not. A retry is the system working — the message will be tried
 again and very often succeeds — and a message the handler refused on purpose is a
 decision rather than a fault. Marking either as an error is how a trace view
 fills with red and stops meaning anything.
+
+### Every failure has an outcome
+
+`Span.Failed` writes `messaging.acemq.outcome = failed` as well as recording the
+exception and the `ERROR` status. Before this release it wrote neither the
+attribute nor anything else a query could group by, so a publish that threw was
+counted as `failed` and carried a span with no outcome at all — the counter and
+the trace disagreeing about the same message, which is the one thing this shared
+vocabulary exists to prevent.
+
+An outcome named out loud wins, whichever order the two calls come in:
+
+```go
+span.Outcome(otel.OutcomeTimedOut)   // a request that ran out of time
+span.Failed(err)                     // still timed_out, not failed
+```
+
+`timed_out` and `unroutable` are both more useful than `failed`, and only a
+failure nobody has a better word for is called `failed`. Java's adapter was
+fixed the same way; Python already did it.
 
 ### Events rather than spans
 

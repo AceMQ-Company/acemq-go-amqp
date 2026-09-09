@@ -227,6 +227,11 @@ func Handle[T any](t *Tracing, queue string, next acemq.Handler[T]) acemq.Handle
 				span.Outcome(OutcomeRetried).Note(ack.Err())
 			case "reject":
 				span.Outcome(OutcomeRejected).Note(ack.Err())
+			case "park":
+				// Not an error either. A message nothing could read is a
+				// producer's problem, and the span says so by its outcome
+				// rather than by a red row in a trace view.
+				span.Outcome(OutcomeParked).Note(ack.Err())
 			default:
 				span.Outcome(OutcomeAcked)
 			}

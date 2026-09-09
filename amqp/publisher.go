@@ -150,10 +150,11 @@ func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (Pu
 		ContentType: p.codec.ContentType(),
 		MessageID:   env.ID,
 		Headers:     env.ToWire(),
+		ReplyTo:     env.ReplyTo,
 		Persistent:  p.persistent,
 		Mandatory:   p.mandatory,
 	})
-	labels := map[string]string{"exchange": exchange, "key": routingKey}
+	labels := map[string]string{TagExchange: exchange, TagRoutingKey: routingKey}
 	if err != nil {
 		p.conn.observer.Count(MetricPublishFailed, 1, labels)
 		return result, err

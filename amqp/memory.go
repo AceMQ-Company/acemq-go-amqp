@@ -241,6 +241,7 @@ func (t *memTransport) Publish(
 			contentType: msg.ContentType,
 			messageID:   msg.MessageID,
 			routingKey:  routingKey,
+			replyTo:     msg.ReplyTo,
 			headers:     copyHeaders(msg.Headers),
 		})
 	}
@@ -346,6 +347,7 @@ type memMsg struct {
 	contentType string
 	messageID   string
 	routingKey  string
+	replyTo     string
 	headers     map[string]any
 	redelivered bool
 }
@@ -451,6 +453,7 @@ func (s *memSubscription) run(deliver func(Delivery)) {
 			ContentType: msg.contentType,
 			RoutingKey:  msg.routingKey,
 			MessageID:   msg.messageID,
+			ReplyTo:     msg.replyTo,
 			Headers:     copyHeaders(msg.headers),
 			Redelivered: msg.redelivered,
 			Ack: func() error {
@@ -594,6 +597,7 @@ func (t *memTransport) Pull(_ context.Context, queue string) (Delivery, bool, er
 		ContentType: msg.contentType,
 		RoutingKey:  msg.routingKey,
 		MessageID:   msg.messageID,
+		ReplyTo:     msg.replyTo,
 		Headers:     copyHeaders(msg.headers),
 		Redelivered: msg.redelivered,
 		Ack:         func() error { settled.Do(func() {}); return nil },

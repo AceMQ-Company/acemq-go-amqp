@@ -32,7 +32,7 @@ afterwards:
 | | |
 |---|---|
 | `{queue}.dlq` | attempts exhausted, too old, rejected, or a fatal reason |
-| `{queue}.parked` | never reached the handler — usually a body that would not decode |
+| `{queue}.parked` | nobody could read it — a body that would not decode, or a handler that returned `acemq.Park` |
 
 Acknowledging a message that failed looks wrong and is what makes this reliable:
 the message has already been safely republished somewhere else, so acknowledging

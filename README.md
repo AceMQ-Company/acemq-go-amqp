@@ -79,6 +79,7 @@ forgets to decide does not compile:
 | `acemq.Accept()` | it worked; the message is gone |
 | `acemq.Retry(err)` | try again, if the policy allows another attempt |
 | `acemq.Reject(err)` | never try again; dead-letter it |
+| `acemq.Park(err)` | nobody could read it; send it to `{queue}.parked` |
 
 `acemq.Fatal(err)` marks a reason that retrying cannot fix. A `Retry` carrying a
 fatal reason is dead-lettered immediately, because the remaining attempts would

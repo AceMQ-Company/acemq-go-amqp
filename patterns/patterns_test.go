@@ -16,6 +16,7 @@ package patterns_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -1130,4 +1131,182 @@ func TestReplayingAnEmptyQueueSaysSo(t *testing.T) {
 	if result.Reason != "drained" {
 		t.Errorf("Reason = %q, want drained", result.Reason)
 	}
+}
+
+// ---- the reply address, both ways ------------------------------------
+//
+// The family did not agree on where the reply address lives. Go, Python and
+// Ruby wrote the acemq-reply-to application header; Java and .NET read AMQP's
+// own reply-to property, and neither could answer the other. All five now write
+// both and read either, header first — so these two tests are the interop, one
+// per convention, with no requester involved on the sending side because the
+// point is a request that arrived from somewhere that is not this library.
+
+// TestARequestCarryingOnlyTheNativePropertyIsAnswered is a Java or .NET
+// requester as this library sees it: reply-to on the message, no header.
+func TestARequestCarryingOnlyTheNativePropertyIsAnswered(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	for _, queue := range []string{"prices", "replies"} {
+		if err := mq.DeclareQueue(ctx, queue); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	responder, err := patterns.Serve(ctx, mq, "prices",
+		func(_ context.Context, m acemq.Message[PriceRequest]) (PriceResponse, error) {
+			return PriceResponse{Cents: 1250}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer responder.Close()
+
+	if err := acemq.NewPublisher[PriceRequest](mq, "", "prices").
+		Send(ctx, PriceRequest{SKU: "abc"},
+			acemq.CorrelationID("corr-native"),
+			acemq.ReplyTo("replies")); err != nil {
+		t.Fatal(err)
+	}
+
+	answer := awaitReply(t, mq, "replies")
+	if answer.Payload.Cents != 1250 {
+		t.Errorf("Cents = %d, want 1250", answer.Payload.Cents)
+	}
+	if answer.Envelope.CorrelationID != "corr-native" {
+		t.Errorf("CorrelationID = %q, want corr-native", answer.Envelope.CorrelationID)
+	}
+}
+
+// TestARequestCarryingOnlyTheHeaderIsAnswered is every AceMQ requester written
+// before the property was written as well, including this library's own.
+func TestARequestCarryingOnlyTheHeaderIsAnswered(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	for _, queue := range []string{"prices", "replies"} {
+		if err := mq.DeclareQueue(ctx, queue); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	responder, err := patterns.Serve(ctx, mq, "prices",
+		func(_ context.Context, m acemq.Message[PriceRequest]) (PriceResponse, error) {
+			return PriceResponse{Cents: 99}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer responder.Close()
+
+	if err := acemq.NewPublisher[PriceRequest](mq, "", "prices").
+		Send(ctx, PriceRequest{SKU: "abc"},
+			acemq.CorrelationID("corr-header"),
+			acemq.Header(patterns.HeaderReplyTo, "replies")); err != nil {
+		t.Fatal(err)
+	}
+
+	answer := awaitReply(t, mq, "replies")
+	if answer.Payload.Cents != 99 {
+		t.Errorf("Cents = %d, want 99", answer.Payload.Cents)
+	}
+}
+
+// TestARequesterWritesTheAddressBothWays is the other direction: a Java or
+// .NET responder reads the property and never looks at the header, so a request
+// this library sends has to carry it.
+func TestARequesterWritesTheAddressBothWays(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	if err := mq.DeclareQueue(ctx, "prices"); err != nil {
+		t.Fatal(err)
+	}
+
+	// No responder: the request stays on the queue to be read off the wire.
+	requester, err := patterns.NewRequester[PriceRequest, PriceResponse](
+		ctx, mq, "", "prices", patterns.Timeout(50*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer requester.Close()
+
+	if _, err := requester.Do(ctx, PriceRequest{SKU: "abc"}); !errors.Is(
+		err, patterns.ErrRequestTimedOut) {
+		t.Fatalf("got %v, want the request to time out unanswered", err)
+	}
+
+	request, found, err := mq.Pull(ctx, "prices")
+	if err != nil || !found {
+		t.Fatalf("the request is not on the queue: %v", err)
+	}
+	defer func() { _ = request.Ack() }()
+
+	if got := request.Envelope.ReplyTo; got != requester.ReplyQueue() {
+		t.Errorf("reply-to property = %q, want %q", got, requester.ReplyQueue())
+	}
+	if got, _ := request.Envelope.Headers[patterns.HeaderReplyTo].(string); got != requester.ReplyQueue() {
+		t.Errorf("%s header = %q, want %q", patterns.HeaderReplyTo, got, requester.ReplyQueue())
+	}
+}
+
+// TestTheHeaderWinsWhenTheTwoDisagree pins the order, which is the same in all
+// five libraries. The header is the one that survives a service rebuilding the
+// message, so where they differ it is the more recent of the two.
+func TestTheHeaderWinsWhenTheTwoDisagree(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	for _, queue := range []string{"prices", "replies", "stale"} {
+		if err := mq.DeclareQueue(ctx, queue); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	responder, err := patterns.Serve(ctx, mq, "prices",
+		func(_ context.Context, m acemq.Message[PriceRequest]) (PriceResponse, error) {
+			return PriceResponse{Cents: 7}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer responder.Close()
+
+	if err := acemq.NewPublisher[PriceRequest](mq, "", "prices").
+		Send(ctx, PriceRequest{SKU: "abc"},
+			acemq.ReplyTo("stale"),
+			acemq.Header(patterns.HeaderReplyTo, "replies")); err != nil {
+		t.Fatal(err)
+	}
+
+	if answer := awaitReply(t, mq, "replies"); answer.Payload.Cents != 7 {
+		t.Errorf("Cents = %d, want 7", answer.Payload.Cents)
+	}
+	if n, err := mq.MessageCount(ctx, "stale"); err != nil || n != 0 {
+		t.Errorf("the reply went to the property's queue: %d messages (%v)", n, err)
+	}
+}
+
+// awaitReply takes the one answer off a reply queue and decodes it.
+func awaitReply(t *testing.T, mq *acemq.Conn, queue string) acemq.Message[PriceResponse] {
+	t.Helper()
+	ctx := context.Background()
+
+	waitFor(t, "the reply", func() bool {
+		n, err := mq.MessageCount(ctx, queue)
+		return err == nil && n == 1
+	})
+
+	pulled, found, err := mq.Pull(ctx, queue)
+	if err != nil || !found {
+		t.Fatalf("no reply on %q: %v", queue, err)
+	}
+	defer func() { _ = pulled.Ack() }()
+
+	var payload PriceResponse
+	if err := json.Unmarshal(pulled.Body, &payload); err != nil {
+		t.Fatalf("the reply body did not decode: %v", err)
+	}
+	return acemq.Message[PriceResponse]{Payload: payload, Envelope: pulled.Envelope}
 }

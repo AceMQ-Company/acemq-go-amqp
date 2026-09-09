@@ -233,6 +233,12 @@ func (a *Actuator) info(w http.ResponseWriter, _ *http.Request) {
 // splitKey pulls a metric key apart into its name and its Prometheus labels.
 //
 // The key is built as name{k=v}{k=v}; Prometheus wants name{k="v",k="v"}.
+//
+// Label names go through [prometheusName] as the metric name does. A dot is
+// legal in an AceMQ tag and illegal in a Prometheus label, and routing.key —
+// which is what every library in the family now calls it — is exactly such a
+// tag; emitted verbatim it would make the whole scrape unparseable rather than
+// one label wrong.
 func splitKey(key string) (string, string) {
 	open := strings.Index(key, "{")
 	if open < 0 {
@@ -250,7 +256,7 @@ func splitKey(key string) (string, string) {
 		if !found {
 			continue
 		}
-		pairs = append(pairs, fmt.Sprintf("%s=%q", k, v))
+		pairs = append(pairs, fmt.Sprintf("%s=%q", prometheusName(k), v))
 	}
 	if len(pairs) == 0 {
 		return name, ""

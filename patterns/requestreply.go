@@ -185,10 +185,14 @@ func (r *Requester[Req, Resp]) Do(ctx context.Context, request Req, opts ...acem
 		r.pendingMu.Unlock()
 	}()
 
-	all := make([]acemq.EnvelopeOption, 0, len(opts)+2)
+	// The reply address goes out twice, to the same queue: as AMQP's own
+	// reply-to property and as the acemq-reply-to header. Write both, read
+	// either — see [HeaderReplyTo].
+	all := make([]acemq.EnvelopeOption, 0, len(opts)+3)
 	all = append(all, opts...)
 	all = append(all,
 		acemq.CorrelationID(correlation),
+		acemq.ReplyTo(r.replyQueue),
 		acemq.Header(HeaderReplyTo, r.replyQueue))
 
 	if err := r.publisher.Send(ctx, request, all...); err != nil {
@@ -229,14 +233,39 @@ func (r *Requester[Req, Resp]) Close() error {
 
 // HeaderReplyTo names the queue a responder should reply to.
 //
-// An application header rather than AMQP's own reply-to property, because it
-// then travels through the same envelope machinery as everything else and
-// survives a hop through a service that rebuilds the message.
+// An application header as well as AMQP's own reply-to property, and never
+// instead of it. The header travels through the same envelope machinery as
+// everything else and survives a hop through a service that rebuilds the
+// message; the property is what the Java and .NET responders read, and a Go
+// requester that wrote only the header could not be answered by either of them.
+//
+// The rule is the same in all five libraries: a requester writes both, to the
+// same queue, and a responder reads the header first and falls back to the
+// property when it is absent. Header first because it is the one that survives
+// a rebuild — a service that reconstructed the message kept the headers and lost
+// the properties, so where the two disagree the header is the more recent truth.
 //
 // It deliberately does not carry the x-acemq- prefix. That namespace belongs to
 // the engine: headers in it are stripped before a handler sees them, so a
 // responder could never read this one.
 const HeaderReplyTo = "acemq-reply-to"
+
+// replyAddress is where an answer to this request should go, reading the
+// acemq-reply-to header first and AMQP's own reply-to property second.
+//
+// Empty means the request named nowhere at all, which is a request published by
+// something that was not expecting an answer.
+func replyAddress[Req any](m acemq.Message[Req]) string {
+	if header, ok := m.Envelope.Headers[HeaderReplyTo].(string); ok && header != "" {
+		return header
+	}
+	if raw, ok := m.Envelope.Headers[HeaderReplyTo].([]byte); ok && len(raw) > 0 {
+		// A long string written by another client can arrive as bytes, the same
+		// way every other header can. See acemq.Envelope.
+		return string(raw)
+	}
+	return m.Envelope.ReplyTo
+}
 
 // HeaderError carries a responder's failure back to the requester.
 const HeaderError = "acemq-error"
@@ -264,12 +293,13 @@ func Serve[Req, Resp any](
 ) (*Responder, error) {
 	consumer, err := acemq.Consume(ctx, conn, queue,
 		func(ctx context.Context, m acemq.Message[Req]) acemq.Ack {
-			replyTo, _ := m.Envelope.Headers[HeaderReplyTo].(string)
+			replyTo := replyAddress(m)
 			if replyTo == "" {
 				// Nothing to reply to. Retrying cannot make a reply queue
 				// appear, so this is dead-lettered rather than looped.
 				return acemq.Reject(acemq.Fatalf(
-					"acemq: request %s carries no %s header, so there is nowhere to reply",
+					"acemq: request %s carries neither a %s header nor a reply-to "+
+						"property, so there is nowhere to reply",
 					m.Envelope.ID, HeaderReplyTo))
 			}
 

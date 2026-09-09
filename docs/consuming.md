@@ -25,6 +25,7 @@ Go 1.27.
 | `acemq.Accept()` | it worked. The message is acknowledged and gone. |
 | `acemq.Retry(err)` | try again, if the policy allows another attempt |
 | `acemq.Reject(err)` | never try again. Dead-letter it. |
+| `acemq.Park(err)` | nobody could read it. Send it to `{queue}.parked`. |
 
 Returning the decision rather than calling a method means a handler that forgets
 to decide does not compile. That matters more than it sounds: a message nobody
@@ -55,6 +56,35 @@ A `Retry` carrying a reason marked with `Fatal` is dead-lettered immediately.
 The mark wins over the request, which is the point of having it. `Fatal` looks
 through wrapping, so an error marked deep inside a call still reads as fatal
 where the engine asks.
+
+### Reject or park?
+
+Both are final and neither is retried. What differs is where the message ends up
+and therefore who has to look at it.
+
+`{queue}.dlq` is a queue of *work that failed*, and somebody drains it looking
+for a broker or a downstream that has since recovered. `{queue}.parked` is a
+queue of *messages nobody could read*, and somebody drains it looking for the
+producer that sent them. Mixing the two makes both drains guesswork.
+
+The engine parks a body the codec would not decode by itself, before any handler
+runs. `acemq.Park` is the same destination and the same reporting — `parked` on
+the counter and on the span — for a handler that decoded the message fine and
+only then found it unreadable:
+
+```go
+func handle(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+	if m.Envelope.Version > supported {
+		return acemq.Park(fmt.Errorf(
+			"schema version %d, and this service understands %d",
+			m.Envelope.Version, supported))
+	}
+	...
+}
+```
+
+.NET has had `Ack.Park` since its first release; Python and Ruby are adding
+theirs alongside this one.
 
 ## What the handler receives
 

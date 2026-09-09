@@ -346,7 +346,7 @@ func (c *Conn) Pull(ctx context.Context, queue string) (*Pulled, bool, error) {
 	}
 
 	return &Pulled{
-		Envelope:    EnvelopeFromWire(delivery.Headers, delivery.RoutingKey, delivery.MessageID),
+		Envelope:    envelopeFromDelivery(delivery),
 		Body:        delivery.Body,
 		ContentType: delivery.ContentType,
 		RoutingKey:  delivery.RoutingKey,

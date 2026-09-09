@@ -59,6 +59,14 @@ type Envelope struct {
 	// Error says why the message was dead-lettered, when it was.
 	Error string
 
+	// ReplyTo is the queue an answer to this message should be sent to.
+	//
+	// It travels as AMQP's own reply-to property rather than as a header, which
+	// is where the Java and .NET libraries look for it. Nothing in this package
+	// reads it; the patterns package's Serve does, after its own acemq-reply-to
+	// header. See [ReplyTo].
+	ReplyTo string
+
 	// Headers are the application's own. Never contains anything in the reserved
 	// namespace.
 	Headers map[string]any
@@ -116,6 +124,16 @@ func FirstSeen(t time.Time) EnvelopeOption {
 // Origin names the publishing process. Defaults to acemq@{hostname}.
 func Origin(origin string) EnvelopeOption {
 	return func(b *envelopeBuilder) error { b.env.Origin = origin; return nil }
+}
+
+// ReplyTo names the queue an answer to this message should go to, as AMQP's own
+// reply-to property.
+//
+// A requester built by the patterns package sets this and the acemq-reply-to
+// header to the same queue, so a responder written against either convention
+// can answer it. Set it directly only when publishing a request by hand.
+func ReplyTo(queue string) EnvelopeOption {
+	return func(b *envelopeBuilder) error { b.env.ReplyTo = queue; return nil }
 }
 
 // DeadLetterReason records why a message was dead-lettered.
@@ -229,7 +247,23 @@ func EnvelopeFromWire(headers map[string]any, routingKey, messageID string) Enve
 	}
 }
 
+// envelopeFromDelivery is [EnvelopeFromWire] with the delivery's own AMQP
+// properties folded in.
+//
+// reply-to is a property and not a header, so it cannot come out of the header
+// map [EnvelopeFromWire] is handed. Adding a parameter to an exported function
+// that applications and the wire fixtures already call would be a worse trade
+// than this one line.
+func envelopeFromDelivery(d Delivery) Envelope {
+	env := EnvelopeFromWire(d.Headers, d.RoutingKey, d.MessageID)
+	env.ReplyTo = d.ReplyTo
+	return env
+}
+
 // ToWire renders the envelope as the headers to put on the message.
+//
+// ReplyTo is deliberately absent: it is an AMQP property, carried on
+// [Outbound.ReplyTo] rather than among the headers.
 //
 // An absent value is an absent header, never a null one. The Java
 // implementation omits x-acemq-causation entirely when there is no causation

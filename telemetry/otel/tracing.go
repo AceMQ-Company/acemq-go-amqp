@@ -83,6 +83,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
@@ -180,9 +181,11 @@ const (
 	// OutcomeDeadLettered is a message that ran out of attempts or was given up on.
 	OutcomeDeadLettered = acemq.OutcomeDeadLettered
 
-	// OutcomeParked is a message nothing could decode. It never reaches a
-	// handler, so it never appears on a consume span — it is here so that the
-	// outcome vocabulary a reader sees in one place is the whole of it.
+	// OutcomeParked is a message nothing could read: one the codec could not
+	// decode, which never reaches a handler at all, or one a handler returned
+	// [acemq.Park] for because it got further before finding out. Only the
+	// second appears on a consume span, because only the second had a handler
+	// to open one.
 	OutcomeParked = acemq.OutcomeParked
 
 	// OutcomeAnswered is a request that got its reply.
@@ -318,6 +321,12 @@ func (t *Tracing) System() string { return t.system }
 type Span struct {
 	span trace.Span
 	once sync.Once
+
+	// named records that somebody called [Span.Outcome], so that [Span.Failed]
+	// does not write failed over a word that was chosen deliberately. A request
+	// that ran out of time is timed_out and not failed, and the caller is the
+	// only one that knows which.
+	named atomic.Bool
 }
 
 // Span is the OpenTelemetry span underneath, for an attribute this adapter does
@@ -330,6 +339,7 @@ func (s *Span) Outcome(outcome string) *Span {
 	if s == nil || !s.span.IsRecording() {
 		return s
 	}
+	s.named.Store(true)
 	s.span.SetAttributes(attribute.String(AttrOutcome, outcome))
 	if failingOutcomes[outcome] {
 		s.span.SetStatus(codes.Error, outcome)
@@ -337,11 +347,25 @@ func (s *Span) Outcome(outcome string) *Span {
 	return s
 }
 
-// Failed records that the operation threw, as an exception event and an error
-// status.
+// Failed records that the operation threw, as an exception event, an error
+// status, and an outcome of failed.
+//
+// The outcome is written here because a span without one is a span a dashboard
+// cannot find. A publish that threw used to leave the counter tagged failed and
+// the span carrying no messaging.acemq.outcome at all, so the two disagreed
+// about the same message — which is the whole thing this vocabulary exists to
+// prevent.
+//
+// An outcome named through [Span.Outcome] wins, whichever order the two are
+// called in. A request that ran out of time is timed_out and a message that
+// reached no queue is unroutable, and both are more useful than failed; only a
+// failure nobody has a better word for is called failed.
 func (s *Span) Failed(err error) *Span {
 	if s == nil || !s.span.IsRecording() {
 		return s
+	}
+	if !s.named.Load() {
+		s.span.SetAttributes(attribute.String(AttrOutcome, OutcomeFailed))
 	}
 	if err == nil {
 		s.span.SetStatus(codes.Error, "failed")

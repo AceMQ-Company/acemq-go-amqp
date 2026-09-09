@@ -56,6 +56,37 @@ queue to be neither exclusive nor auto-deleting.
 is durable, so it is quorum like any other durable queue — see [quorum, classic
 and streams](topology.md#quorum-classic-and-streams).
 
+### Where the reply address travels
+
+**Write both, read either.** A request carries the reply queue twice, in the same
+two places in all five AceMQ libraries:
+
+| | |
+|---|---|
+| the `acemq-reply-to` application header | travels through the envelope machinery and survives a hop through a service that rebuilds the message |
+| AMQP's own `reply-to` property | what Java's and .NET's responders read |
+
+`patterns.Serve` reads the header first and falls back to the property when the
+header is absent, so it answers a request from any of the five. `Requester.Do`
+writes both, to the same queue, so any of the five can answer one of ours.
+
+Header first because it is the half that survives a rebuild: a service that
+reconstructed the message kept the headers and lost the properties, so where the
+two disagree the header is the more recent of the two.
+
+Publishing a request by hand rather than through a `Requester` means writing them
+yourself:
+
+```go
+err := acemq.NewPublisher[PriceRequest](mq, "", "prices").
+	Send(ctx, request,
+		acemq.ReplyTo("my-replies"),
+		acemq.Header(patterns.HeaderReplyTo, "my-replies"))
+```
+
+A request carrying neither is dead-lettered rather than retried: retrying cannot
+make a reply address appear.
+
 ## Idempotency
 
 ```go

@@ -10,6 +10,28 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **A handler can park a message.** `acemq.Park(err)` joins `Accept`, `Retry` and
+  `Reject` in the vocabulary a handler returns. The engine could already park —
+  it does so for a body no codec would decode — but a handler could not ask for
+  it, so a handler that knew a message was unreadable had to `Reject` it into the
+  dead letters and lose the distinction the parked queue exists to make.
+
+  `{queue}.dlq` is a queue of work that failed, drained by somebody looking for a
+  broker or a downstream that has since recovered. `{queue}.parked` is a queue of
+  messages nobody could read, drained by somebody looking for the producer that
+  sent them. A parked message settles to `{queue}.parked` with the handler's
+  reason attached, counts as `acemq.messages.parked`, and carries
+  `messaging.acemq.outcome = parked` on its span — the same reporting the engine's
+  own parking gets, because which layer noticed is not the drainer's question.
+
+  .NET has had `Ack.Park` since its first release; Python and Ruby are adding
+  theirs alongside this one. See
+  [docs/consuming.md](docs/consuming.md#reject-or-park).
+
+- **`acemq.ReplyTo` and `Envelope.ReplyTo`**, which write and read AMQP's own
+  `reply-to` property. `Outbound` and `Delivery` carry it, and both transports
+  put it on the wire and take it off. See the request/reply entry under Fixed.
+
 - **`pipeline.run_finished` is written by the library rather than only being
   callable.** `patterns.InPipeline` and `patterns.AtStep` name a `patterns.Then`
   or a `patterns.FollowSlip`, and a named step writes the event onto the
@@ -129,6 +151,25 @@ While the version is `0.x` the public API may change in any release.
 
 ### Changed
 
+- **The publish metric tag `key` is now `routing.key`. This changes a label an
+  existing dashboard may group by.** Java and .NET already wrote `routing.key`;
+  this library and Python wrote `key`. Neither reading was wrong, but the
+  fully-qualified name says *which* key it means next to a tag called `queue`,
+  and Java is the library the others are ported from — so the two moved rather
+  than the four staying split. Python is making the same change. The tag is on
+  `acemq.messages.published`, `acemq.messages.publish.failed`,
+  `acemq.outbox.total` and `acemq.outbox.lag`, and is `acemq.TagRoutingKey` in
+  code.
+
+  **A dashboard that groups publishes by `key` has to be edited.** The counters
+  themselves are unchanged; only the label name moved.
+
+  The Prometheus endpoint in `actuator` now converts label names the way it
+  already converted metric names, so `routing.key` is scraped as `routing_key`. A
+  dot is legal in an AceMQ tag and illegal in a Prometheus label; emitted
+  verbatim it would have made the whole scrape unparseable rather than one label
+  wrong. Any tag of your own carrying a dot or a dash is converted too.
+
 - **The consume counters classify by the engine's decision, not the handler's
   request. This changes numbers an existing dashboard may rely on.** A handler
   asking for a retry is a request: the engine still has to look at the policy,
@@ -218,6 +259,37 @@ While the version is `0.x` the public API may change in any release.
   which those bodies are refused rather than misread.
 
 ### Fixed
+
+- **A Java or .NET requester and a Go responder can talk.** They could not.
+  This library, Python and Ruby put the reply address in the `acemq-reply-to`
+  application header; Java and .NET read AMQP's own `reply-to` property. Neither
+  side looked where the other wrote, so a cross-language request was
+  dead-lettered as having nowhere to reply — and no fixture covered it, which is
+  why it survived this long.
+
+  The rule now, in all five libraries: **write both, read either.**
+  `Requester.Do` sets the native `reply-to` property *and* the `acemq-reply-to`
+  header, to the same queue. `patterns.Serve` reads the header first and falls
+  back to the property when the header is absent. Header first because it is the
+  half that survives a rebuild — a service that reconstructed the message kept the
+  headers and lost the properties — so where the two disagree the header is the
+  more recent of the two.
+
+  Nothing has to be changed in an application that uses `NewRequester` and
+  `Serve`. A request published by hand should now carry both; see
+  [docs/patterns.md](docs/patterns.md#where-the-reply-address-travels).
+
+- **`telemetry/otel`: a failure with no outcome.** `Span.Failed` recorded the
+  exception and the `ERROR` status and wrote no `messaging.acemq.outcome` at all,
+  so a publish that threw was counted as `failed` and carried a span a query
+  filtered on outcomes could not find — the counter and the trace disagreeing
+  about the same message, which is the one thing that vocabulary exists to
+  prevent. `Failed` now writes `outcome = failed` as well.
+
+  An outcome named through `Span.Outcome` still wins, whichever order the two
+  calls come in, so a request that ran out of time stays `timed_out` and an
+  unroutable message stays `unroutable`. Java's adapter was fixed the same way;
+  Python already did it.
 
 - **`codec/yaml` reads `text/x-yaml` again.** `CanDecode` matched
   `application/x-yaml` and `text/yaml` but not `text/x-yaml`, which the Java,

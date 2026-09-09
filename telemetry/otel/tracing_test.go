@@ -1185,3 +1185,170 @@ func consumedOutcome(key string) (string, bool) {
 	}
 	return rest[:end], true
 }
+
+// TestAFailureNobodyNamedIsCalledFailed closes the gap between the counter and
+// the trace. A publish that threw was recorded as an exception with an error
+// status and no messaging.acemq.outcome at all, so the counter said failed and
+// the span said nothing — and a trace search for failed publishes found none of
+// them.
+func TestAFailureNobodyNamedIsCalledFailed(t *testing.T) {
+	r := record(t)
+
+	_, span := r.tracing.StartRequest(context.Background(), "pricing")
+	span.Failed(errors.New("the responder blew up"))
+	span.End()
+
+	got := r.named(t, "pricing request")
+	if value := attr(t, got, tracing.AttrOutcome).AsString(); value != tracing.OutcomeFailed {
+		t.Errorf("%s = %q, want failed", tracing.AttrOutcome, value)
+	}
+	if got.Status.Code != codes.Error {
+		t.Errorf("status = %v, want error", got.Status.Code)
+	}
+	if !hasEvent(got, "exception") {
+		t.Error("the exception was not recorded")
+	}
+}
+
+// TestAnOutcomeSaidOutLoudBeatsFailed is why Failed does not simply overwrite.
+// A request that ran out of time is timed_out and a message that reached no
+// queue is unroutable; both are more useful than failed, and both are followed
+// by a Failed call that must not flatten them.
+func TestAnOutcomeSaidOutLoudBeatsFailed(t *testing.T) {
+	cases := []struct {
+		name  string
+		first bool // whether Outcome is called before Failed
+	}{
+		{"outcome then failed", true},
+		{"failed then outcome", false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := record(t)
+
+			_, span := r.tracing.StartRequest(context.Background(), "pricing")
+			if c.first {
+				span.Outcome(tracing.OutcomeTimedOut)
+				span.Failed(errors.New("deadline"))
+			} else {
+				span.Failed(errors.New("deadline"))
+				span.Outcome(tracing.OutcomeTimedOut)
+			}
+			span.End()
+
+			got := r.named(t, "pricing request")
+			if value := attr(t, got, tracing.AttrOutcome).AsString(); value != tracing.OutcomeTimedOut {
+				t.Errorf("%s = %q, want timed_out", tracing.AttrOutcome, value)
+			}
+		})
+	}
+}
+
+// TestFailedOnASpanNobodyIsRecordingIsHarmless keeps the nil and non-recording
+// guards honest, because a library that panics inside instrumentation is worse
+// than one that measures nothing.
+func TestFailedOnASpanNobodyIsRecordingIsHarmless(t *testing.T) {
+	var none *tracing.Span
+	none.Failed(errors.New("nothing here"))
+	none.Outcome(tracing.OutcomeFailed)
+	none.End()
+}
+
+// TestAHandlerThatParksIsNotAFailure covers the outcome a handler can now ask
+// for. A message nothing could read is a producer's problem: the span says
+// parked, and it is not red.
+func TestAHandlerThatParksIsNotAFailure(t *testing.T) {
+	r := record(t)
+
+	handler := tracing.Handle(r.tracing, "orders",
+		func(context.Context, acemq.Message[OrderPlaced]) acemq.Ack {
+			return acemq.Park(errors.New("schema version 9 is from a future nobody deployed"))
+		})
+	handler(context.Background(), acemq.Message[OrderPlaced]{
+		Envelope: acemq.Envelope{ID: "m-1", Attempt: 1},
+	})
+
+	span := r.named(t, "orders process")
+	if got := attr(t, span, tracing.AttrOutcome).AsString(); got != tracing.OutcomeParked {
+		t.Errorf("%s = %q, want parked", tracing.AttrOutcome, got)
+	}
+	if span.Status.Code != codes.Unset {
+		t.Errorf("status = %v, want unset: an unreadable message is not this service failing",
+			span.Status.Code)
+	}
+	if !hasEvent(span, "exception") {
+		t.Error("the reason the handler gave was not carried")
+	}
+}
+
+// TestAParkedDeliveryUnderTheEngineReportsParkedOnBothSides is the counter and
+// the span answering with the same word for the same delivery, which is the
+// arrangement the settlement seam exists to hold up.
+func TestAParkedDeliveryUnderTheEngineReportsParkedOnBothSides(t *testing.T) {
+	ctx := context.Background()
+	r := record(t)
+	metrics := acemq.NewMetrics()
+	mq := brokerFor(t, acemq.WithObserver(metrics),
+		acemq.WithPublishInterceptor(r.tracing.PublishInterceptor()))
+
+	if err := mq.DeclareQueue(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+
+	handled := make(chan struct{}, 1)
+	sub, err := acemq.Consume(ctx, mq, "orders",
+		tracing.Handle(r.tracing, "orders",
+			func(context.Context, acemq.Message[OrderPlaced]) acemq.Ack {
+				select {
+				case handled <- struct{}{}:
+				default:
+				}
+				return acemq.Park(errors.New("unreadable"))
+			}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := acemq.NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the handler never ran")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var span tracetest.SpanStub
+	for time.Now().Before(deadline) {
+		for _, s := range r.spans() {
+			if s.Name == "orders process" {
+				span = s
+			}
+		}
+		if span.Name != "" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if span.Name == "" {
+		t.Fatal("the consume span never ended")
+	}
+
+	if got := attr(t, span, tracing.AttrOutcome).AsString(); got != tracing.OutcomeParked {
+		t.Errorf("span %s = %q, want parked", tracing.AttrOutcome, got)
+	}
+
+	var parked int64
+	for key, value := range metrics.Counts() {
+		if strings.HasPrefix(key, acemq.MetricParked) {
+			parked += value
+		}
+	}
+	if parked != 1 {
+		t.Errorf("%s = %d, want 1", acemq.MetricParked, parked)
+	}
+}

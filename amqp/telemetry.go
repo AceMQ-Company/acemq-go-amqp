@@ -144,14 +144,16 @@ const (
 // The metric tag names this library writes, named so a dashboard query and the
 // code that feeds it cannot drift apart.
 //
-// TagRoutingKey is key rather than Java's routing.key. That is a difference
-// between the libraries and not one this package gets to settle on its own —
-// the Python library writes key as well.
+// TagRoutingKey was key until it was aligned on Java's and .NET's routing.key.
+// Two libraries wrote each spelling and neither reading was wrong, but the
+// fully-qualified one says which key it means next to a tag called queue, and
+// Java is the library the others are ported from. A dashboard that groups
+// publishes by key has to be edited; see the changelog.
 const (
 	TagQueue      = "queue"
 	TagOutcome    = "outcome"
 	TagExchange   = "exchange"
-	TagRoutingKey = "key"
+	TagRoutingKey = "routing.key"
 	TagRung       = "rung"
 	TagTarget     = "target"
 )

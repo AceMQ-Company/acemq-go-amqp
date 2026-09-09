@@ -933,3 +933,107 @@ func countOf(m *Metrics, metric string) int64 {
 	}
 	return total
 }
+
+// TestAHandlerCanParkAMessageItCannotRead is the other half of the parking
+// lot. The engine parks a body the codec refused; a handler that decoded fine
+// and only then found the message unreadable — a field naming a schema nobody
+// deployed, a reference into a system that never had one — used to have to
+// reject it into the dead letters, which is the queue for work that failed
+// rather than for messages nobody could read.
+func TestAHandlerCanParkAMessageItCannotRead(t *testing.T) {
+	ctx := context.Background()
+	metrics := NewMetrics()
+	mq := brokerFor(t, WithRetry(FixedRetry(5, 0)), WithObserver(metrics))
+	declare(t, mq, "orders")
+
+	var settled settlements
+	sub, err := Consume(ctx, mq, "orders",
+		func(ctx context.Context, _ Message[OrderPlaced]) Ack {
+			OnSettled(ctx, settled.record)
+			return Park(errors.New("schema version 9 is from a future nobody deployed"))
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the message to be parked", func() bool {
+		n, err := mq.MessageCount(ctx, "orders.parked")
+		return err == nil && n == 1
+	})
+
+	parked, _, err := mq.Pull(ctx, "orders.parked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = parked.Ack() }()
+
+	if !strings.Contains(parked.Envelope.Error, "schema version 9") {
+		t.Errorf("Error = %q, want the handler's reason", parked.Envelope.Error)
+	}
+	if n, err := mq.MessageCount(ctx, "orders.dlq"); err != nil || n != 0 {
+		t.Errorf("the dead-letter queue holds %d messages (%v); parking must not dead-letter",
+			n, err)
+	}
+
+	// The counter and the span have to agree, so the settlement carries the
+	// same word the counter is tagged with.
+	waitFor(t, "the settlement", func() bool { return settled.count() == 1 })
+	got := settled.snapshot()[0]
+	if got.Action != SettledParked {
+		t.Errorf("Action = %q, want %q", got.Action, SettledParked)
+	}
+	if got.Outcome != OutcomeParked {
+		t.Errorf("Outcome = %q, want %q", got.Outcome, OutcomeParked)
+	}
+
+	if total := countOf(metrics, MetricParked); total != 1 {
+		t.Errorf("%s = %d, want 1", MetricParked, total)
+	}
+	if total := countOf(metrics, MetricRejected); total != 0 {
+		t.Errorf("%s = %d, want 0: a park is not a rejection", MetricRejected, total)
+	}
+	if total := countOf(metrics, MetricDeadLettered); total != 0 {
+		t.Errorf("%s = %d, want 0", MetricDeadLettered, total)
+	}
+	if total := countOf(metrics, MetricConsumed); total != 1 {
+		t.Errorf("%s = %d, want 1", MetricConsumed, total)
+	}
+}
+
+func TestParkReadsAsParkInALogLine(t *testing.T) {
+	if got := Park(errors.New("unreadable")).String(); got != "park" {
+		t.Errorf("String() = %q, want park", got)
+	}
+	if got := Park(errors.New("unreadable")).Err(); got == nil {
+		t.Error("Err() lost the reason the handler gave")
+	}
+}
+
+// TestThePublishCounterIsTaggedRoutingKey pins the tag name the family agreed
+// on. It was key here and in Python and routing.key in Java and .NET; a
+// dashboard that groups publishes by it cannot be right in both spellings.
+func TestThePublishCounterIsTaggedRoutingKey(t *testing.T) {
+	ctx := context.Background()
+	metrics := NewMetrics()
+	mq := brokerFor(t, WithObserver(metrics))
+	declare(t, mq, "orders")
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if TagRoutingKey != "routing.key" {
+		t.Errorf("TagRoutingKey = %q, want routing.key", TagRoutingKey)
+	}
+	want := MetricPublished + "{exchange=}{routing.key=orders}"
+	if got := metrics.Counts()[want]; got != 1 {
+		t.Errorf("no counter keyed %q; got %v", want, metrics.Counts())
+	}
+}
