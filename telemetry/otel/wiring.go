@@ -176,7 +176,7 @@ func finishPublish(span *Span, result acemq.PublishResult, err error) {
 // # One word for the counter and the span
 //
 // The outcome written here is [acemq.Settlement.Outcome] — the same string the
-// engine tags acemq.messages.consumed with for this delivery. It is not derived
+// engine tags acemq.consume.total with for this delivery. It is not derived
 // again from the handler's Ack, so a dashboard filtered to dead-lettered
 // messages and a trace search for the same thing cannot return different sets.
 func Handle[T any](t *Tracing, queue string, next acemq.Handler[T]) acemq.Handler[T] {

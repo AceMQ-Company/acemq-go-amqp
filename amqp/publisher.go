@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Publisher sends messages of one type to one destination.
@@ -145,6 +146,7 @@ func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (Pu
 			"acemq: cannot encode a %T for %q: %w", payload, p.routingKey, err)
 	}
 
+	started := time.Now()
 	result, err := p.conn.transport.Publish(ctx, exchange, routingKey, Outbound{
 		Body:        body,
 		ContentType: p.codec.ContentType(),
@@ -154,18 +156,17 @@ func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (Pu
 		Persistent:  p.persistent,
 		Mandatory:   p.mandatory,
 	})
-	labels := map[string]string{TagExchange: exchange, TagRoutingKey: routingKey}
+	took := time.Since(started)
 	if err != nil {
-		p.conn.observer.Count(MetricPublishFailed, 1, labels)
+		observePublish(p.conn.observer, exchange, routingKey, OutcomeFailed, took)
 		return result, err
 	}
-	p.conn.observer.Count(MetricPublished, 1, labels)
 
 	// Reported as an error rather than left in the result, because a caller
 	// using Send never sees the result and would otherwise carry on believing
 	// the message went somewhere.
 	if p.mandatory && !result.Routed {
-		p.conn.observer.Count(MetricPublishFailed, 1, labels)
+		observePublish(p.conn.observer, exchange, routingKey, OutcomeUnroutable, took)
 		reason := result.ReturnReason
 		if reason == "" {
 			reason = "no queue is bound to receive it"
@@ -178,6 +179,15 @@ func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (Pu
 			Err:        errors.New(reason),
 		}
 	}
+
+	// confirmed and published are different promises and the tag is the only
+	// place the difference survives. A publisher without confirms reached the
+	// socket; one with them has the broker's word.
+	outcome := OutcomePublished
+	if result.Confirmed {
+		outcome = OutcomeConfirmed
+	}
+	observePublish(p.conn.observer, exchange, routingKey, outcome, took)
 	return result, nil
 }
 

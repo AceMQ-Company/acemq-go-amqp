@@ -250,8 +250,8 @@ func handleDelivery[T any](
 
 	observer := c.conn.observer
 	labels := map[string]string{TagQueue: c.queue}
-	observer.Gauge(MetricInFlight, c.inFlight(1), labels)
-	defer observer.Gauge(MetricInFlight, c.inFlight(-1), labels)
+	observer.Gauge(MetricConsumeInFlight, c.inFlight(1), labels)
+	defer observer.Gauge(MetricConsumeInFlight, c.inFlight(-1), labels)
 
 	if len(c.conn.onConsume) > 0 {
 		cc := &ConsumeContext{

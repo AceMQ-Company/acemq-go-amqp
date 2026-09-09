@@ -992,17 +992,26 @@ func TestAHandlerCanParkAMessageItCannotRead(t *testing.T) {
 		t.Errorf("Outcome = %q, want %q", got.Outcome, OutcomeParked)
 	}
 
-	if total := countOf(metrics, MetricParked); total != 1 {
-		t.Errorf("%s = %d, want 1", MetricParked, total)
+	// Parking has no counter of its own — Java settled on the outcome tag and
+	// nothing else, and this library follows it — so the tag is where a park is
+	// visible at all.
+	counts := metrics.Counts()
+	parkedCount := counts[metricKey(MetricConsumeTotal,
+		map[string]string{TagQueue: "orders", TagOutcome: OutcomeParked})]
+	if parkedCount != 1 {
+		t.Errorf("%s{outcome=%s} = %d, want 1", MetricConsumeTotal, OutcomeParked, parkedCount)
 	}
-	if total := countOf(metrics, MetricRejected); total != 0 {
-		t.Errorf("%s = %d, want 0: a park is not a rejection", MetricRejected, total)
+	rejected := counts[metricKey(MetricConsumeTotal,
+		map[string]string{TagQueue: "orders", TagOutcome: OutcomeRejected})]
+	if rejected != 0 {
+		t.Errorf("%s{outcome=%s} = %d, want 0: a park is not a rejection",
+			MetricConsumeTotal, OutcomeRejected, rejected)
 	}
-	if total := countOf(metrics, MetricDeadLettered); total != 0 {
-		t.Errorf("%s = %d, want 0", MetricDeadLettered, total)
+	if total := countOf(metrics, MetricDeadLetteredTotal); total != 0 {
+		t.Errorf("%s = %d, want 0", MetricDeadLetteredTotal, total)
 	}
-	if total := countOf(metrics, MetricConsumed); total != 1 {
-		t.Errorf("%s = %d, want 1", MetricConsumed, total)
+	if total := countOf(metrics, MetricConsumeTotal); total != 1 {
+		t.Errorf("%s = %d, want 1", MetricConsumeTotal, total)
 	}
 }
 
@@ -1032,7 +1041,7 @@ func TestThePublishCounterIsTaggedRoutingKey(t *testing.T) {
 	if TagRoutingKey != "routing.key" {
 		t.Errorf("TagRoutingKey = %q, want routing.key", TagRoutingKey)
 	}
-	want := MetricPublished + "{exchange=}{routing.key=orders}"
+	want := MetricPublishTotal + "{exchange=}{outcome=" + OutcomeConfirmed + "}{routing.key=orders}"
 	if got := metrics.Counts()[want]; got != 1 {
 		t.Errorf("no counter keyed %q; got %v", want, metrics.Counts())
 	}

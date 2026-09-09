@@ -22,60 +22,98 @@ import (
 // Metric names, so a dashboard built against one AceMQ library reads the same
 // against another.
 //
+// These are Java's, from MetricNames in acemq-amqp-api, and Java is the library
+// the rest of the family is ported from. Go, Python and Ruby each grew their own
+// names first and the four sets were disjoint, so the promise this comment used
+// to make — that a dashboard reads the same against another library — was not
+// true. It is now, and the cost of making it true is that every dashboard
+// written against the old names has to be edited. See the changelog.
+//
 // Java and .NET publish these through Micrometer and System.Diagnostics.Metrics
 // respectively. Go's standard library has no metrics interface at all, so this
 // package counts them itself and hands them to whatever you use — see
 // [Observer].
+//
+// # One counter, tagged, rather than one counter per outcome
+//
+// The family counts a publish and a delivery once each, under [MetricPublishTotal]
+// and [MetricConsumeTotal], and says what happened in the outcome tag. Go used to
+// write a separate counter per outcome as well as the total, which is the same
+// numbers twice and gave a dashboard two ways to be wrong about one thing.
+//
+// The two exceptions are [MetricRetriedTotal] and [MetricDeadLetteredTotal],
+// which Java keeps standing alone because they are what an alert is written
+// against and an alert should not have to know a tag vocabulary to fire. There
+// is deliberately no third for parking: a parked message is
+// MetricConsumeTotal{outcome=parked} and nothing else, which is what Java
+// settled on and what this library follows rather than inventing a counter the
+// rest of the family would not have.
 const (
-	// MetricPublished counts messages handed to the broker.
-	MetricPublished = "acemq.messages.published"
+	// MetricPublishDuration is how long a publish took, in seconds, from the
+	// call to the broker answering, tagged with the outcome.
+	MetricPublishDuration = "acemq.publish.duration"
 
-	// MetricPublishFailed counts publishes that did not succeed.
-	MetricPublishFailed = "acemq.messages.publish.failed"
-
-	// MetricConsumed counts deliveries this library has finished with, tagged
-	// with the outcome the engine settled on.
+	// MetricPublishTotal counts messages handed to the broker, tagged with the
+	// outcome: confirmed, published, unroutable or failed.
 	//
-	// Counted when the delivery is settled rather than when it arrives, because
-	// the outcome does not exist until then. Summing it across every outcome
-	// gives the number of deliveries handled.
-	MetricConsumed = "acemq.messages.consumed"
+	// confirmed means the broker took responsibility. published means it went
+	// out with nothing promised, which is what a publisher without confirms
+	// gets. The difference matters and only the tag records it.
+	MetricPublishTotal = "acemq.publish.total"
 
-	// MetricAccepted, MetricRetried, MetricRejected, MetricDeadLettered and
-	// MetricParked count what the engine did, one of them per delivery.
-	//
-	// What the engine did, and not what the handler asked for. A handler that
-	// asks for a retry on its last permitted attempt gets a dead letter, and
-	// counting the request rather than the decision is how this library used to
-	// report a retry that never happened. See [Settlement].
-	MetricAccepted = "acemq.messages.accepted"
-	MetricRetried  = "acemq.messages.retried"
-
-	// MetricRejected counts messages a handler gave up on by name. They go to
-	// the dead-letter queue like an exhausted message, and only the word keeps
-	// the two apart — which is the difference between a decision somebody took
-	// and a message the world defeated.
-	MetricRejected = "acemq.messages.rejected"
-
-	// MetricDeadLettered counts messages the engine gave up on: the attempts
-	// ran out, the message got too old, the handler reported the failure as
-	// unprocessable, or an interceptor refused it.
-	MetricDeadLettered = "acemq.messages.dead.lettered"
-
-	// MetricParked counts messages nothing could decode, which never reached a
-	// handler at all and go to {queue}.parked rather than the dead letters.
-	MetricParked = "acemq.messages.parked"
-
-	// MetricHandlerDuration is how long handlers take, in seconds, tagged with
+	// MetricConsumeDuration is how long handlers take, in seconds, tagged with
 	// what the engine then did about it.
 	//
 	// Only deliveries that reached a handler are timed. A body that would not
 	// decode never ran one, and recording a zero for it would drag down the
-	// average of a metric named for handlers.
-	MetricHandlerDuration = "acemq.handler.duration"
+	// average of a metric that is read as "how long does the work take".
+	MetricConsumeDuration = "acemq.consume.duration"
 
-	// MetricInFlight is how many messages are being handled right now.
-	MetricInFlight = "acemq.messages.in.flight"
+	// MetricConsumeTotal counts deliveries this library has finished with,
+	// tagged with the outcome the engine settled on.
+	//
+	// Counted when the delivery is settled rather than when it arrives, because
+	// the outcome does not exist until then. Summing it across every outcome
+	// gives the number of deliveries handled.
+	//
+	// The outcome is what the engine did, and not what the handler asked for. A
+	// handler that asks for a retry on its last permitted attempt gets a dead
+	// letter, and counting the request rather than the decision is how this
+	// library used to report a retry that never happened. See [Settlement].
+	MetricConsumeTotal = "acemq.consume.total"
+
+	// MetricConsumeInFlight is how many messages are being handled right now,
+	// bounded by prefetch times concurrency.
+	MetricConsumeInFlight = "acemq.consume.in.flight"
+
+	// MetricRetriedTotal counts messages sent to a retry queue — another
+	// attempt actually being scheduled, not merely asked for.
+	//
+	// Also visible as MetricConsumeTotal{outcome=retried}. It stands alone
+	// because a rising retry rate is the first sign of a struggling dependency
+	// and is worth an alert of its own.
+	MetricRetriedTotal = "acemq.messages.retried.total"
+
+	// MetricDeadLetteredTotal counts messages the engine gave up on: the
+	// attempts ran out, the message got too old, the handler reported the
+	// failure as unprocessable, or an interceptor refused it.
+	//
+	// Also visible as MetricConsumeTotal{outcome=dead_lettered}, and standing
+	// alone for the same reason: it is the counter an alert is written against.
+	MetricDeadLetteredTotal = "acemq.messages.dead.lettered.total"
+
+	// MetricSetAsideFailed counts messages that could not be moved to a
+	// dead-letter or parking queue, usually because it has not been declared.
+	//
+	// The message is rejected to the broker instead, which is the last thing
+	// between it and nothing.
+	//
+	// The counter that separates two failures which look identical from anywhere
+	// else. A message dead-lettered normally leaves the source queue and appears
+	// in the dead-letter queue; a message whose dead-letter queue was never
+	// declared leaves the source queue and appears nowhere. Queue depths show one
+	// queue going down in both cases, and only this number says which happened.
+	MetricSetAsideFailed = "acemq.messages.set.aside.failed"
 
 	// MetricRungMissing counts long retries that had to wait in the consumer
 	// because the rung queue they were meant to wait on is not on the broker.
@@ -85,13 +123,6 @@ const (
 	// restart mid-wait now shortens a five-minute backoff to nothing — and there
 	// would otherwise be no sign of it, because this library writes no log lines.
 	MetricRungMissing = "acemq.retry.rung.missing"
-
-	// MetricSetAsideFailed counts messages that could not be moved to a
-	// dead-letter or parking queue, usually because it has not been declared.
-	//
-	// The message is rejected to the broker instead, which is the last thing
-	// between it and nothing.
-	MetricSetAsideFailed = "acemq.messages.set.aside.failed"
 
 	// MetricOutboxLag is how long an outbox record waited between being
 	// committed and being published, in seconds.
@@ -108,13 +139,48 @@ const (
 	MetricOutboxTotal = "acemq.outbox.total"
 )
 
-// The outcomes, which are the values of the outcome tag on the consume metrics
-// and of the messaging.acemq.outcome attribute the tracing adapters write. One
-// vocabulary, so a counter and a span for the same delivery say the same word.
-//
-// These are the consume side. The publish and request outcomes — confirmed,
-// published, unroutable, answered, timed_out — are the tracing adapter's, which
-// is the only place they are written.
+// The rest of the family's vocabulary, which this library names but does not
+// write. Declared so that an [Observer] bridging AceMQ onto a metrics system can
+// be written against one list, and so that adding the emission later cannot
+// invent a second spelling for something Java already named.
+const (
+	// MetricConsumeAttempts is which attempt a delivery was, as a distribution,
+	// so a rising one shows a struggling dependency.
+	//
+	// Not written by this library. [Observer] has counters, gauges and durations
+	// and no general distribution, and adding one to a published interface to
+	// carry a small integer is not worth what it breaks. The number is on every
+	// message as Envelope.Attempt, so an application that wants it can record it
+	// from a handler in one line.
+	MetricConsumeAttempts = "acemq.consume.attempts"
+
+	// MetricRequestDuration is the round trip of a request/reply call as the
+	// caller experienced it, and MetricRequestTotal counts those calls, tagged
+	// answered, timed_out or failed.
+	//
+	// Not written by this library: patterns.Request is a function over a
+	// connection rather than something the connection knows it is doing, so
+	// there is no point on the path holding an observer. The tracing adapter
+	// spans the round trip instead.
+	MetricRequestDuration = "acemq.request.duration"
+	MetricRequestTotal    = "acemq.request.total"
+
+	// MetricPipelineRunDuration is how long a message had existed when it left a
+	// pipeline, and MetricPipelineRunTotal counts runs that finished, tagged
+	// with the outcome and the step it ended at.
+	//
+	// Not written by this library. Go has no Pipeline type owning its steps the
+	// way Java does; a run finishing is reported through patterns.RunObserver,
+	// which the tracing adapter turns into a span event. An application that
+	// wants counters can install its own RunObserver and write these two names.
+	MetricPipelineRunDuration = "acemq.pipeline.run.duration"
+	MetricPipelineRunTotal    = "acemq.pipeline.run.total"
+)
+
+// The outcomes, which are the values of the outcome tag on the publish and
+// consume metrics and of the messaging.acemq.outcome attribute the tracing
+// adapters write. One vocabulary, so a counter and a span for the same delivery
+// say the same word.
 const (
 	// OutcomeAcked is the handler accepting the message and the engine
 	// acknowledging it.
@@ -135,10 +201,28 @@ const (
 	// OutcomeParked is a message nothing could decode.
 	OutcomeParked = "parked"
 
-	// OutcomeFailed and OutcomePublished are the outbox relay's, and are the
-	// same two words the tracing adapter writes for a publish.
-	OutcomeFailed    = "failed"
+	// OutcomeConfirmed is the broker taking responsibility for a published
+	// message, which is what a publisher with confirms gets.
+	OutcomeConfirmed = "confirmed"
+
+	// OutcomePublished is a message that went out with nothing promised about
+	// it, which is what a publisher without confirms gets. Also the outbox
+	// relay's word for a record it got out.
 	OutcomePublished = "published"
+
+	// OutcomeUnroutable is a mandatory message that reached no queue at all.
+	// The broker handed it back rather than dropping it.
+	OutcomeUnroutable = "unroutable"
+
+	// OutcomeFailed is a publish that errored, or an outbox record the relay
+	// could not get out.
+	OutcomeFailed = "failed"
+
+	// OutcomeAnswered and OutcomeTimedOut are a request/reply round trip's, and
+	// are written by the tracing adapter rather than by a counter here. See
+	// [MetricRequestTotal].
+	OutcomeAnswered = "answered"
+	OutcomeTimedOut = "timed_out"
 )
 
 // The metric tag names this library writes, named so a dashboard query and the
@@ -149,13 +233,26 @@ const (
 // fully-qualified one says which key it means next to a tag called queue, and
 // Java is the library the others are ported from. A dashboard that groups
 // publishes by key has to be edited; see the changelog.
+//
+// # A dot is legal here and illegal in Prometheus
+//
+// routing.key and message.type are the family's spellings and both carry a dot,
+// which a Prometheus label name may not. Emitted verbatim they would not make
+// one label wrong, they would make the whole scrape unparseable — so the
+// actuator rewrites a label name the same way it rewrites a metric name, and
+// they arrive as routing_key and message_type. An Observer written by hand has
+// to do the same; see docs/observability.md.
 const (
-	TagQueue      = "queue"
-	TagOutcome    = "outcome"
-	TagExchange   = "exchange"
-	TagRoutingKey = "routing.key"
-	TagRung       = "rung"
-	TagTarget     = "target"
+	TagQueue       = "queue"
+	TagOutcome     = "outcome"
+	TagExchange    = "exchange"
+	TagRoutingKey  = "routing.key"
+	TagMessageType = "message.type"
+	TagTransport   = "transport"
+	TagPipeline    = "pipeline"
+	TagStep        = "step"
+	TagRung        = "rung"
+	TagTarget      = "target"
 )
 
 // Observer is told what the library is doing.
@@ -359,31 +456,28 @@ func WithObserver(o Observer) ConnOption {
 // handler's [Ack], and that is the whole point of this function's shape.
 // Deriving it from what the handler asked for was the bug: a message that used
 // up its last attempt asked to be retried and was dead-lettered, so
-// [MetricRetried] counted a retry nobody would ever make and [MetricDeadLettered]
-// only ever saw the give-ups a handler named itself. The same outcome goes on
+// [MetricRetriedTotal] counted a retry nobody would ever make and
+// [MetricDeadLetteredTotal] only ever saw the give-ups a handler named itself.
+// The same outcome goes on
 // the delivery's span through [Settlement], so a counter and a trace queried for
 // the same delivery answer with the same word.
 //
-// Exactly one of the five per-outcome counters is incremented, so they sum to
-// [MetricConsumed].
+// Every delivery increments [MetricConsumeTotal] exactly once, so summing it
+// across the outcome tag gives the number of deliveries handled. Two outcomes
+// also increment a counter of their own — see [MetricRetriedTotal] — and those
+// two are a second view of the same events rather than an addition to them.
 func observeConsume(o Observer, queue, outcome string) {
 	if o == nil {
 		return
 	}
 	labels := map[string]string{TagQueue: queue, TagOutcome: outcome}
 
-	o.Count(MetricConsumed, 1, labels)
+	o.Count(MetricConsumeTotal, 1, labels)
 	switch outcome {
-	case OutcomeAcked:
-		o.Count(MetricAccepted, 1, labels)
 	case OutcomeRetried:
-		o.Count(MetricRetried, 1, labels)
-	case OutcomeRejected:
-		o.Count(MetricRejected, 1, labels)
+		o.Count(MetricRetriedTotal, 1, labels)
 	case OutcomeDeadLettered:
-		o.Count(MetricDeadLettered, 1, labels)
-	case OutcomeParked:
-		o.Count(MetricParked, 1, labels)
+		o.Count(MetricDeadLetteredTotal, 1, labels)
 	}
 }
 
@@ -392,14 +486,33 @@ func observeConsume(o Observer, queue, outcome string) {
 //
 // Separate from [observeConsume] because a delivery that never reached a
 // handler — an interceptor refused it, or nothing could decode the body — still
-// settles and still counts, and timing it at zero would make a metric named for
-// handlers report work no handler did.
+// settles and still counts, and timing it at zero would make a metric read as
+// "how long does the work take" report work no handler did.
 func observeHandler(o Observer, queue, outcome string, took time.Duration) {
 	if o == nil {
 		return
 	}
-	o.Observe(MetricHandlerDuration, took.Seconds(),
+	o.Observe(MetricConsumeDuration, took.Seconds(),
 		map[string]string{TagQueue: queue, TagOutcome: outcome})
+}
+
+// observePublish records one publish under [MetricPublishTotal] and
+// [MetricPublishDuration].
+//
+// The outcome is worked out from what the broker actually said rather than from
+// whether Publish returned an error, which is the same discipline the consume
+// side follows: a mandatory message the broker handed back is not a failure —
+// nothing went wrong, nothing was listening — and calling it one would hide the
+// difference between a broken publisher and an unbound routing key.
+func observePublish(o Observer, exchange, routingKey, outcome string, took time.Duration) {
+	if o == nil {
+		return
+	}
+	labels := map[string]string{
+		TagExchange: exchange, TagRoutingKey: routingKey, TagOutcome: outcome}
+
+	o.Count(MetricPublishTotal, 1, labels)
+	o.Observe(MetricPublishDuration, took.Seconds(), labels)
 }
 
 // ObserveOutbox records what became of one outbox record.

@@ -147,15 +147,15 @@ const (
 // The outcomes, which are the values of the messaging.acemq.outcome attribute
 // and are shared with the metric tag of the same name in every AceMQ library.
 //
-// The consume outcomes are taken from the core package rather than written out
-// again here. The engine decides them, tags [acemq.MetricConsumed] with them and
-// hands them to this adapter on the [acemq.Settlement]; a second copy of the
-// spellings would be a second thing to keep in step, and a counter and a span
-// that disagree about one delivery is the bug this arrangement exists to
-// prevent.
+// Every one of them is taken from the core package rather than written out
+// again here. The engine decides them, tags [acemq.MetricConsumeTotal] and
+// [acemq.MetricPublishTotal] with them and hands the consume ones to this
+// adapter on the [acemq.Settlement]; a second copy of the spellings would be a
+// second thing to keep in step, and a counter and a span that disagree about one
+// delivery is the bug this arrangement exists to prevent.
 const (
 	// OutcomeConfirmed is the broker taking responsibility for the message.
-	OutcomeConfirmed = "confirmed"
+	OutcomeConfirmed = acemq.OutcomeConfirmed
 
 	// OutcomePublished is a message that went out with nothing promised about
 	// it. Publisher confirms were not on.
@@ -164,7 +164,7 @@ const (
 	// OutcomeUnroutable is a message that reached no queue at all, which the
 	// broker does not consider an error and which is very often the whole
 	// problem.
-	OutcomeUnroutable = "unroutable"
+	OutcomeUnroutable = acemq.OutcomeUnroutable
 
 	// OutcomeFailed is a publish or a handler that returned an error or panicked.
 	OutcomeFailed = acemq.OutcomeFailed
@@ -189,11 +189,11 @@ const (
 	OutcomeParked = acemq.OutcomeParked
 
 	// OutcomeAnswered is a request that got its reply.
-	OutcomeAnswered = "answered"
+	OutcomeAnswered = acemq.OutcomeAnswered
 
 	// OutcomeTimedOut is a request that did not, which is the absence of an
 	// answer rather than evidence that nothing happened.
-	OutcomeTimedOut = "timed_out"
+	OutcomeTimedOut = acemq.OutcomeTimedOut
 
 	// OutcomeCompleted and OutcomeEndedEarly are how a pipeline run finished:
 	// through its last step, or stopped before it by a step that decided this

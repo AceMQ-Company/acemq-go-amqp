@@ -68,7 +68,7 @@ type Settlement struct {
 	// shares: [OutcomeAcked], [OutcomeRetried], [OutcomeRejected],
 	// [OutcomeDeadLettered] or [OutcomeParked].
 	//
-	// The engine writes it here and tags [MetricConsumed] with the same string,
+	// The engine writes it here and tags [MetricConsumeTotal] with the same string,
 	// so an adapter that puts it on the span cannot disagree with the counter
 	// for the same delivery. It is finer-grained than [Settlement.Action] in one
 	// place: a message the handler rejected by name is dead-lettered like an

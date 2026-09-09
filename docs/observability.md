@@ -23,59 +23,125 @@ mq, err := acemq.Connect(ctx, url, acemq.WithObserver(myObserver))
 **Nothing is measured until you ask.** The default is `NopObserver`, so a program
 that never reads metrics does not pay for them.
 
+> ### Every metric was renamed
+>
+> **This breaks every existing Go dashboard, alert rule and recording rule.**
+>
+> Java's `MetricNames` is the family's vocabulary and Go, Python and Ruby have
+> moved onto it. Until now the four libraries emitted disjoint sets of names, so
+> the promise this page used to make — that a dashboard reads the same against
+> another AceMQ library — was simply untrue. It is true now, and it costs one
+> editing pass over whatever you have built.
+>
+> | Old | New |
+> |---|---|
+> | `acemq.messages.published` | `acemq.publish.total{outcome=confirmed}` or `{outcome=published}` |
+> | `acemq.messages.publish.failed` | `acemq.publish.total{outcome=failed}` or `{outcome=unroutable}` |
+> | — | `acemq.publish.duration` (new) |
+> | `acemq.messages.consumed` | `acemq.consume.total` |
+> | `acemq.messages.accepted` | `acemq.consume.total{outcome=acked}` |
+> | `acemq.messages.rejected` | `acemq.consume.total{outcome=rejected}` |
+> | `acemq.messages.retried` | `acemq.messages.retried.total` |
+> | `acemq.messages.dead.lettered` | `acemq.messages.dead.lettered.total` |
+> | `acemq.messages.parked` | `acemq.consume.total{outcome=parked}` |
+> | `acemq.handler.duration` | `acemq.consume.duration` |
+> | `acemq.messages.in.flight` | `acemq.consume.in.flight` |
+> | `acemq.messages.set.aside.failed` | unchanged |
+> | `acemq.retry.rung.missing` | unchanged |
+> | `acemq.outbox.lag`, `acemq.outbox.total` | unchanged |
+>
+> **Four of the old counters became tag filters rather than new names, so an
+> alert on one has to be rewritten and not renamed.** `accepted`, `rejected` and
+> `parked` were always `acemq.consume.total` split by its own `outcome` tag;
+> writing both gave a dashboard two ways to be wrong about one thing. Java keeps
+> only `retried` and `dead_lettered` standing alone, because those two are what
+> an alert is written against, and this library now keeps the same two and no
+> others.
+>
+> `acemq.messages.published` and `acemq.messages.publish.failed` merged into one
+> counter with an `outcome` tag, which the old split could not express: an
+> unroutable mandatory message was counted as a failure, so a broken publisher
+> and an unbound routing key were indistinguishable. They are now `unroutable`
+> and `failed`.
+>
+> Scraping through `actuator`, the Prometheus names follow: `acemq_publish_total`,
+> `acemq_consume_total`, `acemq_consume_duration_count`, `acemq_consume_in_flight`.
+
 ### What is reported
 
 | Metric | |
 |---|---|
-| `acemq.messages.published` | handed to the broker |
-| `acemq.messages.publish.failed` | did not get there, including unroutable |
-| `acemq.messages.consumed` | deliveries settled, tagged `outcome` |
-| `acemq.messages.accepted` | the handler accepted it |
-| `acemq.messages.retried` | another attempt was actually scheduled |
-| `acemq.messages.rejected` | the handler gave up on it by name |
-| `acemq.messages.dead.lettered` | the engine gave up on it |
-| `acemq.messages.parked` | nothing could read it |
-| `acemq.handler.duration` | seconds per message, tagged `outcome` |
-| `acemq.messages.in.flight` | being handled right now |
+| `acemq.publish.total` | messages handed to the broker, tagged `outcome` |
+| `acemq.publish.duration` | seconds per publish, tagged `outcome` |
+| `acemq.consume.total` | deliveries settled, tagged `outcome` |
+| `acemq.consume.duration` | seconds per message in a handler, tagged `outcome` |
+| `acemq.consume.in.flight` | being handled right now |
+| `acemq.messages.retried.total` | another attempt was actually scheduled |
+| `acemq.messages.dead.lettered.total` | the engine gave up on it |
+| `acemq.messages.set.aside.failed` | it could not be moved to a dead-letter or parking queue |
+| `acemq.retry.rung.missing` | a long retry had to wait in the consumer |
 | `acemq.outbox.total` | outbox records the relay handled, tagged `outcome` |
 | `acemq.outbox.lag` | seconds between an outbox record being committed and published |
 
-The names match the Python and Ruby libraries. The Java and .NET libraries count
-the same things under `acemq.consume.total` and `acemq.consume.duration` with the
-same `outcome` tag; that split is older than this library and is not one it can
-settle on its own.
+**These are Java's names.** They are the family's vocabulary, and Go, Python and
+Ruby have moved onto them — see the rename note below, because **every existing
+Go dashboard has to be edited.**
 
-`acemq.messages.dead.lettered` is the one to alert on. It is the count of
+`acemq.messages.dead.lettered.total` is the one to alert on. It is the count of
 messages that are gone.
+
+`acemq.retry.rung.missing` started here — the retry ladder is this library's own
+— and Java has since taken the same name, so it is family vocabulary too.
+
+#### Named but not written
+
+Four more names are part of the family vocabulary and are declared in
+`amqp/telemetry.go` so an `Observer` can be written against one list — but this
+library does not emit them, and says so rather than leaving you to wonder why the
+series is empty.
+
+| Metric | Why not |
+|---|---|
+| `acemq.consume.attempts` | `Observer` has counters, gauges and durations and no general distribution. The number is on every message as `Envelope.Attempt`, so a handler can record it in one line. |
+| `acemq.request.duration`, `acemq.request.total` | `patterns.Request` is a function over a connection rather than something the connection knows it is doing, so no point on the path holds an observer. The tracing adapter spans the round trip instead. |
+| `acemq.pipeline.run.duration`, `acemq.pipeline.run.total` | Go has no `Pipeline` type owning its steps the way Java does. A finished run is reported through `patterns.RunObserver`; install your own and write these two names if you want counters. |
 
 ### The tag names
 
 | Tag | On | |
 |---|---|---|
 | `queue` | the consume metrics | the queue the delivery arrived on |
-| `outcome` | the consume and outbox metrics | what the engine did |
+| `outcome` | the publish, consume and outbox metrics | what happened |
 | `exchange` | the publish and outbox metrics | where it was sent |
 | `routing.key` | the publish and outbox metrics | the key it went out under |
 | `rung` | `acemq.retry.rung.missing` | the rung queue that is not there |
 | `target` | `acemq.messages.set.aside.failed` | the queue it could not be moved to |
 
-> **`routing.key` was `key` until this release.** Java and .NET already wrote
-> `routing.key`; Go and Python wrote `key`, and neither reading was wrong. The
-> fully-qualified name says *which* key it means next to a tag called `queue`,
-> and Java is the library the others are ported from, so the two moved rather
-> than the four staying split. **A dashboard that groups publishes by `key` has
-> to be edited.** Python is making the same change.
->
-> The Prometheus endpoint in `actuator` converts label names the way it already
-> converted metric names, so `routing.key` is scraped as `routing_key`. A dot is
-> legal in an AceMQ tag and illegal in a Prometheus label; left in place it would
-> have made the whole scrape unparseable rather than one label wrong.
+`message.type`, `transport`, `pipeline` and `step` are declared as constants for
+the same reason the unemitted metrics are — they are the family's spellings, and
+an application writing its own tags should not invent a second one.
 
-### The outcome is the engine's decision, not the handler's request
+> **A dot is legal here and illegal in Prometheus.** `routing.key` and
+> `message.type` both carry one. Emitted verbatim they do not make one label
+> wrong, they make the **whole scrape unparseable**. The Prometheus endpoint in
+> `actuator` therefore converts label names the way it already converted metric
+> names, so they are scraped as `routing_key` and `message_type`. **An `Observer`
+> you write by hand has to do the same.** There is a test that walks the entire
+> tag vocabulary against the Prometheus label grammar, so a third dotted tag
+> cannot reach a scrape endpoint unnoticed.
 
-Every delivery increments `acemq.messages.consumed` exactly once and exactly one
-of the five outcome counters, so they add up. The `outcome` tag takes one of five
-words:
+> **`routing.key` was `key` until the previous release.** Java and .NET already
+> wrote `routing.key`; Go and Python wrote `key`, and neither reading was wrong.
+> The fully-qualified name says *which* key it means next to a tag called
+> `queue`, and Java is the library the others are ported from, so the two moved
+> rather than the four staying split.
+
+### One counter, tagged, rather than one counter per outcome
+
+Every delivery increments `acemq.consume.total` exactly once, and the `outcome`
+tag partitions those deliveries — the tags do not overlap, so grouping by
+`outcome` and adding the groups back up gives the total again. The tag takes one
+of five words:
 
 | `outcome` | |
 |---|---|
@@ -90,18 +156,44 @@ It is the same word the tracing adapter puts on that delivery's span as
 filtered to dead letters and a trace search for them return the same set. There
 is a test that asserts exactly that.
 
-> **This changes numbers an existing dashboard may rely on.** Until this release
-> the classification came from what the handler asked for. A handler that asked
-> for a retry on its last permitted attempt was counted as a retry and then
-> *again* as a dead letter, so `acemq.messages.retried` counted retries that
-> never happened and included every message about to be given up on. From this
-> release **retries fall and dead letters rise, with no change in what the
-> service does** — the numbers were wrong and are now right. Two smaller
-> corrections come with it: a retry that waits on a rung queue is no longer
-> counted twice (once bare and once under a `rung` label, which is now only on
-> `acemq.retry.rung.missing`), and a message nothing could decode is counted as
-> `acemq.messages.parked` rather than `acemq.messages.rejected`. The .NET library
-> made the same correction; Python and Ruby are making it too.
+`acemq.publish.total` carries the same tag, with four words of its own:
+
+| `outcome` | |
+|---|---|
+| `confirmed` | the broker took responsibility for it |
+| `published` | it went out with nothing promised, which is what a publisher without confirms gets |
+| `unroutable` | it was mandatory and reached no queue at all |
+| `failed` | the publish errored |
+
+`unroutable` is deliberately not `failed`. Nothing went wrong — nothing was
+listening — and a single failure counter cannot tell a broken publisher from an
+unbound routing key, which is the question somebody actually has when the number
+moves.
+
+#### Two counters stand beside the tagged one
+
+`acemq.messages.retried.total` and `acemq.messages.dead.lettered.total` are the
+same events as `acemq.consume.total{outcome=retried}` and
+`{outcome=dead_lettered}` seen a second time, not additions to them. Java keeps
+these two standing alone because they are what an alert is written against, and
+an alert should not have to know a tag vocabulary to fire.
+
+There is deliberately **no third counter for parking.** A parked message is
+`acemq.consume.total{outcome=parked}` and nothing else. That is what Java
+settled on, and inventing a counter the rest of the family would not have is the
+way these vocabularies drifted apart in the first place.
+
+**Do not add them to `acemq.consume.total`.** That double-counts every retry.
+There is a test pinning the two to agree.
+
+### The outcome is the engine's decision, not the handler's request
+
+Until an earlier release the classification came from what the handler asked for.
+A handler that asked for a retry on its last permitted attempt was counted as a
+retry and then *again* as a dead letter, so the retry counter counted retries that
+never happened and included every message about to be given up on. Retries fell
+and dead letters rose when that was fixed, with no change in what the service
+does — the numbers were wrong and are now right.
 
 ### If you only want the numbers
 

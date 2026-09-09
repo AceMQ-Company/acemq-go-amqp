@@ -942,7 +942,7 @@ func TestARejectedMessageKeepsItsOwnOutcome(t *testing.T) {
 // A counter and a trace are read by the same person minutes apart, and a
 // dashboard that says a thousand dead letters next to a trace search that finds
 // none is worse than either number alone. So this asserts the agreement
-// directly: for every delivery, the outcome tag on acemq.messages.consumed and
+// directly: for every delivery, the outcome tag on acemq.consume.total and
 // the messaging.acemq.outcome attribute on that delivery's span are the same
 // word. It covers all four outcomes a handler can produce, including the one
 // that used to disagree — a handler that asked for a retry it could not have.
@@ -1171,7 +1171,7 @@ func TestAnUnnamedPipelineStepWritesNoEvent(t *testing.T) {
 // is the metric name followed by its labels in sorted order.
 func consumedOutcome(key string) (string, bool) {
 	const marker = "{outcome="
-	if !strings.HasPrefix(key, "acemq.messages.consumed{") {
+	if !strings.HasPrefix(key, acemq.MetricConsumeTotal+"{") {
 		return "", false
 	}
 	at := strings.Index(key, marker)
@@ -1342,13 +1342,18 @@ func TestAParkedDeliveryUnderTheEngineReportsParkedOnBothSides(t *testing.T) {
 		t.Errorf("span %s = %q, want parked", tracing.AttrOutcome, got)
 	}
 
+	// Parking has no counter of its own, so the span attribute and the outcome
+	// tag on acemq.consume.total are the two places it appears — and they have to
+	// be the same word for either to be worth reading.
 	var parked int64
 	for key, value := range metrics.Counts() {
-		if strings.HasPrefix(key, acemq.MetricParked) {
+		if strings.HasPrefix(key, acemq.MetricConsumeTotal+"{") &&
+			strings.Contains(key, "{outcome="+acemq.OutcomeParked+"}") {
 			parked += value
 		}
 	}
 	if parked != 1 {
-		t.Errorf("%s = %d, want 1", acemq.MetricParked, parked)
+		t.Errorf("%s{outcome=%s} = %d, want 1",
+			acemq.MetricConsumeTotal, acemq.OutcomeParked, parked)
 	}
 }

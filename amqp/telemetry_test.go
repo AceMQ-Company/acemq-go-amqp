@@ -66,14 +66,16 @@ func TestPublishingAndConsumingAreCounted(t *testing.T) {
 	// moment to unwind before reading.
 	time.Sleep(100 * time.Millisecond)
 
-	if got := countFor(metrics, MetricPublished); got != 3 {
-		t.Errorf("%s = %d, want 3", MetricPublished, got)
+	if got := countFor(metrics, MetricPublishTotal); got != 3 {
+		t.Errorf("%s = %d, want 3", MetricPublishTotal, got)
 	}
-	if got := countFor(metrics, MetricConsumed); got != 3 {
-		t.Errorf("%s = %d, want 3", MetricConsumed, got)
+	if got := countFor(metrics, MetricConsumeTotal); got != 3 {
+		t.Errorf("%s = %d, want 3", MetricConsumeTotal, got)
 	}
-	if got := countFor(metrics, MetricAccepted); got != 3 {
-		t.Errorf("%s = %d, want 3", MetricAccepted, got)
+	acked := metrics.Counts()[metricKey(MetricConsumeTotal,
+		map[string]string{TagQueue: "orders", TagOutcome: OutcomeAcked})]
+	if acked != 3 {
+		t.Errorf("%s{outcome=%s} = %d, want 3", MetricConsumeTotal, OutcomeAcked, acked)
 	}
 	if len(metrics.Durations()) == 0 {
 		t.Error("no handler durations were recorded")
@@ -115,18 +117,19 @@ func TestRetriesAndDeadLetteringAreCounted(t *testing.T) {
 	// for a retry both times; the second ask had no attempt left to spend, and
 	// counting what was asked for rather than what was done is what used to
 	// make this two. A retry that never happens is not a retry.
-	if got := countFor(metrics, MetricRetried); got != 1 {
-		t.Errorf("%s = %d, want 1: only the first of two attempts was retried", MetricRetried, got)
+	if got := countFor(metrics, MetricRetriedTotal); got != 1 {
+		t.Errorf("%s = %d, want 1: only the first of two attempts was retried",
+			MetricRetriedTotal, got)
 	}
 	// The point of the metric: a message that ran out of attempts is gone, and
 	// that should be visible without reading a log.
-	if got := countFor(metrics, MetricDeadLettered); got != 1 {
-		t.Errorf("%s = %d, want 1", MetricDeadLettered, got)
+	if got := countFor(metrics, MetricDeadLetteredTotal); got != 1 {
+		t.Errorf("%s = %d, want 1", MetricDeadLetteredTotal, got)
 	}
-	// Every delivery is counted once, whatever became of it, so the per-outcome
-	// counters add up to this one.
-	if got := countFor(metrics, MetricConsumed); got != 2 {
-		t.Errorf("%s = %d, want 2", MetricConsumed, got)
+	// Every delivery is counted once, whatever became of it, so the outcome tag
+	// on this one partitions the deliveries rather than overlapping them.
+	if got := countFor(metrics, MetricConsumeTotal); got != 2 {
+		t.Errorf("%s = %d, want 2", MetricConsumeTotal, got)
 	}
 }
 
@@ -165,23 +168,30 @@ func TestTheOutcomeTagIsTheEnginesDecisionNotTheHandlersRequest(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	counts := metrics.Counts()
-	retried := counts[metricKey(MetricConsumed,
+	retried := counts[metricKey(MetricConsumeTotal,
 		map[string]string{TagQueue: "orders", TagOutcome: OutcomeRetried})]
-	deadLettered := counts[metricKey(MetricConsumed,
+	deadLettered := counts[metricKey(MetricConsumeTotal,
 		map[string]string{TagQueue: "orders", TagOutcome: OutcomeDeadLettered})]
 
 	if retried != 1 {
-		t.Errorf("%s tagged %s = %d, want 1", MetricConsumed, OutcomeRetried, retried)
+		t.Errorf("%s tagged %s = %d, want 1", MetricConsumeTotal, OutcomeRetried, retried)
 	}
 	if deadLettered != 1 {
 		t.Errorf("%s tagged %s = %d, want 1: the handler asked for a retry it could not have",
-			MetricConsumed, OutcomeDeadLettered, deadLettered)
+			MetricConsumeTotal, OutcomeDeadLettered, deadLettered)
 	}
 }
 
-// TestEveryDeliveryIsCountedUnderExactlyOneOutcome is what makes the per-outcome
-// counters addable. A delivery counted twice, or under a label that splits it,
-// makes every dashboard built on them wrong in a way nothing reports.
+// TestEveryDeliveryIsCountedUnderExactlyOneOutcome is what makes the outcome tag
+// a partition rather than a set of overlapping labels. A delivery counted twice,
+// or under a label that splits it, makes every dashboard built on it wrong in a
+// way nothing reports.
+//
+// It also pins the relationship between acemq.consume.total and the two counters
+// that stand beside it: acemq.messages.retried.total is the same events as
+// acemq.consume.total{outcome=retried}, a second view rather than an addition.
+// Adding the two would double every retry, which is exactly the shape of bug the
+// old per-outcome counters invited.
 func TestEveryDeliveryIsCountedUnderExactlyOneOutcome(t *testing.T) {
 	ctx := context.Background()
 	metrics := NewMetrics()
@@ -222,22 +232,54 @@ func TestEveryDeliveryIsCountedUnderExactlyOneOutcome(t *testing.T) {
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	consumed := countFor(metrics, MetricConsumed)
-	perOutcome := countFor(metrics, MetricAccepted) + countFor(metrics, MetricRetried) +
-		countFor(metrics, MetricRejected) + countFor(metrics, MetricDeadLettered) +
-		countFor(metrics, MetricParked)
-
-	if consumed != perOutcome {
-		t.Errorf("%s = %d but the per-outcome counters add to %d",
-			MetricConsumed, consumed, perOutcome)
-	}
+	counts := metrics.Counts()
+	consumed := countFor(metrics, MetricConsumeTotal)
 	if consumed != 5 {
 		t.Errorf("%s = %d, want 5: three messages, one of them delivered three times",
-			MetricConsumed, consumed)
+			MetricConsumeTotal, consumed)
+	}
+
+	// Every series of the counter has to carry an outcome from the vocabulary,
+	// and adding them back up has to give the total again. A series tagged with
+	// something not on this list is a delivery a dashboard grouping by outcome
+	// would lose.
+	known := map[string]bool{
+		OutcomeAcked: true, OutcomeRetried: true, OutcomeRejected: true,
+		OutcomeDeadLettered: true, OutcomeParked: true,
+	}
+	var partitioned int64
+	for outcome := range known {
+		partitioned += counts[metricKey(MetricConsumeTotal,
+			map[string]string{TagQueue: "orders", TagOutcome: outcome})]
+	}
+	if partitioned != consumed {
+		t.Errorf("the known outcomes add to %d but %s is %d, so a delivery was tagged"+
+			" with something outside the vocabulary", partitioned, MetricConsumeTotal, consumed)
+	}
+
+	// The standalone counters are the same events seen again, not extra ones.
+	retriedTagged := counts[metricKey(MetricConsumeTotal,
+		map[string]string{TagQueue: "orders", TagOutcome: OutcomeRetried})]
+	if got := countFor(metrics, MetricRetriedTotal); got != retriedTagged {
+		t.Errorf("%s = %d but %s{outcome=%s} = %d; they are one set of events and"+
+			" have to agree", MetricRetriedTotal, got, MetricConsumeTotal,
+			OutcomeRetried, retriedTagged)
+	}
+	deadTagged := counts[metricKey(MetricConsumeTotal,
+		map[string]string{TagQueue: "orders", TagOutcome: OutcomeDeadLettered})]
+	if got := countFor(metrics, MetricDeadLetteredTotal); got != deadTagged {
+		t.Errorf("%s = %d but %s{outcome=%s} = %d", MetricDeadLetteredTotal, got,
+			MetricConsumeTotal, OutcomeDeadLettered, deadTagged)
 	}
 }
 
-func TestAFailedPublishIsCounted(t *testing.T) {
+// TestAnUnroutablePublishIsCountedApartFromAFailedOne is the reason the publish
+// counter carries an outcome tag rather than being split into published and
+// failed. A mandatory message the broker handed back is not a broken publisher:
+// nothing went wrong, nothing was listening — and a single failure counter
+// cannot say which of those two happened, which is the question somebody
+// actually has when the number moves.
+func TestAnUnroutablePublishIsCountedApartFromAFailedOne(t *testing.T) {
 	ctx := context.Background()
 	metrics := NewMetrics()
 	mq := brokerFor(t, WithObserver(metrics))
@@ -252,8 +294,24 @@ func TestAFailedPublishIsCounted(t *testing.T) {
 		t.Fatal("the unroutable publish succeeded")
 	}
 
-	if got := countFor(metrics, MetricPublishFailed); got != 1 {
-		t.Errorf("%s = %d, want 1", MetricPublishFailed, got)
+	counts := metrics.Counts()
+	labels := map[string]string{TagExchange: "events", TagRoutingKey: "nothing.listens"}
+
+	labels[TagOutcome] = OutcomeUnroutable
+	if got := counts[metricKey(MetricPublishTotal, labels)]; got != 1 {
+		t.Errorf("%s{outcome=%s} = %d, want 1", MetricPublishTotal, OutcomeUnroutable, got)
+	}
+	labels[TagOutcome] = OutcomeFailed
+	if got := counts[metricKey(MetricPublishTotal, labels)]; got != 0 {
+		t.Errorf("%s{outcome=%s} = %d, want 0: nothing failed, nothing was bound",
+			MetricPublishTotal, OutcomeFailed, got)
+	}
+
+	// The publish was still timed. A publish that got as far as the broker and
+	// came back has a duration, and leaving it out would make the timing series
+	// silently exclude the slow unroutable case.
+	if len(metrics.Durations()) == 0 {
+		t.Errorf("%s recorded nothing for an unroutable publish", MetricPublishDuration)
 	}
 }
 
