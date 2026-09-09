@@ -196,6 +196,27 @@ lets Confluent's clients, the Java library and this one read each other. A
 producer can then add a field with a default and a consumer that has never heard
 of it still reads the message. There is a test for exactly that.
 
+The two modes are not interchangeable, and a codec only claims the content type
+its own mode can read:
+
+| built with | claims | refuses |
+| --- | --- | --- |
+| `avro.Of` | `avro/binary` | `application/vnd.acemq.avro` |
+| `avro.Registered` | `application/vnd.acemq.avro` | `avro/binary` |
+
+Both take `application/avro` and any `*+avro` suffix type, because neither says
+how the body was framed and a message nothing claims is a message nobody reads.
+
+The gate matters. A fixed-schema codec handed a registry-framed message would
+pass the five framing bytes to the Avro reader as the start of the first field,
+and Avro does not object: it reads the shifted bytes as whatever they happen to
+mean and returns a record where every value is wrong, with no error and no log
+line. Refusing the content type turns silent corruption into a message nothing
+claimed, which is a thing somebody can see. The other direction was never
+silent — the registered decoder checks the framing byte and the schema
+identifier, and says which mode wrote the message it cannot read. Java, .NET,
+Python and Ruby gate the same way.
+
 ### Encryption
 
 ```go

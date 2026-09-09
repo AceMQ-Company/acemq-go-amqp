@@ -219,8 +219,111 @@ func TestItNeverAnswersForAnUntypedMessage(t *testing.T) {
 	if codec.CanDecode("application/json") {
 		t.Error("it claimed a JSON message")
 	}
-	if !codec.CanDecode(FixedContentType) || !codec.CanDecode(RegisteredContentType) {
-		t.Error("it refuses its own content types")
+	if !codec.CanDecode(FixedContentType) {
+		t.Error("it refuses its own content type")
+	}
+}
+
+// TestAFixedCodecRefusesARegistryFramedMessage is the one that matters.
+//
+// Accepting it lost data in silence: the five Confluent framing bytes went to
+// avro.Unmarshal as the start of the first field, Avro read the shifted bytes
+// as whatever they meant, and the handler was given a record where every value
+// was wrong — no error, no log line, nothing on any dashboard.
+func TestAFixedCodecRefusesARegistryFramedMessage(t *testing.T) {
+	framed, err := Registered(patterns.NewInMemorySchemaRegistry(), "order.placed", v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := framed.Encode(Order{OrderID: "A-1", TotalCents: 4250})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fixed, err := Of(v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixed.CanDecode(framed.ContentType()) {
+		t.Fatalf("a fixed-schema codec claimed a %s message", framed.ContentType())
+	}
+
+	// Why the refusal is worth having: this is what the handler was given when
+	// the codec claimed the message anyway.
+	var back Order
+	if err := fixed.Decode(body, &back); err == nil &&
+		back.OrderID == "A-1" && back.TotalCents == 4250 {
+		t.Fatal("the framed body decoded correctly through a fixed-schema codec, " +
+			"so this test no longer pins anything")
+	}
+}
+
+func TestARegisteredCodecRefusesAFixedSchemaMessage(t *testing.T) {
+	codec, err := Registered(patterns.NewInMemorySchemaRegistry(), "order.placed", v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if codec.CanDecode(FixedContentType) {
+		t.Errorf("a registry-framed codec claimed a %s message", FixedContentType)
+	}
+	if !codec.CanDecode(RegisteredContentType) {
+		t.Error("it refuses its own content type")
+	}
+}
+
+// Neither spelling says how the body was framed, so neither mode may refuse
+// them: a producer writing one of these has said Avro and nothing more, and a
+// message no codec claims is a message nobody reads.
+func TestBothModesTakeTheFramingNeutralTypes(t *testing.T) {
+	fixed, err := Of(v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	framed, err := Registered(patterns.NewInMemorySchemaRegistry(), "order.placed", v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, contentType := range []string{
+		"application/avro",
+		"application/avro; charset=utf-8",
+		"application/vnd.acme.order+avro",
+	} {
+		if !fixed.CanDecode(contentType) {
+			t.Errorf("a fixed-schema codec refused %q", contentType)
+		}
+		if !framed.CanDecode(contentType) {
+			t.Errorf("a registry-framed codec refused %q", contentType)
+		}
+	}
+}
+
+// The other direction was never silent, and this says so rather than assuming
+// it. The body below starts with the framing byte by coincidence — an empty
+// string is a zero length — so the length check alone does not save it, and it
+// is the schema identifier that turns out to name nothing that does.
+func TestAnUnframedBodyThatLooksFramedIsStillRefused(t *testing.T) {
+	fixed, err := Of(v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unframed, err := fixed.Encode(Order{OrderID: "", TotalCents: 1 << 40})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unframed[0] != magic || len(unframed) < frameSize {
+		t.Fatalf("this body is %d bytes starting %#x, and no longer poses as framed",
+			len(unframed), unframed[0])
+	}
+
+	framed, err := Registered(patterns.NewInMemorySchemaRegistry(), "order.placed", v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Order
+	if err := framed.Decode(unframed, &back); err == nil {
+		t.Fatalf("it decoded to %+v instead of failing", back)
 	}
 }
 

@@ -803,3 +803,135 @@ func waitForSpans(t *testing.T, r *recorder, want int) {
 	}
 	t.Fatalf("only %d spans were exported, want %d", len(r.spans()), want)
 }
+
+// TestADeadLetteredMessageSaysDeadLetteredAndNotRetried is the whole point of
+// the settlement seam.
+//
+// The handler asked for another attempt and the policy had none left, so the
+// message was given up on. A span that ended when the handler returned said
+// retried and stopped there, and somebody querying a trace backend for dead
+// letters found nothing at all.
+func TestADeadLetteredMessageSaysDeadLetteredAndNotRetried(t *testing.T) {
+	ctx := context.Background()
+	r := record(t)
+	mq := brokerFor(t,
+		acemq.WithPublishInterceptor(r.tracing.PublishInterceptor()),
+		acemq.WithRetry(acemq.FixedRetry(1, 0)))
+
+	handle := func(context.Context, acemq.Message[OrderPlaced]) acemq.Ack {
+		return acemq.Retry(errors.New("the pricing service is down"))
+	}
+	sub, err := acemq.Consume(ctx, mq, "orders", tracing.Handle(r.tracing, "orders", handle))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	orders := tracing.NewPublisher[OrderPlaced](r.tracing, mq, "", "orders")
+	if err := orders.Send(ctx, OrderPlaced{OrderID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitForSpans(t, r, 2)
+
+	processed := r.named(t, "orders process")
+	if got := attr(t, processed, tracing.AttrOutcome).AsString(); got != tracing.OutcomeDeadLettered {
+		t.Errorf("%s = %q, want %q: the handler asked for a retry and did not get one",
+			tracing.AttrOutcome, got, tracing.OutcomeDeadLettered)
+	}
+	if processed.Status.Code != codes.Error {
+		t.Errorf("status = %v, want error: the message was given up on", processed.Status.Code)
+	}
+
+	event := eventNamed(t, processed, tracing.EventMessageDeadLettered)
+	reason := eventAttr(t, event, tracing.AttrReason).AsString()
+	if !strings.Contains(reason, "exhausted 1 attempt") {
+		t.Errorf("%s = %q, want the reason it was given up on", tracing.AttrReason, reason)
+	}
+	if got := eventAttr(t, event, tracing.AttrDestination).AsString(); got != "orders" {
+		t.Errorf("%s = %q, want orders", tracing.AttrDestination, got)
+	}
+}
+
+// A retry that does happen is still a retry, and the event carries the delay the
+// engine chose rather than the one the policy was written with.
+func TestARetriedMessageCarriesTheDelayTheEngineChose(t *testing.T) {
+	ctx := context.Background()
+	r := record(t)
+	mq := brokerFor(t,
+		acemq.WithPublishInterceptor(r.tracing.PublishInterceptor()),
+		acemq.WithRetry(acemq.FixedRetry(3, 20*time.Millisecond)))
+
+	handle := func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+		if m.Envelope.Attempt == 1 {
+			return acemq.Retry(errors.New("the pricing service is down"))
+		}
+		return acemq.Accept()
+	}
+	sub, err := acemq.Consume(ctx, mq, "orders", tracing.Handle(r.tracing, "orders", handle))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	orders := tracing.NewPublisher[OrderPlaced](r.tracing, mq, "", "orders")
+	if err := orders.Send(ctx, OrderPlaced{OrderID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	// The publish and both deliveries. The engine's republish carries the trace
+	// but opens no span of its own: it is this library moving a message, not an
+	// application sending one.
+	waitForSpans(t, r, 3)
+
+	first := r.named(t, "orders process")
+	if got := attr(t, first, tracing.AttrOutcome).AsString(); got != tracing.OutcomeRetried {
+		t.Errorf("%s = %q, want retried", tracing.AttrOutcome, got)
+	}
+	if first.Status.Code != codes.Unset {
+		t.Errorf("status = %v, want unset: a retry is the system working", first.Status.Code)
+	}
+
+	event := eventNamed(t, first, tracing.EventMessageRetried)
+	if got := eventAttr(t, event, tracing.AttrRetryDelayMs).AsInt64(); got != 20 {
+		t.Errorf("%s = %d, want 20", tracing.AttrRetryDelayMs, got)
+	}
+	if got := eventAttr(t, event, tracing.AttrAttempt).AsInt64(); got != 2 {
+		t.Errorf("%s = %d, want the 2 the message goes back as", tracing.AttrAttempt, got)
+	}
+}
+
+// A handler that rejects a message on purpose keeps rejected, even though the
+// engine dead-letters it. The decision arrived where it was meant to, and a
+// trace view that fills with red for decisions stops meaning anything.
+func TestARejectedMessageKeepsItsOwnOutcome(t *testing.T) {
+	ctx := context.Background()
+	r := record(t)
+	mq := brokerFor(t, acemq.WithPublishInterceptor(r.tracing.PublishInterceptor()))
+
+	handle := func(context.Context, acemq.Message[OrderPlaced]) acemq.Ack {
+		return acemq.Reject(errors.New("no such customer"))
+	}
+	sub, err := acemq.Consume(ctx, mq, "orders", tracing.Handle(r.tracing, "orders", handle))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	orders := tracing.NewPublisher[OrderPlaced](r.tracing, mq, "", "orders")
+	if err := orders.Send(ctx, OrderPlaced{OrderID: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitForSpans(t, r, 2)
+
+	processed := r.named(t, "orders process")
+	if got := attr(t, processed, tracing.AttrOutcome).AsString(); got != tracing.OutcomeRejected {
+		t.Errorf("%s = %q, want rejected: the handler decided", tracing.AttrOutcome, got)
+	}
+	if processed.Status.Code != codes.Unset {
+		t.Errorf("status = %v, want unset", processed.Status.Code)
+	}
+	// The dead letter still happened, and is still on the span as an event.
+	if !hasEvent(processed, tracing.EventMessageDeadLettered) {
+		t.Errorf("no %s event: the message was dead-lettered and the span does not say so",
+			tracing.EventMessageDeadLettered)
+	}
+}

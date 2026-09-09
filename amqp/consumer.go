@@ -191,8 +191,18 @@ func Consume[T any](
 	for range cfg.concurrency {
 		go func() {
 			defer c.wg.Done()
+
+			// One settlement hook per worker, and one context carrying it,
+			// built here rather than per delivery: a worker handles one message
+			// at a time, so the hook can be cleared and reused. Nothing on the
+			// message path allocates for it, and a consumer nobody has
+			// instrumented never calls through it. See [OnSettled].
+			hook := &settlementHook{}
+			hookCtx := withSettlementHook(ctx, hook)
+
 			for d := range c.work {
-				handleDelivery(c, ctx, d, handler, cfg)
+				hook.reset()
+				handleDelivery(c, hookCtx, d, handler, cfg, hook)
 			}
 		}()
 	}
@@ -219,8 +229,14 @@ func Consume[T any](
 //
 // A function taking the consumer rather than a method on it, for the same
 // reason [Consume] is: a generic method needs go1.27.
+//
+// hook is how anything the handler registered through [OnSettled] hears what
+// was decided. Every path out of here settles exactly once, because a caller
+// holding something that has to be finished — a span, most obviously — has
+// nowhere else to hear that the message is done with.
 func handleDelivery[T any](
 	c *Consumer, ctx context.Context, d Delivery, handler Handler[T], cfg consumeConfig,
+	hook *settlementHook,
 ) {
 	// The attempt comes off the wire, because that is where a retry put it. An
 	// earlier version counted redeliveries in a map on this consumer, which is
@@ -251,9 +267,16 @@ func handleDelivery[T any](
 				// Refused before the handler ran. Dead-lettered rather than
 				// retried, because an interceptor that says no will say no
 				// again to the same message.
+				reason := "an interceptor refused it: " + describe(err)
 				observer.Count(MetricRejected, 1, labels)
 				observer.Count(MetricDeadLettered, 1, labels)
-				c.deadLetter(ctx, d, env, "an interceptor refused it: "+describe(err))
+				c.deadLetter(ctx, d, env, reason)
+				hook.settled(Settlement{
+					Queue:    c.queue,
+					Action:   SettledDeadLettered,
+					Envelope: env,
+					Reason:   reason,
+				})
 				return
 			}
 		}
@@ -268,8 +291,15 @@ func handleDelivery[T any](
 		// message nothing could read are different problems with different answers
 		// — one is usually the world, the other is usually a producer — and
 		// whoever drains the dead letters should not have to sort them by hand.
+		reason := "could not be decoded: " + describe(err)
 		observer.Count(MetricRejected, 1, labels)
-		c.park(ctx, d, env, "could not be decoded: "+describe(err))
+		c.park(ctx, d, env, reason)
+		hook.settled(Settlement{
+			Queue:    c.queue,
+			Action:   SettledParked,
+			Envelope: env,
+			Reason:   reason,
+		})
 		return
 	}
 
@@ -291,18 +321,32 @@ func handleDelivery[T any](
 		if d.Ack != nil {
 			_ = d.Ack()
 		}
+		hook.settled(Settlement{Queue: c.queue, Action: SettledAccepted, Envelope: env})
 
 	case ackReject:
-		c.deadLetter(ctx, d, env, "the handler rejected it: "+describe(ack.err))
+		reason := "the handler rejected it: " + describe(ack.err)
+		c.deadLetter(ctx, d, env, reason)
+		hook.settled(Settlement{
+			Queue:    c.queue,
+			Action:   SettledDeadLettered,
+			Envelope: env,
+			Reason:   reason,
+		})
 
 	case ackRetry:
 		if IsFatal(ack.err) {
 			// The handler asked for a retry but marked the reason as one that
 			// will not change. Honouring the mark rather than the request is
 			// the point of having it.
+			reason := "the handler reported an unprocessable message: " + describe(ack.err)
 			observer.Count(MetricDeadLettered, 1, labels)
-			c.deadLetter(ctx, d, env,
-				"the handler reported an unprocessable message: "+describe(ack.err))
+			c.deadLetter(ctx, d, env, reason)
+			hook.settled(Settlement{
+				Queue:    c.queue,
+				Action:   SettledDeadLettered,
+				Envelope: env,
+				Reason:   reason,
+			})
 			return
 		}
 
@@ -314,10 +358,31 @@ func handleDelivery[T any](
 			wait, again = Wait{}, true
 		}
 		if !again {
+			// The message asked for another attempt and there is none left.
+			// This is the moment the two things a reader wants diverge: the
+			// handler said retry, and what happened is a dead letter. Anything
+			// that stops at the handler reports the first and never the second.
+			reason := c.exhausted(env) + ": " + describe(ack.err)
 			observer.Count(MetricDeadLettered, 1, labels)
-			c.deadLetter(ctx, d, env, c.exhausted(env)+": "+describe(ack.err))
+			c.deadLetter(ctx, d, env, reason)
+			hook.settled(Settlement{
+				Queue:    c.queue,
+				Action:   SettledDeadLettered,
+				Envelope: env,
+				Reason:   reason,
+			})
 			return
 		}
+
+		// Said before the retry rather than after it, so the delay reported is
+		// the one just chosen and not one already spent — and so a span covering
+		// the handler is not held open across a wait the handler is not doing.
+		hook.settled(Settlement{
+			Queue:    c.queue,
+			Action:   SettledRetried,
+			Envelope: env.NextAttempt(),
+			Delay:    wait.Delay,
+		})
 
 		if wait.InBroker && c.retryInBroker(ctx, d, env, wait.Delay) {
 			return

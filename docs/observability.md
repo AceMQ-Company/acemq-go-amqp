@@ -164,6 +164,42 @@ An event with no span open is dropped rather than opening one for itself. That
 is a legitimate answer: an outbox relay on its own goroutine with no delivery in
 flight has nothing to hang an event on.
 
+### The engine has the last word on a delivery
+
+`message.retried` and `message.dead_lettered` are written by the engine rather
+than by the handler, because the handler does not know which of the two
+happened. A handler asking for a retry is a request: the engine still has to
+look at the policy, and a message on its last attempt is dead-lettered instead.
+
+`otel.Handle` therefore hands the ending of a delivery's span to the engine,
+through `acemq.OnSettled`:
+
+```go
+acemq.OnSettled(ctx, func(s acemq.Settlement) {
+	// s.Action is accepted, retried, dead_lettered or parked.
+	// s.Delay is the retry delay the engine actually chose.
+	// s.Reason is why it was given up on.
+})
+```
+
+Call it from inside a handler with the handler's own context. `f` runs exactly
+once, on the same goroutine, after the handler has returned and after the engine
+has decided — which is the only moment at which a retry's delay or a dead
+letter's reason exists. It reports `false` when there is no engine listening,
+which is what a handler called directly from a test is, and a caller holding
+something that has to be finished either way should then finish it itself.
+
+Nothing is allocated per delivery for this and nothing is called when nobody has
+registered: a consumer's worker holds one hook and reuses it, so a service that
+publishes plaintext and traces nothing pays nothing for the seam.
+
+What this fixes: a message that exhausted its attempts used to carry
+`outcome="retried"` on its span, because that is what the handler asked for and
+the span ended before the engine answered. It now carries `dead_lettered`, with
+`message.dead_lettered` and the reason on it. A handler that rejected a message
+on purpose still carries `rejected` — that decision arrived where it was meant
+to — with the dead-letter event alongside it.
+
 ### Trace context for a message this library does not publish
 
 ```go

@@ -152,15 +152,37 @@ func (c *Codec) Decode(body []byte, dst any) error {
 	return nil
 }
 
-// CanDecode accepts the Avro content types, and never an absent one.
+// CanDecode accepts the Avro content types this codec's mode can actually read,
+// and never an absent one.
+//
+// The mode matters here and the two spellings are not interchangeable. A
+// fixed-schema codec that claimed a registry-framed message would hand the five
+// Confluent framing bytes to the Avro reader as though they were the start of
+// the first field, and Avro does not object: it reads the shifted bytes as
+// whatever they happen to mean and returns a record where every value is wrong,
+// with no error and no log line. Refusing the content type turns silent
+// corruption into a message no codec claimed, which is a thing somebody can
+// see. The Java, .NET, Python and Ruby libraries gate the same way.
+//
+//   - [Of] claims [FixedContentType] and refuses [RegisteredContentType].
+//   - [Registered] claims [RegisteredContentType] and refuses [FixedContentType].
+//
+// application/avro and any +avro suffix type say Avro without saying which
+// framing, so both modes take them: a producer writing one of those has said
+// nothing about how it framed the body, and refusing them would leave a message
+// nothing would read.
 func (c *Codec) CanDecode(contentType string) bool {
 	if contentType == "" {
 		return false
 	}
 	lower := strings.ToLower(contentType)
-	return strings.HasPrefix(lower, FixedContentType) ||
-		strings.HasPrefix(lower, RegisteredContentType) ||
-		strings.HasPrefix(lower, "application/avro") ||
+	switch {
+	case strings.HasPrefix(lower, RegisteredContentType):
+		return c.registered
+	case strings.HasPrefix(lower, FixedContentType):
+		return !c.registered
+	}
+	return strings.HasPrefix(lower, "application/avro") ||
 		strings.Contains(lower, "+avro")
 }
 

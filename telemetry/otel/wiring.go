@@ -159,10 +159,33 @@ func finishPublish(span *Span, result acemq.PublishResult, err error) {
 // The queue is passed rather than read off the delivery because a handler is
 // given a message, not the subscription it arrived on, and the span is named
 // after the queue.
+//
+// # The engine has the last word
+//
+// A handler asking for a retry is a request, not an outcome: the engine still
+// has to look at the policy, and a message on its last attempt is dead-lettered
+// instead. A span ended when the handler returned would be closed before that
+// happened, and would say retried for a message nobody will ever try again —
+// which is exactly what somebody searching a trace backend for dead letters
+// fails to find.
+//
+// So the span's ending is handed to the engine through [acemq.OnSettled], and
+// the retry and dead-letter events are written where the decision is taken. A
+// handler called directly rather than run by a consumer gets no engine and no
+// handover, and its span ends here as it always did.
 func Handle[T any](t *Tracing, queue string, next acemq.Handler[T]) acemq.Handler[T] {
 	return func(ctx context.Context, m acemq.Message[T]) acemq.Ack {
 		ctx, span := t.StartConsume(ctx, queue, m.Envelope)
-		defer span.End()
+
+		// What the handler asked for, which the settlement below needs in order
+		// to tell a message the handler gave up on from one the engine did.
+		// Assigned after next returns; the closure reads it then.
+		var asked string
+		if !acemq.OnSettled(ctx, func(s acemq.Settlement) {
+			t.settled(ctx, span, asked, s)
+		}) {
+			defer span.End()
+		}
 
 		// A handler that panics is a handler that failed, and the span has to
 		// say so before the panic carries on to whoever handles it.
@@ -179,7 +202,8 @@ func Handle[T any](t *Tracing, queue string, next acemq.Handler[T]) acemq.Handle
 		// Ack keeps its decision unexported — returning a value rather than
 		// calling a method is what stops a handler forgetting to decide — so
 		// String is what there is to read it by.
-		switch ack.String() {
+		asked = ack.String()
+		switch asked {
 		case "retry":
 			// Not an error. The message will be tried again, and very often
 			// succeeds; the reason is still worth carrying, as an exception
@@ -192,6 +216,29 @@ func Handle[T any](t *Tracing, queue string, next acemq.Handler[T]) acemq.Handle
 		}
 		return ack
 	}
+}
+
+// settled writes what the engine did onto the handler's span and ends it.
+//
+// asked is what the handler wanted, and it decides whether the outcome the
+// handler set is overwritten. A handler that rejected a message on purpose keeps
+// rejected even though the engine dead-letters it: that is the handler's
+// decision arriving where it was meant to, and marking it as an error is how a
+// trace view fills with red and stops meaning anything. A handler that asked for
+// a retry and got a dead letter is the opposite case — what it asked for did not
+// happen, and the span has to say what did.
+func (t *Tracing) settled(ctx context.Context, span *Span, asked string, s acemq.Settlement) {
+	switch s.Action {
+	case acemq.SettledRetried:
+		t.MessageRetried(ctx, s.Queue, s.Envelope, s.Delay)
+
+	case acemq.SettledDeadLettered, acemq.SettledParked:
+		t.MessageDeadLettered(ctx, s.Queue, s.Envelope, s.Reason)
+		if asked != "reject" {
+			span.Outcome(OutcomeDeadLettered)
+		}
+	}
+	span.End()
 }
 
 // Middleware is [Handle] as a [patterns.Middleware], so tracing can sit in a

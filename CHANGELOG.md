@@ -164,6 +164,55 @@ While the version is `0.x` the public API may change in any release.
 
 ### Fixed
 
+- **`codec/avro` no longer decodes a message written in the other mode into
+  nonsense.** `CanDecode` accepted all four Avro content-type spellings whatever
+  mode the codec was in, so a fixed-schema codec claimed a registry-framed
+  message and handed the five Confluent framing bytes — one zero byte and four
+  bytes of schema identifier — to `avro.Unmarshal` as though they were the start
+  of the first field. Avro does not object to that. It reads the shifted bytes as
+  whatever they happen to mean and returns a record where every value is wrong,
+  with no error, no log line and nothing on any dashboard. A round trip through a
+  registered producer and a fixed consumer came back as an empty order for zero
+  pence.
+
+  A codec now claims only the spelling its own mode can read: `avro.Of` claims
+  `avro/binary` and refuses `application/vnd.acemq.avro`, `avro.Registered` the
+  reverse. Both still take `application/avro` and any `*+avro` suffix type,
+  because neither of those says how the body was framed and a message nothing
+  claims is a message nobody reads. Java, .NET, Python and Ruby have always
+  gated this way; Go was the only one that did not.
+
+  The other direction was never silent — the registered decoder checks the
+  framing byte and then the schema identifier — and there is now a test that
+  says so rather than assuming it, using a body that starts with the framing byte
+  by coincidence so the length check alone cannot be what saves it.
+
+- **A dead-lettered message's span said `retried`.** `telemetry/otel` exposed
+  `message.retried` and `message.dead_lettered` as methods an application could
+  call, and nothing in the engine called them: Go's engine had only
+  `Observer.Count`, which carries no span context. So the last thing written on a
+  delivery's span was whatever the handler asked for, and a handler that asks for
+  a retry it will not get — because the attempts have run out — left a span
+  saying `retried` for a message nobody would ever try again. Anybody querying a
+  trace backend for dead letters found nothing at all.
+
+  The engine now settles every delivery through a seam of its own,
+  `acemq.OnSettled`, which reports what actually happened: `accepted`, `retried`
+  with the delay the policy chose, `dead_lettered` with the reason, or `parked`.
+  `otel.Handle` registers on it and hands the ending of the span to the engine,
+  which is the only way the two events can land on it — a span ended when the
+  handler returned is closed before the engine decides. A handler that rejected a
+  message on purpose keeps `rejected`: that decision arrived where it was meant
+  to, and a trace view that fills with red for decisions stops meaning anything.
+
+  Java calls its `Telemetry` interface at these two moments and reaches the span
+  through `Span.current()`. Go has no ambient current span, so the seam passes
+  the handler's own context back instead. It costs a process that traces nothing
+  nothing at all: each consumer worker holds one hook and clears it between
+  deliveries, so there is no per-delivery allocation and no call when nobody has
+  registered. `telemetry/otel` remains a module of its own and the root module's
+  dependencies are unchanged.
+
 - **`crypto.ContentType` no longer claims an interoperability that does not
   exist.** Its documentation said the content type was "what Java and .NET
   write", which is true of the string and of nothing after it. All five libraries
