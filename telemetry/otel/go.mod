@@ -13,7 +13,7 @@ module github.com/AceMQ-Company/acemq-go-amqp/telemetry/otel
 go 1.23.0
 
 require (
-	github.com/AceMQ-Company/acemq-go-amqp v0.3.0
+	github.com/AceMQ-Company/acemq-go-amqp v0.5.0
 	go.opentelemetry.io/otel v1.38.0
 	go.opentelemetry.io/otel/sdk v1.38.0
 	go.opentelemetry.io/otel/trace v1.38.0
