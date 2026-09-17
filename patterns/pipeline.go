@@ -154,10 +154,14 @@ type Middleware[T any] func(acemq.Handler[T]) acemq.Handler[T]
 //	handler := patterns.Chain(handle,
 //		patterns.WithLogging[OrderPlaced](log.Printf),
 //		patterns.WithTimeout[OrderPlaced](10*time.Second),
-//		patterns.Idempotent[OrderPlaced](store))
+//		patterns.WithIdempotency[OrderPlaced](store))
 //
 // Logging is outermost, so it records what the timeout and the idempotency
 // guard decided.
+//
+// [WithIdempotency] rather than [Idempotent]: the middleware takes the store and
+// returns something that wraps a handler, while Idempotent takes the store and
+// the handler together and is what to reach for outside a chain.
 func Chain[T any](handler acemq.Handler[T], middleware ...Middleware[T]) acemq.Handler[T] {
 	// Applied in reverse so the first named ends up outermost, which is the
 	// order somebody reading the list expects.

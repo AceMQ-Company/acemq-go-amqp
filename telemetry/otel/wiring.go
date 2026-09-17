@@ -31,9 +31,15 @@ import (
 //		acemq.WithPublishInterceptor(tracing.PublishInterceptor()))
 //
 // Register it once and every publisher on that connection carries the trace,
-// including the ones inside [patterns.Requester] and the outbox relay. It
-// writes nothing when nothing is being traced, so a process with no SDK
-// configured publishes exactly the headers it did before.
+// including the ones inside [patterns.Requester], [patterns.Serve] and a routing
+// slip's forward. It writes nothing when nothing is being traced, so a process
+// with no SDK configured publishes exactly the headers it did before.
+//
+// It does not reach everything the library sends. Retries, dead letters, parks,
+// [patterns.Replay], [patterns.OutboxRelay] and [patterns.Scheduler] publish
+// through acemq.Conn.PublishRaw, which has no interceptor chain — so an
+// outbox-relayed message carries whatever trace context was stored with the
+// record, and a dead letter carries the one the original message already had.
 //
 // It also completes the attributes of a span opened by [Tracing.StartPublish]
 // or [Tracing.StartRequest], which are opened before the envelope exists. A

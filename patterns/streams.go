@@ -167,15 +167,27 @@ func durationArg(d time.Duration) string {
 // # How this differs from consuming a queue
 //
 // Acknowledging does not remove the message: a stream keeps everything until
-// its retention policy discards it. What an acknowledgement does is advance
-// this consumer's position, so restarting from FromNext carries on rather than
-// re-reading.
+// its retention policy discards it. What an acknowledgement does is move this
+// run forward, and nothing more — it does not record a position anywhere the
+// broker will give back. This function always names an explicit x-stream-offset
+// on the wire, StreamOptions.Offset's, so where a run starts is that option and
+// never a position the broker remembered. A restarted consumer on FromNext sees
+// what is published from then on rather than carrying on where it stopped;
+// resuming exactly means recording the x-stream-offset header as you go and
+// starting from FromOffset.
 //
-// Rejecting a message does not dead-letter it either, because there is nothing
-// to remove it from. A message that cannot be handled has to be dealt with by
-// the handler — logged, copied to another queue, counted — and the stream moves
-// on regardless. That is the trade a stream makes: nothing is lost, and nothing
-// is retried for you.
+// Returning acemq.Retry is the wrong verb here. A retry republishes the message
+// onto the queue it came from, which on a stream appends a second copy to the
+// log at a new offset, for every consumer to read now and on every replay
+// afterwards.
+//
+// Rejecting does not dead-letter in the broker's sense, because a stream carries
+// no x-dead-letter-exchange and nothing can be removed from it. The engine's own
+// path still runs: acemq.Reject republishes a copy to {stream}.dlq and
+// acemq.Park to {stream}.parked, and the original stays in the stream. A message
+// that cannot be handled otherwise has to be dealt with by the handler — logged,
+// counted, copied elsewhere — and the stream moves on regardless. That is the
+// trade a stream makes: nothing is lost, and nothing is retried for you.
 func ReadStream[T any](
 	ctx context.Context, conn *acemq.Conn, stream string,
 	handler acemq.Handler[T], opts StreamOptions,
