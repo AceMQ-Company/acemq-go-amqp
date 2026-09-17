@@ -15,7 +15,10 @@ err := patterns.DeclareStream(ctx, mq, "orders.log", patterns.StreamRetention{
 
 sub, err := patterns.ReadStream(ctx, mq, "orders.log",
 	func(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
-		return projection.Apply(ctx, m.Payload)
+		if err := projection.Apply(ctx, m.Payload); err != nil {
+			return acemq.Reject(err)
+		}
+		return acemq.Accept()
 	},
 	patterns.StreamOptions{Offset: patterns.FromFirst(), Prefetch: 100})
 defer sub.Close()
