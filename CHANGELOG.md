@@ -95,6 +95,64 @@ While the version is `0.x` the public API may change in any release.
 
 ### Fixed
 
+- **Publishing raced the connection recovery. `go test -race` found it on CI,
+  during a broker restart, and nothing that runs on a laptop could have.**
+  `Transport.Publish` read `confirming` — the flag that decides whether a publish
+  waits for a confirm — outside the mutex `reconnectOnce` holds while it writes
+  it. Both accesses were introduced by the two entries below: taking the confirm
+  wait out from under the channel lock narrowed the critical section to the write
+  itself, which was the point, and left the branch that chooses between the two
+  publish paths reading a field that a reconnection assigns.
+
+  **The pipelining is untouched.** The confirm is still awaited outside the lock
+  and a batch still costs one broker round trip; the lock was not widened back.
+  The field is simply no longer written on reconnection at all. A recovery
+  redials with the transport's own `WithoutConfirms`, and `Dial` fails rather
+  than handing back a connection without the confirms it was asked for, so
+  `confirming` is whatever `Dial` decided and cannot become anything else.
+  Assigning it again was writing the value that was already there — a data race
+  whose only effect, besides being one, was nothing.
+
+  **Three more unsynchronised reads went with it**, found by auditing every
+  field the recovery path writes against every field publishing touches rather
+  than by fixing the one line the report named. `conn` is replaced on
+  reconnection too, and `Consume`, `CheckQueue`, `MessageCount`, `DeleteQueue`
+  and `QueueExists` all read it without the lock to open a channel of their own;
+  they take a snapshot under it now. `Supports(CapabilityPublisherConfirms)` read
+  `confirming` unguarded as well, which the same fix settles. `Close` read `conn`
+  outside the lock it had just released, which was safe only because the recovery
+  goroutine has already been waited for by then; it now reads it inside.
+
+  **A publish interrupted by the reconnection no longer reports that the broker
+  refused it.** The client answers every publish still waiting on a channel that
+  closes with a nack, which is true of the channel and a lie about the broker, and
+  the transport passed that on as `the broker refused it` — sending the caller to
+  look for a fault in a message the broker never objected to and may well have
+  taken. A publish now carries the channel and a connection generation from the
+  write to the confirm, and a nack that arrives with either of them gone says the
+  connection was lost or the channel closed before the broker confirmed it, that
+  whether it arrived is unknown, and that republishing is for callers who can
+  afford a duplicate.
+
+  **This is the argument for the integration job.** The race needs a connection
+  to be replaced underneath a publish in flight, which means a broker going away
+  while the process keeps running — nothing a unit test or a local
+  `go test ./...` does. `rabbitmq/recovery_test.go` is the regression test and
+  needs no restart: it drives the recovery path by hand while sixteen goroutines
+  publish, and with the defect restored it reproduced the race in six runs out of
+  six.
+
+- **A connection the broker had blocked stayed blocked for ever after a
+  reconnection.** `connection.blocked` is recorded so that publishing can be
+  refused rather than hang, and `Publish` consults it first. The reason was not
+  cleared when the connection it belonged to was replaced, and the `unblocked`
+  that would have cleared it could only arrive on a connection nobody was
+  watching — recovery dials a replacement whose own watcher writes into a struct
+  that is then discarded. A broker that blocked a connection while it was low on
+  disk, and dropped it before recovering, left every subsequent publish on the
+  new connection refused with a reason from a connection that no longer existed.
+  The state is cleared on reconnection now, and the new connection is watched.
+
 - **Documentation said the stream prefetch default was a gap between the
   libraries. It is not, and [docs/streams.md](docs/streams.md#prefetch) now says
   so.** Go supplies 10 when `StreamOptions.Prefetch` is unset, Java and .NET

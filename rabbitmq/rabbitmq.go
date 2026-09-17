@@ -221,16 +221,35 @@ type Transport struct {
 	// channel is not safe for concurrent use, and sharing one under a lock is
 	// simpler to reason about than a pool for the traffic a publisher generates.
 	//
-	// The lock covers the write and nothing else. Waiting for the confirm used
-	// to happen under it too, which serialised every publish behind a full
-	// broker round trip and made a pipelined batch no faster than a loop.
+	// The lock covers reading the field and the write, and nothing else.
+	// Waiting for the confirm used to happen under it too, which serialised
+	// every publish behind a full broker round trip and made a pipelined batch
+	// no faster than a loop. Reading the field outside it is not an option
+	// either: a recovery replaces it, so every use goes through the lock or
+	// through a snapshot taken under it.
 	mu      sync.Mutex
 	channel *amqp.Channel
 
+	// generation says which connection conn and channel are: Dial's is the
+	// first and every recovery makes another. A publish reads it with the write
+	// and again once the confirm has resolved, because the client answers every
+	// publish still waiting on a dying channel with a nack — true of the
+	// channel, and a lie about the broker. Without it, a message lost to a
+	// reconnection was reported as one the broker refused.
+	generation uint64
+
 	// returns carries messages the broker could not route. It is drained after
 	// a confirm rather than watched, because the protocol guarantees a return
-	// arrives before the confirm for the same publish.
-	returns    chan amqp.Return
+	// arrives before the confirm for the same publish. Guarded by returnsMu
+	// below, alongside the map it is drained into.
+	returns chan amqp.Return
+
+	// confirming is fixed for the life of the transport, which is why it is the
+	// one field here read without a lock: Dial sets it before the transport is
+	// anyone else's, and a recovery redials with the same WithoutConfirms and
+	// so cannot arrive at a different answer. It used to be assigned again on
+	// every reconnection — with the value it already had — which was a data
+	// race against every publish, and one only a broker restart could show.
 	confirming bool
 
 	// outstanding is the semaphore that bounds unconfirmed publishes. A slot is
@@ -380,6 +399,7 @@ func Dial(ctx context.Context, url string, cfg ...Config) (*Transport, error) {
 		cfg:         c,
 		conn:        conn,
 		channel:     ch,
+		generation:  1,
 		stopRecov:   make(chan struct{}),
 		outstanding: make(chan struct{}, bound),
 		returned:    map[string]string{},
@@ -497,11 +517,7 @@ func (t *Transport) Publish(
 	}
 
 	if !t.confirming {
-		t.mu.Lock()
-		err := t.channel.PublishWithContext(
-			ctx, exchange, routingKey, msg.Mandatory, false, publishing)
-		t.mu.Unlock()
-		if err != nil {
+		if _, _, err := t.send(ctx, exchange, routingKey, msg.Mandatory, false, publishing); err != nil {
 			return result, &acemq.PublishFailedError{
 				MessageID: msg.MessageID, Exchange: exchange, RoutingKey: routingKey, Err: err}
 		}
@@ -520,14 +536,8 @@ func (t *Transport) Publish(
 	}
 	defer t.release()
 
-	// The write is under the lock because an AMQP channel is not safe for
-	// concurrent writes, and because the sequence number the confirm will name
-	// is assigned by the write itself. The wait below is not, which is what
-	// makes a batch cost one round trip rather than one per message.
-	t.mu.Lock()
-	confirmation, err := t.channel.PublishWithDeferredConfirmWithContext(
-		ctx, exchange, routingKey, msg.Mandatory, false, publishing)
-	t.mu.Unlock()
+	confirmation, sent, err := t.send(
+		ctx, exchange, routingKey, msg.Mandatory, true, publishing)
 	if err != nil {
 		return result, &acemq.PublishFailedError{
 			MessageID: msg.MessageID, Exchange: exchange, RoutingKey: routingKey, Err: err}
@@ -539,6 +549,11 @@ func (t *Transport) Publish(
 			"acemq: waiting for the broker to confirm message %s: %w", msg.MessageID, err)
 	}
 	if !acked {
+		if lost, ok := t.lostRatherThanRefused(sent); ok {
+			return result, &acemq.PublishFailedError{
+				MessageID: msg.MessageID, Exchange: exchange, RoutingKey: routingKey,
+				Err: errors.New(lost)}
+		}
 		// A nack is the broker saying it could not take the message. Retrying
 		// is the caller's decision; losing it quietly is not on offer.
 		return result, &acemq.PublishFailedError{
@@ -557,6 +572,88 @@ func (t *Transport) Publish(
 		}
 	}
 	return result, nil
+}
+
+// inFlight is what a publish has to remember about where it went, so that a
+// confirm arriving after the connection has moved on can still be judged.
+type inFlight struct {
+	channel    *amqp.Channel
+	generation uint64
+}
+
+// send writes one message, and says where it went.
+//
+// Reading the channel and writing to it happen under one acquisition of the
+// lock, which is the whole of the critical section. Snapshotting the channel and
+// releasing the lock before the write would be worse than reading the field
+// unguarded: a recovery landing in between would put the message on a channel
+// that is already dead, and the write is also what assigns the sequence number
+// the confirm will name.
+//
+// Waiting for that confirm is deliberately not in here. That is what makes a
+// pipelined batch cost one broker round trip rather than one per message, and it
+// is why the channel and the generation come back with the confirmation: by the
+// time the confirm resolves, neither may be the transport's any more.
+func (t *Transport) send(
+	ctx context.Context, exchange, routingKey string, mandatory, confirm bool,
+	publishing amqp.Publishing,
+) (*amqp.DeferredConfirmation, inFlight, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	sent := inFlight{channel: t.channel, generation: t.generation}
+	if !confirm {
+		return nil, sent, t.channel.PublishWithContext(
+			ctx, exchange, routingKey, mandatory, false, publishing)
+	}
+	confirmation, err := t.channel.PublishWithDeferredConfirmWithContext(
+		ctx, exchange, routingKey, mandatory, false, publishing)
+	return confirmation, sent, err
+}
+
+// lostRatherThanRefused explains a nack the broker did not send, and reports
+// whether that is what happened.
+//
+// The client answers every publish still waiting on a channel that closes with
+// a nack: true of the channel, and a lie about the broker. Told apart here
+// because the difference is the whole of what the caller should do next —
+// nobody can fix a message the broker never objected to, and it may well have
+// arrived.
+//
+// The channel's own state is the question, not whether a recovery has happened
+// yet: the connection dies first and the reconnection follows a delay, so
+// asking only about the generation would call the publishes that lost the race
+// to that delay refusals.
+func (t *Transport) lostRatherThanRefused(sent inFlight) (string, bool) {
+	const unknown = ", so whether it arrived is unknown; " +
+		"publish it again only if a duplicate is acceptable"
+
+	switch {
+	case t.reconnectedSince(sent.generation):
+		return "the connection was lost and remade before the broker confirmed it" + unknown, true
+	case sent.channel.IsClosed():
+		return "the channel it was published on closed before the broker confirmed it" + unknown, true
+	}
+	return "", false
+}
+
+// reconnectedSince reports whether the connection has been remade since the
+// generation given.
+func (t *Transport) reconnectedSince(generation uint64) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.generation != generation
+}
+
+// connection is the connection as it is now.
+//
+// Taken under the lock because a recovery replaces it. Everything that opens a
+// channel of its own comes through here, and a connection that has since been
+// replaced at worst refuses to open one — which is reported rather than hidden.
+func (t *Transport) connection() *amqp.Connection {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.conn
 }
 
 // defaultMaxOutstandingPublishes is Java's number, and .NET's.
@@ -682,7 +779,7 @@ func (t *Transport) Consume(
 
 	// A channel per consumer, so one consumer's prefetch and its cancellation
 	// do not touch another's.
-	ch, err := t.conn.Channel()
+	ch, err := t.connection().Channel()
 	if err != nil {
 		return nil, fmt.Errorf("acemq: cannot open a channel for %q: %w", queue, err)
 	}
@@ -750,9 +847,10 @@ func (t *Transport) Close() error {
 	if t.channel != nil {
 		_ = t.channel.Close()
 	}
+	conn := t.conn
 	t.mu.Unlock()
 
-	return t.conn.Close()
+	return conn.Close()
 }
 
 type subscription struct {
@@ -786,11 +884,7 @@ func (s *subscription) reattach(_ context.Context, t *Transport) error {
 	queue, spec, deliver, tag := s.queue, s.spec, s.deliver, s.tag
 	s.mu.Unlock()
 
-	t.mu.Lock()
-	conn := t.conn
-	t.mu.Unlock()
-
-	ch, err := conn.Channel()
+	ch, err := t.connection().Channel()
 	if err != nil {
 		return fmt.Errorf("acemq: cannot reopen a channel for %q after reconnecting: %w", queue, err)
 	}
@@ -904,7 +998,7 @@ func (s *subscription) Close() error {
 // not a read-only operation — which is why the library asks QueueExists first
 // and only calls this for queues that are already there.
 func (t *Transport) CheckQueue(_ context.Context, name string, spec acemq.QueueSpec) error {
-	ch, err := t.conn.Channel()
+	ch, err := t.connection().Channel()
 	if err != nil {
 		return fmt.Errorf("acemq: cannot open a channel to check queue %q: %w", name, err)
 	}
@@ -928,7 +1022,7 @@ func (t *Transport) CheckQueue(_ context.Context, name string, spec acemq.QueueS
 // asked about a queue that does not exist: the broker replies NOT_FOUND and
 // closes the channel, so this uses one of its own.
 func (t *Transport) MessageCount(_ context.Context, name string) (int64, error) {
-	ch, err := t.conn.Channel()
+	ch, err := t.connection().Channel()
 	if err != nil {
 		return 0, fmt.Errorf("acemq: cannot open a channel to count queue %q: %w", name, err)
 	}
@@ -947,7 +1041,7 @@ func (t *Transport) MessageCount(_ context.Context, name string) (int64, error) 
 // be gone and it is. Anything else would make cleaning up after a test a matter
 // of guessing what ran.
 func (t *Transport) DeleteQueue(_ context.Context, name string) error {
-	ch, err := t.conn.Channel()
+	ch, err := t.connection().Channel()
 	if err != nil {
 		return fmt.Errorf("acemq: cannot open a channel to delete queue %q: %w", name, err)
 	}
@@ -970,7 +1064,7 @@ func (t *Transport) DeleteQueue(_ context.Context, name string) error {
 // channel doing so, which is why this asks on a throwaway one rather than
 // taking the connection's publishing down as the price of a question.
 func (t *Transport) QueueExists(_ context.Context, name string) (bool, error) {
-	ch, err := t.conn.Channel()
+	ch, err := t.connection().Channel()
 	if err != nil {
 		return false, fmt.Errorf("acemq: cannot open a channel to look for queue %q: %w", name, err)
 	}
@@ -1081,11 +1175,25 @@ func (t *Transport) reconnectOnce() (chan *amqp.Error, error) {
 		return nil, err
 	}
 
+	// confirming is not reassigned here. fresh was dialled with this
+	// transport's own WithoutConfirms and Dial fails rather than returning a
+	// connection without the confirms it was asked for, so the value cannot
+	// have changed — and writing it anyway raced every publish reading it to
+	// decide which of the two publish paths to take.
 	t.mu.Lock()
 	t.conn = fresh.conn
 	t.channel = fresh.channel
-	t.confirming = fresh.confirming
+	t.generation++
 	t.mu.Unlock()
+
+	// The blocked state belonged to the connection that has just died. Left
+	// alone it would refuse every publish on the new one for ever, because the
+	// unblock that cleared it can only arrive on a connection nobody is
+	// watching: fresh's own watcher writes into fresh, which is discarded here.
+	t.blockedMu.Lock()
+	t.blocked = ""
+	t.blockedMu.Unlock()
+	go t.watchBlocked(fresh.conn.NotifyBlocked(make(chan amqp.Blocking, 4)))
 
 	// The old channel's returns died with it, and anything still filed against
 	// it belongs to publishes that failed when the connection went. Keeping
