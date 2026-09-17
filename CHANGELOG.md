@@ -107,6 +107,63 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`avro.ReadAs`, so a registered Avro codec reads every message against the
+  schema the consumer was written against rather than the one the producer
+  sent.** Java has had `AvroCodec.registered(registry, readerSchema)` and .NET
+  resolves against its own schema on every message; this library looked the
+  writer's schema up and then decoded with it, which is only half of schema
+  evolution and the half that does less work.
+
+  ```go
+  consumer, err := avro.Registered(registry, "order.placed", schema,
+      avro.ReadAs(schema))
+  ```
+
+  What the missing half cost: a consumer decoded whatever shape the producer
+  happened to send. A field it had never heard of arrived and a field it expected
+  came back as the zero value — `""`, `0`, `false` — for as long as the producer
+  had not started sending it, with no way to tell *absent* from *empty*. Given
+  both schemas Avro resolves them: the unknown field is skipped rather than
+  shifting every field after it, and the missing one is filled in from the
+  reader's own default, so a schema saying `"default":"public"` produces
+  `"public"` and not `""`. The consumer sees the shape it was written against
+  whichever version wrote the message, which is the entire reason the registered
+  mode exists.
+
+  The resolution is Avro's, through `SchemaCompatibility.Resolve` — a composite
+  schema built from the pair, not a re-parse of the bytes against a different
+  schema and not a field-by-field copy. That is what makes the failure cases
+  right as well as the happy one: a writer schema that cannot be resolved onto
+  the reader's — a field added without a default, a type changed to one Avro will
+  not promote — is a fatal error printing **both** schemas in full, because the
+  two are usually versions of one record and share a name, so naming one of them
+  says nothing. Resolution is done once per schema identifier and remembered; an
+  identifier stands for one schema forever.
+
+  **Nothing changes for code that does not pass it.** `avro.Registered` gained a
+  variadic option parameter, so every existing call still compiles and still
+  decodes against the writer's schema exactly as it did. That default is
+  deliberate and is where this library parts from .NET, which resolves
+  unconditionally: turning resolution on underneath an unchanged call would
+  change what every deployed consumer sees — a field it had been ignoring starts
+  arriving as a default — and a silent change of meaning is worse than an
+  argument. Opting in is one argument.
+
+  **The wire format is untouched.** `ReadAs` is a read-side decision and the
+  bytes a producer writes are identical with it and without it: one zero byte,
+  four bytes of identifier, big-endian, then the Avro body. Content types,
+  `CanDecode` and the gate between the two modes are unchanged, and there is a
+  test asserting a codec built with a reader schema encodes byte-for-byte what
+  one built without it encodes. Java, .NET, Python and Ruby read the same
+  messages they always did.
+
+  What a reader has to do about it: nothing, unless producers and consumers are
+  deployed independently — in which case add `avro.ReadAs(schema)` to the
+  consumer's `avro.Registered` call, passing the same schema the codec was built
+  with, and audit any handler that has been treating a zero value as *the
+  producer has not sent this yet*. That reading stops being true once the
+  reader's default fills the field in.
+
 - A test asserting the three replay stamps stay outside the `x-acemq-` namespace
   and keep their exact spelling, and one asserting a replayed message reaches a
   handler carrying all three with `acemq-replayed-at` parseable as RFC 3339. The

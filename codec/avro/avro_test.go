@@ -33,6 +33,21 @@ const v2 = `{"type":"record","name":"OrderPlaced","namespace":"acemq.test","fiel
   {"name":"totalCents","type":"long"},
   {"name":"tenant","type":"string","default":""}]}`
 
+// The same addition as v2, with a default that is not the zero value, so a
+// field filled in from the reader's schema can be told apart from a field left
+// untouched.
+const v2Tenanted = `{"type":"record","name":"OrderPlaced","namespace":"acemq.test","fields":[
+  {"name":"orderId","type":"string"},
+  {"name":"totalCents","type":"long"},
+  {"name":"tenant","type":"string","default":"public"}]}`
+
+// A field added without a default, which is the change Avro cannot resolve: a
+// reader asking for it has nowhere to get it from when the writer never sent it.
+const v3Required = `{"type":"record","name":"OrderPlaced","namespace":"acemq.test","fields":[
+  {"name":"orderId","type":"string"},
+  {"name":"totalCents","type":"long"},
+  {"name":"region","type":"string"}]}`
+
 type Order struct {
 	OrderID    string `avro:"orderId"`
 	TotalCents int64  `avro:"totalCents"`
@@ -330,5 +345,252 @@ func TestAnUnframedBodyThatLooksFramedIsStillRefused(t *testing.T) {
 func TestABadSchemaIsRefusedAtConstruction(t *testing.T) {
 	if _, err := Of(`{not a schema`); err == nil {
 		t.Fatal("an unparseable schema was accepted")
+	}
+}
+
+// TestAFieldTheWriterNeverSentComesBackAsItsDefault is what ReadAs is for.
+//
+// The consumer has been redeployed with a field the producer has not started
+// sending. Without a reader schema Avro is never told the field exists, so it
+// is left at whatever the destination already held — a zero value that means
+// "not set" and "empty" at once. With one, the reader's default fills it in.
+func TestAFieldTheWriterNeverSentComesBackAsItsDefault(t *testing.T) {
+	registry := patterns.NewInMemorySchemaRegistry()
+
+	producer, err := Registered(registry, "order.placed", v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := producer.Encode(Order{OrderID: "A-1", TotalCents: 4250})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	consumer, err := Registered(registry, "order.placed", v2Tenanted, ReadAs(v2Tenanted))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back OrderV2
+	if err := consumer.Decode(body, &back); err != nil {
+		t.Fatal(err)
+	}
+
+	if back.OrderID != "A-1" || back.TotalCents != 4250 {
+		t.Errorf("decoded %+v", back)
+	}
+	if back.Tenant != "public" {
+		t.Errorf("tenant is %q, want the reader schema's default %q", back.Tenant, "public")
+	}
+}
+
+// TestWithoutAReaderSchemaTheDefaultIsNotApplied pins the difference the option
+// makes, so that the test above cannot pass for some other reason.
+func TestWithoutAReaderSchemaTheDefaultIsNotApplied(t *testing.T) {
+	registry := patterns.NewInMemorySchemaRegistry()
+
+	producer, err := Registered(registry, "order.placed", v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := producer.Encode(Order{OrderID: "A-1", TotalCents: 4250})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The same consumer schema, and no ReadAs: decoding happens against the
+	// writer's schema, which has never heard of tenant.
+	consumer, err := Registered(registry, "order.placed", v2Tenanted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back OrderV2
+	if err := consumer.Decode(body, &back); err != nil {
+		t.Fatal(err)
+	}
+
+	if back.Tenant != "" {
+		t.Errorf("tenant is %q, and a codec without ReadAs applies no default", back.Tenant)
+	}
+}
+
+// TestAFieldTheReaderNeverHeardOfIsSkipped is the other direction, and the one
+// that would corrupt every field after it if the bytes were read as they stand.
+func TestAFieldTheReaderNeverHeardOfIsSkipped(t *testing.T) {
+	registry := patterns.NewInMemorySchemaRegistry()
+
+	producer, err := Registered(registry, "order.placed", v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := producer.Encode(OrderV2{OrderID: "A-1", TotalCents: 4250, Tenant: "acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The consumer still holds v1 and reads against it explicitly.
+	consumer, err := Registered(registry, "order.placed", v1, ReadAs(v1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Order
+	if err := consumer.Decode(body, &back); err != nil {
+		t.Fatal(err)
+	}
+
+	if back.OrderID != "A-1" || back.TotalCents != 4250 {
+		t.Errorf("decoded %+v", back)
+	}
+}
+
+// TestResolutionIsGenuineAndNotAReparse reads into a map, where a re-parse
+// against the writer's schema and a real resolution differ visibly: the map
+// carries exactly the fields the schema Avro was given describes.
+func TestResolutionIsGenuineAndNotAReparse(t *testing.T) {
+	registry := patterns.NewInMemorySchemaRegistry()
+
+	producer, err := Registered(registry, "order.placed", v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := producer.Encode(OrderV2{OrderID: "A-1", TotalCents: 4250, Tenant: "acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	consumer, err := Registered(registry, "order.placed", v1, ReadAs(v1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	back := map[string]any{}
+	if err := consumer.Decode(body, &back); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, present := back["tenant"]; present {
+		t.Errorf("tenant reached a reader that has never heard of it: %+v", back)
+	}
+	if back["orderId"] != "A-1" {
+		t.Errorf("decoded %+v", back)
+	}
+}
+
+// TestAnIncompatibleChangeNamesBothSchemas.
+//
+// A field added without a default cannot be resolved: there is nothing to put
+// in it. The two schemas share a name, so an error mentioning one of them says
+// almost nothing, and both are printed.
+func TestAnIncompatibleChangeNamesBothSchemas(t *testing.T) {
+	registry := patterns.NewInMemorySchemaRegistry()
+
+	producer, err := Registered(registry, "order.placed", v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := producer.Encode(Order{OrderID: "A-1", TotalCents: 4250})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	consumer, err := Registered(registry, "order.placed", v3Required, ReadAs(v3Required))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back map[string]any
+	err = consumer.Decode(body, &back)
+	if err == nil {
+		t.Fatalf("an unresolvable schema decoded to %+v", back)
+	}
+
+	message := err.Error()
+	for _, want := range []string{"written with:", "read as:", "region"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("the error does not mention %q: %v", want, err)
+		}
+	}
+	if !acemq.IsFatal(err) {
+		t.Error("an unresolvable schema is not a failure retrying can fix")
+	}
+}
+
+func TestAnUnparseableReaderSchemaIsRefusedAtConstruction(t *testing.T) {
+	_, err := Registered(
+		patterns.NewInMemorySchemaRegistry(), "order.placed", v1, ReadAs(`{not a schema`))
+	if err == nil {
+		t.Fatal("an unparseable reader schema was accepted")
+	}
+	if !strings.Contains(err.Error(), "reader schema") {
+		t.Errorf("the error does not say which schema is the bad one: %v", err)
+	}
+}
+
+// TestAReaderSchemaChangesNothingOnTheWire. The option is a read-side decision
+// and the bytes a producer writes must stay byte-for-byte what they were, or
+// Java, .NET, Python and Ruby stop reading them.
+func TestAReaderSchemaChangesNothingOnTheWire(t *testing.T) {
+	registry := patterns.NewInMemorySchemaRegistry()
+
+	plain, err := Registered(registry, "order.placed", v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolving, err := Registered(registry, "order.placed", v1, ReadAs(v2Tenanted))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	order := Order{OrderID: "A-1", TotalCents: 4250}
+	first, err := plain.Encode(order)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := resolving.Encode(order)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(first) != string(second) {
+		t.Errorf("a reader schema changed the bytes: %x against %x", first, second)
+	}
+	if resolving.ContentType() != RegisteredContentType {
+		t.Errorf("the content type is %q", resolving.ContentType())
+	}
+	if !resolving.CanDecode(RegisteredContentType) || resolving.CanDecode(FixedContentType) {
+		t.Error("a reader schema changed which content types the codec claims")
+	}
+}
+
+// TestResolutionIsRememberedPerWriterSchema. Resolving is not cheap and an
+// identifier stands for one schema forever, so it happens once.
+func TestResolutionIsRememberedPerWriterSchema(t *testing.T) {
+	registry := patterns.NewInMemorySchemaRegistry()
+
+	producer, err := Registered(registry, "order.placed", v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := producer.Encode(Order{OrderID: "A-1", TotalCents: 4250})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	consumer, err := Registered(registry, "order.placed", v2Tenanted, ReadAs(v2Tenanted))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		var back OrderV2
+		if err := consumer.Decode(body, &back); err != nil {
+			t.Fatal(err)
+		}
+		if back.Tenant != "public" {
+			t.Fatalf("tenant is %q", back.Tenant)
+		}
+	}
+
+	consumer.mu.RLock()
+	remembered := len(consumer.resolved)
+	consumer.mu.RUnlock()
+	if remembered != 1 {
+		t.Errorf("three messages of one schema left %d resolutions", remembered)
 	}
 }

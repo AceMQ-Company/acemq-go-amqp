@@ -131,7 +131,7 @@ A package per concern, with nothing at the module root:
 | `patterns/` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, claim check, sagas, delayed delivery, streams, consumer groups, schema registry, SQL-backed stores. |
 | `actuator/` | metrics, health and info over HTTP, on the same paths as Java and .NET. |
 | `crypto/` | encrypted message bodies, AES-GCM. Standard library only. |
-| `codec/xml`, `codec/yaml`, `codec/toml`, `codec/protobuf`, `codec/avro` | one module each, so the core keeps its single dependency. |
+| `codec/xml`, `codec/yaml`, `codec/toml`, `codec/protobuf`, `codec/avro` | one module each, so the core keeps its single dependency. Avro resolves a writer's schema onto a reader's, so a producer can add a field without every consumer being redeployed the same afternoon. |
 | `telemetry/otel/` | OpenTelemetry spans, a module of its own for the same reason. |
 | `devcerts/` | development certificates, behind `cmd/acemq-certs`. |
 

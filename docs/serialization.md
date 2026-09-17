@@ -196,6 +196,52 @@ lets Confluent's clients, the Java library and this one read each other. A
 producer can then add a field with a default and a consumer that has never heard
 of it still reads the message. There is a test for exactly that.
 
+#### Reading against a schema of your own
+
+Looking the writer's schema up is half of what evolution needs. On its own it
+means a consumer decodes whatever shape the producer sent: a field it has never
+heard of arrives, and a field it expects is simply absent — read back as the
+zero value — until the producer starts sending it. `ReadAs` supplies the other
+half, the schema this consumer was written against:
+
+```go
+consumer, err := avro.Registered(registry, "order.placed", schema,
+	avro.ReadAs(schema))
+```
+
+Avro is then given both schemas and resolves them. A field the writer added and
+this reader does not know is skipped rather than shifting every field after it,
+and a field the writer omitted is filled in from the reader's own default —
+`"public"`, not `""`. The consumer sees the shape it was written against,
+whichever version wrote the message.
+
+Passing the codec's own schema, as above, is the ordinary case: a consumer reads
+what it was compiled against. The two are separate arguments because they are
+separate schemas — the first is what the codec writes, the second what it reads —
+and a process that both publishes and consumes may want them to differ.
+
+Resolution happens once per writer schema and is remembered, so the cost lands on
+the first message carrying an identifier and not again. A writer schema that
+cannot be resolved onto the reader's — a field added without a default, a type
+changed to one Avro will not promote — is an error naming both schemas rather
+than a decode that returns the wrong values. Both are printed in full, because
+the two are usually versions of one record and share a name.
+
+**`ReadAs` changes nothing on the wire.** It is a read-side decision: the bytes a
+producer writes are identical with it and without it, so Java, .NET, Python and
+Ruby go on reading them.
+
+The other libraries reach the same behaviour by different routes, and the routes
+are worth knowing when messages cross between them. Java has an explicit second
+overload, `AvroCodec.registered(registry, readerSchema)`, and resolves only when
+it is used. .NET resolves **always**: `AvroCodec.Registered(registry, schema)`
+hands that schema to Avro as the reader schema on every message, with no way to
+ask for the writer's shape instead. Go is opt-in like Java's, because a
+registered codec here has always decoded against the writer's schema and turning
+resolution on by default would change what every existing consumer sees — a
+field it had been ignoring starts arriving as a default, silently. Opting in is
+one argument; a change of meaning under an unchanged call is not.
+
 The two modes are not interchangeable, and a codec only claims the content type
 its own mode can read:
 
