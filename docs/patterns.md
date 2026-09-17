@@ -654,14 +654,15 @@ consumer's position rather than removing anything, and rejecting dead-letters
 nothing, because there is nothing to remove it from. A message that cannot be
 handled has to be dealt with by the handler — logged, copied elsewhere, counted
 — and the stream moves on regardless. Nothing is lost, and nothing is retried
-for you.
+for you: `ReadStream` refuses `acemq.Retry`, because on a stream a retry appends
+a second copy of the message to the log.
 
 Retention is unbounded by default, which for a stream means "until the disk is
 full". Set `MaxAge` or `MaxBytes` on anything that runs for long.
 
 [Streams](streams.md) is the whole page: where to start reading, checkpointing,
-why `acemq.Retry` is the wrong verb on a stream, and what the in-memory transport
-will not do.
+why `acemq.Retry` is refused on a stream, and what the in-memory transport will
+not do.
 
 ## Delayed delivery
 

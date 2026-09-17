@@ -75,6 +75,20 @@ func Park(err error) Ack { return Ack{action: ackPark, err: err} }
 // Err is the reason the handler gave, if it gave one.
 func (a Ack) Err() error { return a.err }
 
+// IsRetry reports whether a handler asked for another attempt.
+//
+// Exported for one caller and one reason: patterns.ReadStream has to refuse a
+// retry, because on a stream "republish onto the queue it came from" appends a
+// second copy of the message to the log. It lives in another package and the
+// action is unexported, so without this the only way to ask would be to compare
+// [Ack.String] against a literal — a wire between two packages made of a word.
+//
+// It is not a way to second-guess a handler in general. Everything the engine
+// does with an Ack is decided in [Settlement], where the retry policy and the
+// attempt counter are, and a caller branching on this instead is reimplementing
+// that badly.
+func (a Ack) IsRetry() bool { return a.action == ackRetry }
+
 // String makes an Ack readable in a log line.
 func (a Ack) String() string {
 	switch a.action {

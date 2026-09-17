@@ -200,6 +200,83 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`patterns.ReadStream` refuses `acemq.Retry`, and says what to do instead.**
+  A retry in this library republishes the message onto the queue it came from,
+  with the attempt counter advanced, and acknowledges the original. On a stream
+  "republish onto the queue it came from" means **appending a second copy to the
+  log at a new offset** — which every other consumer of that stream then reads,
+  and which a projection rebuilding from `FromFirst` next month reads as well. A
+  handler failing on every message turned a stream into one that grew by a copy
+  of itself per attempt. The page had said "do not do this" since it was written,
+  which is not the same as the library not doing it.
+
+  A handler that returns `acemq.Retry` now has the message parked — republished
+  to `{stream}.parked`, which touches nothing in the stream — with a
+  `patterns.RetryOnStreamError` as the reason:
+
+  ```
+  acemq: a handler on stream "orders.log" returned acemq.Retry for message
+  order-1 at offset 41337, which this library refuses: a retry republishes the
+  message onto the queue it came from, and on a stream that appends a second copy
+  to the log at a new offset [...] A stream handler has two honest choices: park
+  it deliberately with acemq.Park(err), or record the x-stream-offset header and
+  return acemq.Accept() to checkpoint and move on.
+  ```
+
+  The handler's own error is wrapped, so `errors.Is` against a sentinel still
+  matches through the refusal.
+
+  **Java draws this line in the type system; Go draws it at the verb.** Java's
+  `StreamConsumer` is a separate type from `MessageConsumer` exactly so that the
+  outcomes a stream cannot honour are never on offer, because a single type
+  covering both would be one where half the methods throw. Go has one
+  `acemq.Handler` and `ReadStream` takes it, so the line is drawn when the verb is
+  used rather than when it is spelled. Same intent, one step later.
+
+  **What you do about it:** if any stream handler returns `acemq.Retry`, decide
+  which of the two it meant. `acemq.Park(err)` if somebody should look at the
+  message; record the offset and `acemq.Accept()` if the run should move on —
+  and count the gap, because nothing else records it. Leaving it as `Retry` is
+  now a parked message rather than a duplicated one, which is the safer failure
+  but still a failure.
+
+  `acemq.Reject` is unchanged and is worth saying out loud, because the table on
+  the page now has three entries that read alike: it republishes a copy to
+  `{stream}.dlq` and acknowledges the original, and **the original stays in the
+  stream**. It is a copy, not a move, and it always was — a stream has no
+  `x-dead-letter-exchange` and nothing can be removed from one.
+
+- **`patterns.StreamOffsetOf`, which reads the `x-stream-offset` header off a
+  delivery.** The checkpointing section of
+  [docs/streams.md](docs/streams.md#nothing-remembers-your-position) carried this
+  as a function to copy into your own code, because the broker writes an integer
+  and which width it arrives as depends on the client. Copying a type switch out
+  of a documentation page is how five services end up with five slightly
+  different ones.
+
+  ```go
+  if offset, ok := patterns.StreamOffsetOf(m.Envelope); ok {
+      checkpoints.Save(ctx, "projection-a", offset)
+  }
+  ```
+
+  The second return is whether the delivery carried an offset at all, and it is
+  not decoration. Zero is a real offset — the first message in the stream — so a
+  reader that could not tell "the beginning" from "this delivery said nothing"
+  would write a checkpoint of zero for a message that had no position, and the
+  next run would replay everything believing it was resuming.
+
+- **`acemq.Ack.IsRetry`, so another package can see which verb a handler used.**
+  Added for one caller: `patterns.ReadStream` has to recognise a retry in order
+  to refuse it, and the action behind an `Ack` is unexported. Without it the only
+  way to ask would be to compare `Ack.String()` against the literal `"retry"` — a
+  wire between two packages made of a word.
+
+  It is not an invitation to second-guess handlers in general. Everything the
+  engine does with an `Ack` is decided in `Settlement`, where the retry policy and
+  the attempt counter live, and a caller branching on this instead is
+  reimplementing that badly.
+
 - **`Publisher.SendAll`, which publishes a batch and then waits for every
   confirm, instead of waiting for each one where it was published.** Java has had
   `Publisher.sendAll` and .NET `IPublisher.SendAllAsync`; in Go the only way to

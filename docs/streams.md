@@ -181,11 +181,11 @@ it:
 sub, err := patterns.ReadStream(ctx, mq, "orders.log",
 	func(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
 		if err := projection.Apply(ctx, m.Payload); err != nil {
-			return acemq.Retry(err)
+			return acemq.Park(err) // not Retry — see below
 		}
-		if offset, ok := streamOffset(m.Envelope); ok {
+		if offset, ok := patterns.StreamOffsetOf(m.Envelope); ok {
 			if err := checkpoints.Save(ctx, "projection-a", offset); err != nil {
-				return acemq.Retry(err)
+				return acemq.Park(err)
 			}
 		}
 		return acemq.Accept()
@@ -195,24 +195,15 @@ sub, err := patterns.ReadStream(ctx, mq, "orders.log",
 		Prefetch: 100,
 		Name:     "projection-a",
 	})
-
-// The broker writes the offset as an integer, and which width it arrives as
-// depends on the client. Read it tolerantly rather than asserting one type.
-func streamOffset(env acemq.Envelope) (uint64, bool) {
-	switch v := env.Headers["x-stream-offset"].(type) {
-	case int64:
-		return uint64(v), true
-	case int32:
-		return uint64(v), true
-	case int:
-		return uint64(v), true
-	case uint64:
-		return v, true
-	default:
-		return 0, false
-	}
-}
 ```
+
+`patterns.StreamOffsetOf` reads the header tolerantly, because the broker writes
+an integer and which width it arrives as depends on the client. The second return
+is whether the delivery carried an offset at all, and it matters: zero is a real
+offset — the first message in the stream — so a reader that could not tell "the
+beginning" from "this delivery said nothing" would write a checkpoint of zero for
+a message that had no position, and the next run would replay everything
+believing it was resuming.
 
 Resume from one past the last offset you recorded. Saving the checkpoint in the
 same transaction as the projection's own writes is what makes the pair effectively
@@ -233,7 +224,7 @@ more here than anywhere else in the docs.
 | On a queue | On a stream |
 |---|---|
 | `acemq.Accept()` removes the message | removes nothing; the log moves on and every other consumer still sees it |
-| `acemq.Retry(err)` republishes onto the same queue | **appends a new copy to the log** — see below |
+| `acemq.Retry(err)` republishes onto the same queue | **refused** — it would append a new copy to the log. See below |
 | `acemq.Reject(err)` republishes to `{queue}.dlq` | republishes to `{stream}.dlq` and works, but the original also stays in the stream |
 | `acemq.Park(err)` republishes to `{queue}.parked` | the same, with the same caveat |
 | the broker's own dead-lettering | **none** — a stream has no `x-dead-letter-exchange` |
@@ -242,7 +233,7 @@ more here than anywhere else in the docs.
 None of them decides where the next run starts. That is `StreamOptions.Offset`
 and your checkpoint, as above.
 
-### Retry is the trap
+### Retry is refused
 
 This library retries by republishing the message onto the queue it came from,
 with the attempt counter advanced, and acknowledging the original — which is what
@@ -251,19 +242,64 @@ empties. See [the attempt counter](reliability.md#the-attempt-counter-and-why-it
 
 On a stream, "republish onto the queue it came from" means **appending a second
 copy to the log**. It is not a redelivery; it is a new message at a new offset.
-Every other consumer of that stream will read it as well. A projection rebuilding
-from `FromFirst` next month will read both. A handler that returns `Retry` on
-every message turns a stream into one that grows by a copy of itself per attempt,
-bounded only by the retry policy.
+Every other consumer of that stream would read it as well. A projection rebuilding
+from `FromFirst` next month would read both. A handler that returned `Retry` on
+every message would turn a stream into one that grows by a copy of itself per
+attempt, bounded only by the retry policy.
 
-So: **do not return `acemq.Retry` from a stream handler.** A stream handler has
-two honest choices and you have to pick one:
+So `ReadStream` does not obey it. A handler that returns `acemq.Retry` has the
+message **parked** — republished to `{stream}.parked`, which touches nothing in
+the stream — and the reason it is given is a `patterns.RetryOnStreamError` that
+names the two alternatives:
+
+```
+acemq: a handler on stream "orders.log" returned acemq.Retry for message
+order-1 at offset 41337, which this library refuses: a retry republishes the
+message onto the queue it came from, and on a stream that appends a second copy
+to the log at a new offset — for every consumer to read now and on every replay
+afterwards. It was parked on orders.log.parked instead. A stream handler has two
+honest choices: park it deliberately with acemq.Park(err), or record the
+x-stream-offset header and return acemq.Accept() to checkpoint and move on. The
+handler's reason was: the projection store is down
+```
+
+The handler's own error is wrapped, so `errors.Is` against a sentinel still
+matches through the refusal. Parking is the conservative half of the choice and
+not the library deciding for you — it is what leaves the stream untouched while
+the message goes somewhere an operator will find it. Pick one deliberately:
+
+```go
+// Park it. The message is in {stream}.parked with the reason on its envelope,
+// and the run moves on. The original is still in the stream, as always.
+func(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+	if err := projection.Apply(ctx, m.Payload); err != nil {
+		return acemq.Park(err)
+	}
+	return checkpointAndAccept(ctx, m)
+}
+```
+
+```go
+// Checkpoint and move on, counting the gap. Nothing else records it.
+func(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+	if err := projection.Apply(ctx, m.Payload); err != nil {
+		skipped.Add(1)
+		offset, _ := patterns.StreamOffsetOf(m.Envelope)
+		log.Printf("skipping %s at offset %d: %v", m.Envelope.ID, offset, err)
+	}
+	return checkpointAndAccept(ctx, m)
+}
+```
+
+Stopping is the third thing people mean by "retry" here, and it is the second
+one with the checkpoint left where it was:
 
 ```go
 // Stop. The checkpoint is not advanced, so a restart comes back to this message.
 func(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
 	if err := projection.Apply(ctx, m.Payload); err != nil {
-		log.Printf("halting at %v: %v", m.Envelope.Headers["x-stream-offset"], err)
+		offset, _ := patterns.StreamOffsetOf(m.Envelope)
+		log.Printf("halting at %d: %v", offset, err)
 		halt()                 // cancel the process's context; nothing is checkpointed
 		return acemq.Accept()  // settles this delivery without copying it anywhere
 	}
@@ -271,28 +307,22 @@ func(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
 }
 ```
 
-```go
-// Skip, and count it. Nothing else records the gap.
-func(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
-	if err := projection.Apply(ctx, m.Payload); err != nil {
-		skipped.Add(1)
-		log.Printf("skipping %s at offset %v: %v",
-			m.Envelope.ID, m.Envelope.Headers["x-stream-offset"], err)
-	}
-	return checkpointAndAccept(ctx, m)
-}
-```
+**Java draws this line in the type system and Go draws it at the verb.** Java's
+`StreamConsumer` is a separate type from `MessageConsumer` precisely so the
+outcomes a stream cannot honour are never offered — a single type covering both
+would be one where half the methods throw. Go has one `acemq.Handler` and
+`ReadStream` takes it, so the refusal happens when the verb is used rather than
+when it is spelled. Same intent, one step later.
 
-`acemq.Accept()` in the first one is not the handler saying the work succeeded —
-it is the cheapest way to settle a delivery without appending a copy of it
-anywhere, on the way out of a process that is stopping. What makes it recoverable
-is that the checkpoint was not advanced, so the restarted reader comes back to
-this offset and sees the message again after the fix.
+`acemq.Accept()` in the stopping example is not the handler saying the work
+succeeded — it is the cheapest way to settle a delivery without appending a copy
+of it anywhere, on the way out of a process that is stopping. What makes it
+recoverable is that the checkpoint was not advanced, so the restarted reader
+comes back to this offset and sees the message again after the fix.
 
-Skipping is the other honest choice, and it is invisible unless you make it
-visible: Java has a `skipFailures()` mode with a `skipped()` counter behind it,
-and there is no equivalent here, so the counter and the log line are yours to
-write. Nothing else records the gap.
+Skipping is invisible unless you make it visible: Java has a `skipFailures()`
+mode with a `skipped()` counter behind it, and there is no equivalent here, so
+the counter and the log line are yours to write. Nothing else records the gap.
 
 ### Rejecting works, and is not what Java says
 
@@ -332,4 +362,4 @@ systems project.
   stream differs from quorum and classic
 - [Patterns](patterns.md#streams) — the short version, beside the rest
 - [Retries, redelivery and shutdown](reliability.md) — what `Retry` does, and why
-  it is the wrong verb here
+  it is refused here

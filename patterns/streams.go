@@ -176,10 +176,11 @@ func durationArg(d time.Duration) string {
 // resuming exactly means recording the x-stream-offset header as you go and
 // starting from FromOffset.
 //
-// Returning acemq.Retry is the wrong verb here. A retry republishes the message
-// onto the queue it came from, which on a stream appends a second copy to the
-// log at a new offset, for every consumer to read now and on every replay
-// afterwards.
+// Returning acemq.Retry is refused rather than obeyed. A retry republishes the
+// message onto the queue it came from, which on a stream appends a second copy
+// to the log at a new offset, for every consumer to read now and on every replay
+// afterwards. A handler that returns it gets the message parked with a
+// [RetryOnStreamError] naming the two honest alternatives instead; see that type.
 //
 // Rejecting does not dead-letter in the broker's sense, because a stream carries
 // no x-dead-letter-exchange and nothing can be removed from it. The engine's own
@@ -201,7 +202,8 @@ func ReadStream[T any](
 	prefetch := opts.Prefetch
 	if prefetch <= 0 {
 		// RabbitMQ refuses a stream consumer without one, and the error it
-		// gives does not explain why.
+		// gives does not explain why. The number is this library's own choice
+		// and not part of the cross-language contract; see docs/streams.md.
 		prefetch = 10
 	}
 
@@ -213,5 +215,123 @@ func ReadStream[T any](
 		consumeOpts = append(consumeOpts, acemq.ConsumerTag(opts.Name))
 	}
 
-	return acemq.Consume(ctx, conn, stream, handler, consumeOpts...)
+	return acemq.Consume(ctx, conn, stream, refuseRetry(stream, handler), consumeOpts...)
+}
+
+// RetryOnStreamError is what a stream handler gets for returning acemq.Retry.
+//
+// Java draws this line in the type system: StreamConsumer is a separate type
+// from MessageConsumer precisely so that the outcomes a stream cannot honour are
+// not offered, and a single type covering both would be one where half the
+// methods throw. Go's handler signature is shared — acemq.Handler is one type
+// and [ReadStream] takes it — so the line is drawn here instead, at the moment
+// the verb is used rather than at the moment it is spelled.
+//
+// The message is parked: republished to {stream}.parked, which does not touch
+// the stream, and the run moves on. That is the conservative half of the choice
+// and it is not the library deciding for you — the error says which two are on
+// offer, and both are one line in the handler:
+//
+//   - Park it. Return acemq.Park(err) yourself. The message goes to
+//     {stream}.parked as a copy and somebody looks at the queue later. The
+//     original is still in the stream, because nothing is ever removed from one.
+//
+//   - Checkpoint and move on. Record the x-stream-offset header, return
+//     acemq.Accept(), and count the gap — nothing else records it. See
+//     [StreamOffsetOf].
+//
+// Stopping is the third thing people mean by "retry" on a stream, and it is the
+// second option with the checkpoint left where it was: settle the delivery with
+// acemq.Accept, do not advance the checkpoint, and cancel the process's context.
+// A restarted reader comes back to the same offset.
+type RetryOnStreamError struct {
+	// Stream is the stream the handler was reading.
+	Stream string
+
+	// Offset is where in the log the message sat, when the delivery carried one.
+	Offset uint64
+
+	// MessageID is the message the handler gave up on.
+	MessageID string
+
+	// Err is the reason the handler passed to acemq.Retry.
+	Err error
+}
+
+func (e *RetryOnStreamError) Error() string {
+	where := e.MessageID
+	if e.Offset > 0 {
+		where = fmt.Sprintf("%s at offset %d", e.MessageID, e.Offset)
+	}
+	return fmt.Sprintf(
+		"acemq: a handler on stream %q returned acemq.Retry for message %s, which this library"+
+			" refuses: a retry republishes the message onto the queue it came from, and on a"+
+			" stream that appends a second copy to the log at a new offset — for every consumer"+
+			" to read now and on every replay afterwards. It was parked on %s.parked instead."+
+			" A stream handler has two honest choices: park it deliberately with acemq.Park(err),"+
+			" or record the x-stream-offset header and return acemq.Accept() to checkpoint and"+
+			" move on. The handler's reason was: %v",
+		e.Stream, where, e.Stream, e.Err)
+}
+
+// Unwrap gives back the reason the handler passed to acemq.Retry, so a handler's
+// own sentinel survives errors.Is through the refusal.
+func (e *RetryOnStreamError) Unwrap() error { return e.Err }
+
+// refuseRetry wraps a stream handler so a retry becomes a park with an
+// explanation rather than a second copy in the log.
+//
+// The wrapping happens once, at subscribe, rather than being checked on the
+// settlement path: everywhere else in this library an Ack means what it says,
+// and putting a stream-shaped exception into the engine would make every queue
+// consumer pay for it.
+func refuseRetry[T any](stream string, handler acemq.Handler[T]) acemq.Handler[T] {
+	return func(ctx context.Context, m acemq.Message[T]) acemq.Ack {
+		ack := handler(ctx, m)
+		if !ack.IsRetry() {
+			return ack
+		}
+		offset, _ := StreamOffsetOf(m.Envelope)
+		return acemq.Park(&RetryOnStreamError{
+			Stream:    stream,
+			Offset:    offset,
+			MessageID: m.Envelope.ID,
+			Err:       ack.Err(),
+		})
+	}
+}
+
+// StreamOffsetOf is where in the log a stream delivery sat, and whether it said.
+//
+// RabbitMQ stamps every stream delivery with an x-stream-offset header. That
+// name is outside the reserved x-acemq- namespace, so the engine leaves it on
+// the envelope rather than stripping it, and this is the number to record if a
+// reader has to resume where it stopped: start the next run at FromOffset(n+1).
+//
+// The width the broker writes it as depends on the client, which is why this
+// reads several rather than asserting one. False means the delivery carried no
+// offset at all — a message from an ordinary queue, or a stream delivery a hop
+// rebuilt and did not restamp — and a checkpoint must not be written from it.
+func StreamOffsetOf(env acemq.Envelope) (uint64, bool) {
+	switch v := env.Headers["x-stream-offset"].(type) {
+	case uint64:
+		return v, true
+	case int64:
+		if v < 0 {
+			return 0, false
+		}
+		return uint64(v), true
+	case int32:
+		if v < 0 {
+			return 0, false
+		}
+		return uint64(v), true
+	case int:
+		if v < 0 {
+			return 0, false
+		}
+		return uint64(v), true
+	default:
+		return 0, false
+	}
 }
