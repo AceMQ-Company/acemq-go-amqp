@@ -35,15 +35,15 @@ jobs:
           # promise the API design rests on.
           go-version: '1.23'
 
-      - name: Check the tag is a 0.1.x version
-        # The line stays on 0.1.x until that is deliberately changed. Without
+      - name: Check the tag is a 0.6.x version
+        # The line stays on 0.6.x until that is deliberately changed. Without
         # this a mistyped tag becomes a version nobody can withdraw.
         run: |
           version="${GITHUB_REF_NAME#v}"
           case "$version" in
-            0.5.*) echo "releasing $version" ;;
+            0.6.*) echo "releasing $version" ;;
             *)
-              echo "::error::this library releases 0.5.x only; '$version' needs the guard in release.yml lifted first"
+              echo "::error::this library releases 0.6.x only; '$version' needs the guard in release.yml lifted first"
               exit 1
               ;;
           esac

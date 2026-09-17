@@ -64,7 +64,7 @@ anything. So everything that can be checked is checked before the tag exists.
 
    `patterns/sqltest` is not tagged: it holds tests and nothing imports it.
 
-The release workflow then verifies the tag: that it is a `0.1.x` version, that
+The release workflow then verifies the tag: that it is a `0.6.x` version, that
 `go.mod` still targets Go 1.23, that `acemq.Version` matches the tag, that every
 codec module builds, that the nested modules require the version being released,
 and that the whole suite passes against a real broker with nothing skipped.
@@ -99,5 +99,5 @@ curl -s "https://proxy.golang.org/github.com/!ace!m!q-!company/acemq-go-amqp/cod
 
 ## The version line
 
-`0.1.x` until somebody decides otherwise. The release workflow refuses anything
+`0.6.x` until somebody decides otherwise. The release workflow refuses anything
 else, so moving the line is a deliberate edit rather than a typo in a tag.
