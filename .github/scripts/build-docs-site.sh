@@ -19,6 +19,89 @@ OUT="site"
 
 command -v pandoc >/dev/null || { echo "pandoc is required" >&2; exit 1; }
 
+# The same question as the link check in docs.yml, asked of the source instead of
+# the site.
+#
+# Links between pages are written as .md and rewritten to .html below, for the
+# rendered copy only. That convention exists so the same files read correctly on
+# GitHub, which is where somebody meets these pages before they find the site --
+# and a site check cannot see that half. It runs on the rewritten output, so it is
+# satisfied by `guide.html` existing in site/ whatever the markdown said. Java had
+# 75 cross-page links written as `.html`: correct on the site, dead in GitHub's
+# markdown view, invisible to every check it had, and found by somebody reading
+# the docs in the repository rather than by the build.
+#
+# It runs first because it needs nothing rendered, and a bad link is cheapest to
+# find before a minute of pandoc.
+python3 - <<'PY'
+import os, re, sys, urllib.parse
+
+DOCS = "docs"
+
+pages = sorted(f for f in os.listdir(DOCS) if f.endswith(".md"))
+broken = []
+links = 0
+
+
+def prose(body):
+    """The page with its code removed, because Go code contains `](`.
+
+    Java's version of this check scans the markdown whole, which it can: `](`
+    does not occur in Java. It occurs all over Go. Instantiating a generic is
+    `patterns.WithTimeout[OrderPlaced](10*time.Second)`, and a link-shaped
+    regex reads that as a link to `10*time.Second` -- ten of them across these
+    pages on the first run, every one a false report. A link never lives inside
+    code, so dropping fenced blocks and inline spans before scanning costs the
+    check nothing and is what makes it usable here at all.
+    """
+    lines, fence = [], None
+    for line in body.split("\n"):
+        marker = re.match(r"\s*(```+|~~~+)", line)
+        if fence is None and marker:
+            fence = marker.group(1)[0] * 3
+            continue
+        if fence is not None:
+            # Closing on the same character, so a ``` inside a ~~~ block -- how
+            # a fenced block is shown in prose -- does not end it early.
+            if marker and marker.group(1)[0] * 3 == fence:
+                fence = None
+            continue
+        lines.append(line)
+    # Inline spans, longest run of backticks first so ``a ` b`` closes on its
+    # own pair rather than on the single backtick it is quoting.
+    return re.sub(r"(`+)[\s\S]*?\1", " ", "\n".join(lines))
+
+
+for page in pages:
+    with open(os.path.join(DOCS, page), encoding="utf-8") as handle:
+        body = handle.read()
+    for target in re.findall(r"\]\(([^)\s]+)\)", prose(body)):
+        if target.startswith(("http://", "https://", "mailto:", "#")):
+            continue
+        path = urllib.parse.unquote(target.partition("#")[0])
+        if not path:
+            continue
+        links += 1
+        # Nothing in this repository generates HTML into docs/ -- Go's API
+        # reference is pkg.go.dev, which is an external link and skipped above --
+        # so every .html target here is a docs page written the wrong way round.
+        # That is the mistake this check exists for, so it is named as that
+        # rather than reported as a missing file.
+        if path.endswith(".html"):
+            broken.append("{} -> {}  (a docs page link belongs in .md)".format(page, target))
+            continue
+        if not os.path.exists(os.path.join(DOCS, path)):
+            broken.append("{} -> {}".format(page, target))
+
+if broken:
+    print("::error::docs/ links that are dead when the pages are read on GitHub:")
+    for item in broken:
+        print("  " + item)
+    sys.exit(1)
+print("{} source pages, {} internal links, every one resolves inside docs/"
+      .format(len(pages), links))
+PY
+
 # The option was renamed: --highlight-style in older pandoc, --syntax-highlighting
 # in newer, and each rejects or deprecates the other. Ubuntu's package and a
 # current Homebrew install sit on opposite sides of that change, so the flag is
