@@ -28,6 +28,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
 )
@@ -223,5 +224,63 @@ func TestAnAbsentOffsetIsNotAZeroCheckpoint(t *testing.T) {
 	_, found = StreamOffsetOf(acemq.Envelope{Headers: map[string]any{}})
 	if found {
 		t.Error("a delivery with no offset header reported one")
+	}
+}
+
+// TestAnOffsetPrintsAsSomethingAPersonCanRead covers the String on StreamOffset,
+// which is what ends up in a log line saying where a reader was told to start.
+// "next" for the zero value rather than an empty string, because a StreamOptions
+// nobody filled in still starts somewhere and the log should say where.
+func TestAnOffsetPrintsAsSomethingAPersonCanRead(t *testing.T) {
+	at := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
+
+	for _, c := range []struct {
+		offset StreamOffset
+		want   string
+	}{
+		{FromFirst(), "first"},
+		{FromNext(), "next"},
+		{FromLast(), "last"},
+		{FromOffset(41337), "offset(41337)"},
+		{StreamOffset{}, "next"},
+		{FromTimestamp(at), "timestamp(2026-09-17 10:00:00 +0000 UTC)"},
+	} {
+		if got := c.offset.String(); got != c.want {
+			t.Errorf("%#v prints as %q, want %q", c.offset, got, c.want)
+		}
+	}
+}
+
+// TestATimestampThatIsNotATimeReachesTheBrokerAsNothing is the defensive half of
+// StreamOffset.arg. The constructors cannot build one, but the struct is
+// comparable and a zero-value kind with the wrong payload must not be handed to
+// the broker as a type it will reject with an error about nothing in particular.
+func TestATimestampThatIsNotATimeReachesTheBrokerAsNothing(t *testing.T) {
+	broken := StreamOffset{kind: "timestamp", value: "yesterday"}
+	if got := broken.arg(); got != nil {
+		t.Errorf("a timestamp offset holding a %T reached the broker as %v", broken.value, got)
+	}
+}
+
+// TestMaxAgeUsesTheLargestExactUnit pins durationArg directly, including the
+// rounding that a duration with no exact unit gets. RabbitMQ wants a number with
+// a unit suffix, and a redeclaration whose string differs is PRECONDITION_FAILED
+// rather than an adjustment.
+func TestMaxAgeUsesTheLargestExactUnit(t *testing.T) {
+	for _, c := range []struct {
+		age  time.Duration
+		want string
+	}{
+		{7 * 24 * time.Hour, "7D"},
+		{24 * time.Hour, "1D"},
+		{36 * time.Hour, "36h"},
+		{time.Hour, "1h"},
+		{90 * time.Minute, "90m"},
+		{45 * time.Second, "45s"},
+		{1500 * time.Millisecond, "1s"},
+	} {
+		if got := durationArg(c.age); got != c.want {
+			t.Errorf("%v rendered as %q, want %q", c.age, got, c.want)
+		}
 	}
 }

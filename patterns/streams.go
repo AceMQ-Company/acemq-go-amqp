@@ -17,6 +17,7 @@ package patterns
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
@@ -60,9 +61,25 @@ func FromTimestamp(at time.Time) StreamOffset {
 }
 
 // arg is what the broker is told.
+//
+// An exact offset goes out as an int64 and not as the uint64 [FromOffset] takes.
+// AMQP's field table has no unsigned long, and the client refuses to encode one
+// — "table field x-stream-offset value uint64 not supported" — so a consumer
+// built with FromOffset could not start at all. The public type stays unsigned
+// because an offset is a position in a log and cannot be negative; the
+// conversion belongs here, where the wire is.
 func (o StreamOffset) arg() any {
 	switch o.kind {
 	case "offset":
+		if offset, ok := o.value.(uint64); ok {
+			// Past the signed range there is no honest encoding, and a stream
+			// that far along does not exist. Clamping is better than wrapping
+			// to a negative the broker reads as something else entirely.
+			if offset > math.MaxInt64 {
+				return int64(math.MaxInt64)
+			}
+			return int64(offset)
+		}
 		return o.value
 	case "timestamp":
 		if t, ok := o.value.(time.Time); ok {

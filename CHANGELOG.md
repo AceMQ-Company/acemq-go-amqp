@@ -43,6 +43,32 @@ While the version is `0.x` the public API may change in any release.
 
 ### Fixed
 
+- **`patterns.FromOffset` produced a consumer the broker refused, and nothing
+  noticed because `patterns/streams.go` had no tests at all.** An exact offset
+  was put on the wire as the `uint64` the function takes. AMQP's field table has
+  no unsigned long, so the client would not encode it and the subscribe failed
+  with `table field "x-stream-offset" value uint64 not supported` — which means
+  the one position a reader resuming from a checkpoint needs has never worked
+  since it was added.
+
+  It goes out as an `int64` now. `FromOffset` still takes a `uint64`, because an
+  offset is a position in a log and cannot be negative; the conversion belongs
+  at the wire and not in the signature. An offset past the signed range is
+  clamped rather than allowed to wrap into a negative the broker would read as
+  something else entirely.
+
+  This is the first thing the new broker-backed tests found, which is the
+  argument for having written them: `memory://` refuses streams on purpose, so
+  every one of these arguments had been checked against the documentation and
+  nothing else. `patterns/streams_test.go` and `patterns/streams_wire_test.go`
+  now cover the parts that need no broker — the retention arguments, the offset
+  argument, the prefetch default, the consumer tag, the retry refusal and the
+  offset reader — and `rabbitmq/streams_test.go` covers the parts that do:
+  declaring a stream the broker agrees is one, reading history from `FromFirst`,
+  two readers of one stream both seeing everything, resuming from a recorded
+  offset with no gap and no repeat, and a refused retry landing in
+  `{stream}.parked` while the log stays exactly as long as it was.
+
 - **`Publisher.SendAll` pipelined at the library layer and then waited one
   message at a time underneath, so a batch bought no throughput at all.** The
   RabbitMQ transport took its publishing mutex at the top of `Transport.Publish`

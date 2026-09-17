@@ -47,6 +47,14 @@ arguments without interpreting them. So a test can build the topology and only
 discovers the gap when it tries to read. **Stream tests need Docker.** See
 [testing without a broker](testing.md) for what `memory://` does and does not do.
 
+That applies to your tests and it applied to this library's own. Nothing in
+`patterns/streams.go` was exercised against a broker until the tests in
+`rabbitmq/streams_test.go` were written, and the first thing they found was that
+`FromOffset` had never worked: an exact offset went out as an unsigned integer,
+which AMQP's field table cannot carry, so the consumer was refused before it
+started. Everything a stream does that a fake cannot imitate — offsets,
+retention, two readers seeing the same message — needs a real one.
+
 Streams are RabbitMQ 3.9 or later.
 
 ## Declaring one
