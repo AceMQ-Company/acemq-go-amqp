@@ -8,6 +8,32 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-17
+
+### Fixed
+
+- **The nested modules asked for the wrong parent.** Every module with its own
+  `go.mod` — the four codecs, `telemetry/otel` and `patterns/sqltest` — still
+  required `github.com/AceMQ-Company/acemq-go-amqp v0.5.0` when 0.6.0 was
+  tagged. They now require `v0.6.1`.
+
+  **What this meant for 0.6.0.** A consumer requiring the parent *and* a codec at
+  `v0.6.0` resolved the 0.6.0 parent and was unaffected — minimal version
+  selection takes the higher of the two. A consumer requiring only
+  `codec/avro@v0.6.0` silently resolved the **0.5.0** parent. It compiled, so
+  nothing said otherwise, and the codec ran against an engine without this
+  release's transport fixes.
+
+  The 0.6.0 tags cannot be corrected. A Go tag is permanent: the proxy caches it
+  on first fetch and deleting a tag un-publishes nothing. 0.6.1 carries the
+  corrected requirement rather than any library change — the parent's source is
+  identical to 0.6.0.
+
+  **If you are on 0.6.0**, move to 0.6.1. If your `go.mod` already names the
+  parent at `v0.6.0` this is tidiness; if it names only a codec, it is the fix.
+
+## [0.6.0] - 2026-09-17
+
 ### Removed
 
 - **Breaking change: reading the legacy Go encryption framing. `crypto` reads one
