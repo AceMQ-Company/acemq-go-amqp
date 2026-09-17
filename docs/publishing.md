@@ -152,8 +152,9 @@ through the same path as `Send`, so whatever bounds publishes in flight still
 does: the RabbitMQ transport shares one channel under a lock, because an AMQP
 channel is not safe for concurrent use.
 
-Publish interceptors run on one goroutine per message during a batch, so an
-interceptor keeping state of its own has to be safe for concurrent use.
+[Publish interceptors](interceptors.md) run on one goroutine per message during a
+batch, so an interceptor keeping state of its own has to be safe for concurrent
+use.
 
 ## Carrying context forward
 
