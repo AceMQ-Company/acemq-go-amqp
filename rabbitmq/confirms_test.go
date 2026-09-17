@@ -96,10 +96,19 @@ func oneRoundTrip(t *testing.T, ctx context.Context, pub *acemq.Publisher[OrderP
 // after another, and a batch of N cost N of them. The library's own batch tests
 // could not see it, because the in-memory transport has no round trip to pay.
 //
-// The assertion is deliberately generous — a quarter of what the serialised
-// version would cost — because the point is not to measure a speedup precisely
-// but to fail loudly if the serialisation ever comes back. Running this against
-// the previous implementation gives a ratio of about 1.0.
+// The assertion is deliberately generous — half of what the serialised version
+// would cost — because the point is not to measure a speedup precisely but to
+// fail loudly if the serialisation ever comes back. Running this against the
+// previous implementation gives a ratio of about 1.0.
+//
+// It was a quarter, which is a budget the numerator and the denominator are not
+// steady enough to share. The denominator is one median round trip, measured
+// serially; the numerator is 200 publishes contending for one channel under
+// -race. Those two do not slow down together on a loaded machine, and a shared
+// CI runner is a loaded machine: the same code measured 3.2x, 3.8x and 5.1x on
+// three consecutive runs there while a laptop put it between 11x and 18x. Half
+// still fails by a factor of two against the 1.0 this exists to catch, and stops
+// failing for the reason a timing test must never fail — the machine it is on.
 func TestABatchCostsFarLessThanOneRoundTripPerMessage(t *testing.T) {
 	queue := queueName(t)
 	removeAtEnd(t, []string{queue}, nil)
@@ -136,12 +145,12 @@ func TestABatchCostsFarLessThanOneRoundTripPerMessage(t *testing.T) {
 	}
 
 	serialised := time.Duration(batchSize) * roundTrip
-	budget := serialised / 4
+	budget := serialised / 2
 	t.Logf("one round trip %v, %d serialised would be %v, the batch took %v (%.1fx faster)",
 		roundTrip, batchSize, serialised, batch, float64(serialised)/float64(batch))
 	if batch > budget {
 		t.Errorf(
-			"a batch of %d took %v, which is more than a quarter of the %v it would cost "+
+			"a batch of %d took %v, which is more than half the %v it would cost "+
 				"at one round trip per message; the confirm wait is serialising publishes again",
 			batchSize, batch, serialised)
 	}
