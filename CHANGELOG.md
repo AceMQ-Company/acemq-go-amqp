@@ -226,6 +226,76 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **A requester and a responder count something at last.**
+  `acemq.MetricRequestDuration` and `acemq.MetricRequestTotal` have been names
+  this library declared and never wrote, and a `Responder` reported nothing at
+  all where Java reports `answered()` and `unanswerable()`. Both gaps are closed,
+  with Java's semantics rather than approximations of them.
+
+  `patterns.Requester.Do` now writes both metrics, timing the round trip as the
+  caller experienced it — from before the request is published to the moment `Do`
+  is about to return, timeout included:
+
+  ```
+  acemq.request.total{routing.key="pricing", outcome="answered"}
+  acemq.request.duration{routing.key="pricing", outcome="timed_out"}
+  ```
+
+  The publish was already timed by the publish metrics and the reply's delivery
+  by the responder's consume metrics; neither of those is the number a blocked
+  caller is holding, which is what this adds. `answered`, `timed_out` and
+  `failed` are the outcomes, and the distinction between the last two is
+  deliberate: a timeout is the absence of an answer and not evidence that nothing
+  happened, so a counter calling it a failure sends somebody looking for one that
+  did not occur. A reply that came back carrying the responder's error *is*
+  `failed` — the round trip completed and the answer was bad news. The tracing
+  adapter has drawn that line since it was written; the counter now uses the same
+  word, so a counter and a trace queried for the same round trip agree.
+
+  Java also tags `message.type` and `transport`. The type is built inside
+  `Publisher.Send` from options `Do` only passes through, so writing it here
+  would mean guessing at a value the caller may have overridden.
+
+  `patterns.Responder` reports two numbers, and **the ordering is the point**:
+
+  ```go
+  responder.Answered()      // requests answered, counted before the reply left
+  responder.Unanswerable()  // requests that named nowhere to reply
+  ```
+
+  `Answered()` is incremented **before** the reply is published, so a caller
+  holding its answer can rely on the count already including it. The other order
+  looks more natural and is wrong: it leaves a window in which the reply is in the
+  caller's hands and the responder still says nothing has been answered, which is
+  a dashboard reporting an idle service that is demonstrably working. A publish
+  that fails hands its increment back, so this counts replies that were sent
+  rather than replies that were attempted — without which counting early would
+  introduce a failure of its own.
+
+  The counters exist **before** `Serve` subscribes, and are reached by the handler
+  through a value of their own rather than through the `Responder` the subscribe
+  has not returned yet. A broker may hand the first request over from inside the
+  subscribe, which is what a queue with a backlog looks like from in here, and the
+  handler reads them on that very delivery. .NET had to lift its counters out of
+  its responder to get this guarantee and Java initialises them at their
+  declaration; this does the same thing in Go's idiom.
+
+  A handler that returned an error is not counted as answered. The failure still
+  goes back to the caller, but it is not an answer, and counting it as one would
+  make a responder that fails every request look like one that works.
+
+  `Unanswerable()` above zero means a caller is publishing where it means to
+  request. This library dead-letters such a request where Java logs it and
+  acknowledges it — both count it at the same moment and in the same way, and
+  what differs is only where the message ends up. A request nobody can answer is
+  worth keeping on `{queue}.dlq` for whoever has to find the sender.
+
+  **What you do about it:** neither number needs a wait before it can be trusted,
+  so code that sleeps before reading one is working around a defect that is not
+  there. Dashboards that were graphing the responder's consume metrics as a proxy
+  can keep doing so; `acemq.request.*` is the more direct answer and it is now
+  there to use.
+
 - **`patterns.ReadStream` refuses `acemq.Retry`, and says what to do instead.**
   A retry in this library republishes the message onto the queue it came from,
   with the attempt counter advanced, and acknowledges the original. On a stream

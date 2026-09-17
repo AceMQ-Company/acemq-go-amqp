@@ -83,6 +83,8 @@ that never reads metrics does not pay for them.
 | `acemq.retry.rung.missing` | a long retry had to wait in the consumer |
 | `acemq.outbox.total` | outbox records the relay handled, tagged `outcome` |
 | `acemq.outbox.lag` | seconds between an outbox record being committed and published |
+| `acemq.request.total` | request/reply round trips, tagged `outcome` |
+| `acemq.request.duration` | seconds per round trip as the caller experienced it, tagged `outcome` |
 
 **These are Java's names.** They are the family's vocabulary, and Go, Python and
 Ruby have moved onto them — see the rename note below, because **every existing
@@ -94,9 +96,14 @@ messages that are gone.
 `acemq.retry.rung.missing` started here — the retry ladder is this library's own
 — and Java has since taken the same name, so it is family vocabulary too.
 
+The two request metrics are written by `patterns.Requester.Do`, tagged
+`answered`, `timed_out` or `failed`, and a responder reports `Answered()` and
+`Unanswerable()` alongside them. See
+[what the counters promise](request-reply.md#what-the-counters-promise).
+
 #### Named but not written
 
-Five more names are part of the family vocabulary and are declared in
+Three more names are part of the family vocabulary and are declared in
 `amqp/telemetry.go` so an `Observer` can be written against one list — but this
 library does not emit them, and says so rather than leaving you to wonder why the
 series is empty.
@@ -104,17 +111,19 @@ series is empty.
 | Metric | Why not |
 |---|---|
 | `acemq.consume.attempts` | `Observer` has counters, gauges and durations and no general distribution. The number is on every message as `Envelope.Attempt`, so a handler can record it in one line. |
-| `acemq.request.duration`, `acemq.request.total` | `patterns.Request` is a function over a connection rather than something the connection knows it is doing, so no point on the path holds an observer. The tracing adapter spans the round trip instead. |
 | `acemq.pipeline.run.duration`, `acemq.pipeline.run.total` | Go has no `Pipeline` type owning its steps the way Java does. A finished run is reported through `patterns.RunObserver`; install your own and write these two names if you want counters. |
+
+`acemq.request.duration` and `acemq.request.total` used to be in this table. They
+are written now, which is what a name in it is supposed to become.
 
 ### The tag names
 
 | Tag | On | |
 |---|---|---|
 | `queue` | the consume metrics | the queue the delivery arrived on |
-| `outcome` | the publish, consume and outbox metrics | what happened |
+| `outcome` | the publish, consume, outbox and request metrics | what happened |
 | `exchange` | the publish and outbox metrics | where it was sent |
-| `routing.key` | the publish and outbox metrics | the key it went out under |
+| `routing.key` | the publish, outbox and request metrics | the key it went out under |
 | `rung` | `acemq.retry.rung.missing` | the rung queue that is not there |
 | `target` | `acemq.messages.set.aside.failed` | the queue it could not be moved to |
 

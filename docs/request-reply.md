@@ -272,19 +272,73 @@ round again and the work runs a second time. That is why **a responder should be
 idempotent** — the same reason a timeout is not automatically retryable, seen
 from the other end.
 
-## What is not measured
+## What the counters promise
 
-This is the honest part, and it is a gap rather than a decision.
+A responder reports two numbers, and both are safe to read the instant a round
+trip returns:
 
-`acemq.MetricRequestDuration` and `acemq.MetricRequestTotal` exist as names, and
-**this library never writes them**. A requester is a thing built over a
-connection rather than something the connection knows it is doing, so no point on
-the round trip holds an `Observer`. A `Requester` counts nothing: no
-timeouts, no unmatched replies, no round trips. A `Responder` counts nothing
-either — Java reports `answered()` and `unanswerable()`, and there is no
-equivalent here.
+```go
+responder.Answered()      // requests answered, counted before the reply left
+responder.Unanswerable()  // requests that named nowhere to reply
+```
 
-What there is instead is the tracing adapter, which spans the round trip:
+`Answered()` is incremented **before** the reply is published, so a caller
+holding its answer can rely on the count already including it. The other order
+looks more natural and is wrong: it leaves a window where the reply is in the
+caller's hands and the responder still says nothing has been answered, which is a
+monitoring dashboard reporting an idle service that is demonstrably working. A
+publish that fails takes its increment back, so this counts replies that were
+sent rather than replies that were attempted.
+
+The counters exist before the responder subscribes, so a request the broker hands
+over during start-up — what a queue with a backlog looks like from in here — is
+counted like any other. Neither number needs a wait before it can be trusted, and
+code that sleeps before reading one is working around a defect that is fixed.
+
+A handler that returned an error is **not** counted as answered. The failure does
+go back to the caller, but it is not an answer, and counting it as one would make
+a responder that fails every request look like one that works.
+
+`Unanswerable()` above zero means a caller is publishing where it means to
+request: a message that names neither the `acemq-reply-to` header nor AMQP's own
+`reply-to` property cannot be answered by anybody. This library dead-letters such
+a request where Java logs it and acknowledges it — both count it the same way, at
+the same moment, and what differs is where the message ends up. A request nobody
+can answer is worth keeping on `{queue}.dlq` for whoever has to find the sender.
+
+Java and .NET promise exactly this ordering, in those words. Python and Ruby
+expose neither number yet.
+
+## What the requester measures
+
+```
+acemq.request.total{routing.key="pricing", outcome="answered"}
+acemq.request.duration{routing.key="pricing", outcome="timed_out"}
+```
+
+`Requester.Do` writes both, timing the round trip as the caller experienced it —
+from before the request is published to the moment `Do` is about to return,
+timeout included. The publish was already timed by the publish metrics and the
+reply's delivery by the responder's consume metrics, and neither of those is the
+number a blocked caller is holding.
+
+| `outcome` | |
+|---|---|
+| `answered` | a reply came back |
+| `timed_out` | none did before the deadline |
+| `failed` | the publish failed, the context was cancelled, or the reply carried the responder's error |
+
+A timeout is `timed_out` rather than `failed` on purpose: the work may well have
+been done, and a counter saying otherwise sends somebody looking for a failure
+that did not happen. A reply that came back carrying an error *is* `failed` — the
+round trip completed and the answer was bad news, which is a different thing from
+no answer.
+
+Java also tags `message.type` and `transport`. The type is built inside
+`Publisher.Send` from options `Do` only passes through, so writing it here would
+mean guessing at a value the caller may have overridden.
+
+The tracing adapter spans the same round trip, with the same vocabulary:
 
 ```go
 import "github.com/AceMQ-Company/acemq-go-amqp/telemetry/otel"
@@ -296,13 +350,12 @@ answer, err := otel.Ask[PriceRequest, PriceResponse](ctx, tracing, "prices", req
 
 That produces a `prices request` span of kind `CLIENT` — `CLIENT` rather than
 `PRODUCER` because it waits, and its duration is a round trip — tagged
-`answered`, `timed_out` or `failed`. A timeout is `timed_out` rather than
-`failed` on purpose: the work may well have been done, and a trace saying
-otherwise sends somebody looking for a failure that did not happen.
+`answered`, `timed_out` or `failed`. Queried for the same round trip, the counter
+and the trace answer with the same word.
 
-Until the counters exist, the numbers to graph are the ordinary consume metrics
-on the responder's queue: `acemq.consume.total` tagged `acked` against
-`rejected`, and `acemq.consume.duration` for how long answers take. See
+The responder's side is the ordinary consume metrics on its queue:
+`acemq.consume.total` tagged `acked` against `rejected`, and
+`acemq.consume.duration` for how long answers take. See
 [metrics, tracing and health](observability.md).
 
 ## Closing

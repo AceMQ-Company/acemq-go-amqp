@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
@@ -166,9 +167,37 @@ func (r *Requester[Req, Resp]) deliver(m acemq.Message[Resp]) {
 	}
 }
 
+// observe records one round trip under [acemq.MetricRequestTotal] and
+// [acemq.MetricRequestDuration].
+//
+// What is measured is the round trip as the caller experienced it: from before
+// the request is published to the moment Do is about to return, timeout
+// included. The publish was already timed by the publish metrics and the reply's
+// delivery by the responder's consume metrics, and neither of those is the
+// number a caller is waiting on — which is the whole reason this one exists.
+//
+// Tagged with the routing key and the outcome. Java also tags message.type and
+// transport; the type is built inside Publisher.Send from options this function
+// only passes through, so writing it here would mean guessing at a value the
+// caller may have overridden.
+func (r *Requester[Req, Resp]) observe(outcome string, took time.Duration) {
+	observer := r.conn.Observer()
+	if observer == nil {
+		return
+	}
+	labels := map[string]string{
+		acemq.TagRoutingKey: r.routingKey,
+		acemq.TagOutcome:    outcome,
+	}
+	observer.Count(acemq.MetricRequestTotal, 1, labels)
+	observer.Observe(acemq.MetricRequestDuration, took.Seconds(), labels)
+}
+
 // Do sends a request and waits for its reply.
 func (r *Requester[Req, Resp]) Do(ctx context.Context, request Req, opts ...acemq.EnvelopeOption) (Resp, error) {
 	var zero Resp
+
+	started := time.Now()
 
 	// The correlation identifier is what pairs a reply with its request, so it
 	// is generated here rather than taken from the caller's options.
@@ -196,6 +225,7 @@ func (r *Requester[Req, Resp]) Do(ctx context.Context, request Req, opts ...acem
 		acemq.Header(HeaderReplyTo, r.replyQueue))
 
 	if err := r.publisher.Send(ctx, request, all...); err != nil {
+		r.observe(acemq.OutcomeFailed, time.Since(started))
 		return zero, err
 	}
 
@@ -205,15 +235,24 @@ func (r *Requester[Req, Resp]) Do(ctx context.Context, request Req, opts ...acem
 	select {
 	case m := <-waiter:
 		if failure := m.Envelope.Headers[HeaderError]; failure != nil {
+			// The round trip completed and the answer was a failure, which is
+			// not the same thing as no answer. Tagged failed rather than
+			// answered so a dashboard can tell the two apart.
+			r.observe(acemq.OutcomeFailed, time.Since(started))
 			return zero, fmt.Errorf("acemq: the responder failed: %v", failure)
 		}
+		r.observe(acemq.OutcomeAnswered, time.Since(started))
 		return m.Payload, nil
 	case <-timeout.C:
 		// The work may well have been done. A timeout is the absence of an
-		// answer, not evidence that nothing happened.
+		// answer, not evidence that nothing happened — which is why it is its
+		// own outcome and not failed. A round trip that never completes is
+		// exactly the case worth graphing, so it must not be simply absent.
+		r.observe(acemq.OutcomeTimedOut, time.Since(started))
 		return zero, fmt.Errorf("%w after %s (correlation %s)",
 			ErrRequestTimedOut, r.timeout, correlation)
 	case <-ctx.Done():
+		r.observe(acemq.OutcomeFailed, time.Since(started))
 		return zero, ctx.Err()
 	}
 }
@@ -277,7 +316,57 @@ const HeaderError = "acemq-error"
 // should learn that it failed rather than wait out the timeout.
 type Responder struct {
 	consumer *acemq.Consumer
+	counts   *responderCounts
 }
+
+// responderCounts is what a responder has answered and what it could not.
+//
+// A value of its own rather than fields on [Responder], and that is the whole
+// point of it existing: the handler closure has to be able to reach these before
+// acemq.Consume returns, because a broker may hand the first request over from
+// inside the subscribe — which is what a queue with a backlog looks like from in
+// here. A closure over the Responder would be a closure over a variable the
+// subscribe had not assigned yet. .NET had to lift its counters out of the
+// responder for exactly this reason and Java initialises them at their
+// declaration, which puts them in place before the constructor body runs.
+type responderCounts struct {
+	answered     atomic.Int64
+	unanswerable atomic.Int64
+}
+
+// Answered is how many requests were answered, counted before each reply left.
+//
+// A caller holding a reply can rely on this having counted it: the increment
+// happens before the publish, so there is no interleaving in which the answer is
+// visible and the number is not. The other order looks more natural and is
+// wrong — it leaves a window where the reply is in the caller's hands and the
+// responder still says nothing has been answered, which is a dashboard reporting
+// an idle service that is demonstrably working.
+//
+// A publish that fails takes its increment back, so this counts replies that
+// were sent rather than replies that were attempted.
+//
+// A handler that returned an error is not counted here. The failure does go back
+// to the caller — see [Serve] — but it is not an answer, and counting it as one
+// would make a responder that fails every request look like one that works.
+//
+// Neither this nor [Responder.Unanswerable] needs a wait before it can be
+// trusted, and code that sleeps before reading one is working around a defect
+// that is not there.
+func (r *Responder) Answered() int64 { return r.counts.answered.Load() }
+
+// Unanswerable is how many requests arrived with nowhere to reply, counted
+// before the delivery is settled.
+//
+// Anything above zero means a caller is publishing where it means to request: a
+// message that names neither the acemq-reply-to header nor AMQP's own reply-to
+// property cannot be answered by anybody.
+//
+// This library dead-letters such a request, where Java logs it and acknowledges
+// it. Both count it the same way and at the same moment; what differs is where
+// the message ends up, and a request nobody can answer is worth keeping on
+// {queue}.dlq for whoever has to find the sender.
+func (r *Responder) Unanswerable() int64 { return r.counts.unanswerable.Load() }
 
 // Serve consumes requests from a queue and replies to each one.
 //
@@ -286,17 +375,29 @@ type Responder struct {
 //			return price(ctx, m.Payload)
 //		})
 //	defer responder.Close()
+//
+// The counters [Responder.Answered] and [Responder.Unanswerable] exist before
+// the subscribe below, so a request the broker hands over during start-up — what
+// a queue with a backlog looks like from in here — is counted like any other.
 func Serve[Req, Resp any](
 	ctx context.Context, conn *acemq.Conn, queue string,
 	handle func(context.Context, acemq.Message[Req]) (Resp, error),
 	opts ...acemq.ConsumeOption,
 ) (*Responder, error) {
+	// Built before acemq.Consume and captured by the handler, not reached
+	// through the Responder this function has not returned yet. See
+	// responderCounts.
+	counts := &responderCounts{}
+
 	consumer, err := acemq.Consume(ctx, conn, queue,
 		func(ctx context.Context, m acemq.Message[Req]) acemq.Ack {
 			replyTo := replyAddress(m)
 			if replyTo == "" {
-				// Nothing to reply to. Retrying cannot make a reply queue
-				// appear, so this is dead-lettered rather than looped.
+				// A request nobody can answer, counted before it is settled.
+				// Retrying cannot make a reply queue appear, so this is
+				// dead-lettered rather than looped; the sender is the thing that
+				// is broken and somebody has to be able to find it.
+				counts.unanswerable.Add(1)
 				return acemq.Reject(acemq.Fatalf(
 					"acemq: request %s carries neither a %s header nor a reply-to "+
 						"property, so there is nowhere to reply",
@@ -306,7 +407,10 @@ func Serve[Req, Resp any](
 			response, err := handle(ctx, m)
 			if err != nil {
 				// The failure goes back to the caller, then the request is
-				// settled: replying and then retrying would answer twice.
+				// settled: replying and then retrying would answer twice. Not
+				// counted as answered — a failure reaching the caller is not an
+				// answer, and counting it as one would make a responder that
+				// fails everything look like one that works.
 				if sendErr := replyWithError[Resp](ctx, conn, replyTo, m, err); sendErr != nil {
 					return acemq.Retry(sendErr)
 				}
@@ -316,7 +420,21 @@ func Serve[Req, Resp any](
 				return acemq.Reject(err)
 			}
 
+			// Counted before the reply goes out, and that order is the contract
+			// in all five libraries. The reply and the counter are two things
+			// one caller can see, and publishing first leaves a window in which
+			// a caller already holding its answer reads Answered as zero — a
+			// dashboard reporting an idle service that is demonstrably working.
+			// Incrementing first puts the counter ahead of the reply in every
+			// interleaving there is, which is the only ordering a reader can
+			// rely on.
+			counts.answered.Add(1)
 			if err := reply(ctx, conn, replyTo, m, response); err != nil {
+				// The increment is handed back, so this counts replies that were
+				// sent rather than replies that were attempted — without which
+				// counting early would introduce a failure of its own.
+				counts.answered.Add(-1)
+
 				// The work is done but the answer did not get out. Retrying
 				// repeats the work, which is why a responder should be
 				// idempotent.
@@ -327,7 +445,7 @@ func Serve[Req, Resp any](
 	if err != nil {
 		return nil, err
 	}
-	return &Responder{consumer: consumer}, nil
+	return &Responder{consumer: consumer, counts: counts}, nil
 }
 
 func reply[Req, Resp any](

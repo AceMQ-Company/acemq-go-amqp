@@ -144,12 +144,40 @@ const (
 	// MetricOutboxTotal counts outbox records the relay has handled, tagged
 	// published or failed.
 	MetricOutboxTotal = "acemq.outbox.total"
+
+	// MetricRequestDuration is the round trip of a request/reply call as the
+	// caller experienced it, and MetricRequestTotal counts those calls, tagged
+	// answered, timed_out or failed.
+	//
+	// Written by patterns.Requester.Do, from before the request is published to
+	// the moment it is about to return. The publish was already timed under
+	// [MetricPublishDuration] and the reply's delivery under
+	// [MetricConsumeDuration] on the responder's side, and neither of those is
+	// the number a blocked caller is waiting on — which is what this one is for.
+	//
+	// A timeout is timed_out and not failed, on purpose. The work may well have
+	// been done; a timeout is the absence of an answer rather than evidence that
+	// nothing happened, and a counter that called it a failure would send
+	// somebody looking for one that did not occur. A reply that came back
+	// carrying the responder's error is failed: the round trip completed and the
+	// answer was bad news, which is a different thing from no answer.
+	//
+	// Tagged with routing.key and outcome. Java also tags message.type and
+	// transport; the type is built inside the publisher from options the
+	// requester only passes through, so writing it here would mean guessing at a
+	// value the caller may have overridden.
+	MetricRequestDuration = "acemq.request.duration"
+	MetricRequestTotal    = "acemq.request.total"
 )
 
 // The rest of the family's vocabulary, which this library names but does not
 // write. Declared so that an [Observer] bridging AceMQ onto a metrics system can
 // be written against one list, and so that adding the emission later cannot
 // invent a second spelling for something Java already named.
+//
+// It used to hold the two request/reply names as well. Those are written now —
+// see [MetricRequestTotal] — which is what a name in this block is supposed to
+// become.
 const (
 	// MetricConsumeAttempts is which attempt a delivery was, as a distribution,
 	// so a rising one shows a struggling dependency.
@@ -160,17 +188,6 @@ const (
 	// message as Envelope.Attempt, so an application that wants it can record it
 	// from a handler in one line.
 	MetricConsumeAttempts = "acemq.consume.attempts"
-
-	// MetricRequestDuration is the round trip of a request/reply call as the
-	// caller experienced it, and MetricRequestTotal counts those calls, tagged
-	// answered, timed_out or failed.
-	//
-	// Not written by this library: patterns.Request is a function over a
-	// connection rather than something the connection knows it is doing, so
-	// there is no point on the path holding an observer. The tracing adapter
-	// spans the round trip instead.
-	MetricRequestDuration = "acemq.request.duration"
-	MetricRequestTotal    = "acemq.request.total"
 
 	// MetricPipelineRunDuration is how long a message had existed when it left a
 	// pipeline, and MetricPipelineRunTotal counts runs that finished, tagged
@@ -225,9 +242,10 @@ const (
 	// could not get out.
 	OutcomeFailed = "failed"
 
-	// OutcomeAnswered and OutcomeTimedOut are a request/reply round trip's, and
-	// are written by the tracing adapter rather than by a counter here. See
-	// [MetricRequestTotal].
+	// OutcomeAnswered and OutcomeTimedOut are a request/reply round trip's,
+	// written by patterns.Requester.Do onto [MetricRequestTotal] and by the
+	// tracing adapter onto the request span. Queried for the same round trip,
+	// the counter and the trace answer with the same word.
 	OutcomeAnswered = "answered"
 	OutcomeTimedOut = "timed_out"
 )
