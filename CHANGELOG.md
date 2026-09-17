@@ -43,6 +43,32 @@ While the version is `0.x` the public API may change in any release.
 
 ### Fixed
 
+- **Documentation said the stream prefetch default was a gap between the
+  libraries. It is not, and [docs/streams.md](docs/streams.md#prefetch) now says
+  so.** Go supplies 10 when `StreamOptions.Prefetch` is unset, Java and .NET
+  supply 100, and the page read as though somebody had got it wrong.
+
+  **The number is unchanged in all three.** What changed is the framing, and the
+  same wording is going into the other four repositories so the five pages agree:
+  the default is a per-library choice about memory against throughput, and **it
+  is not part of the cross-language contract**. What the five libraries promise
+  each other is the wire — the header names, the envelope fields, the retention
+  arguments, the `x-stream-offset` a consumer sends and the one it reads back.
+  How many messages one library's reader keeps buffered while a handler works is
+  a local decision about the memory of the process it runs in, and matching
+  numbers would not make a Go service and a Java service behave alike anyway,
+  because the handlers, the payloads and the machines all differ.
+
+  **What you do about it:** set it. Ten is conservative — a handler doing real
+  work per message holds ten bodies rather than a hundred — and slow for a
+  projection reading a large history, which is the ordinary reason to open a
+  stream from `FromFirst`. A service that cares about the number should say it
+  rather than inherit it, in any of the five libraries.
+
+  ```go
+  patterns.StreamOptions{Offset: patterns.FromFirst(), Prefetch: 500}
+  ```
+
 - **`patterns.FromOffset` produced a consumer the broker refused, and nothing
   noticed because `patterns/streams.go` had no tests at all.** An exact offset
   was put on the wire as the `uint64` the function takes. AMQP's field table has
@@ -225,6 +251,49 @@ While the version is `0.x` the public API may change in any release.
   Python's `park()` and Ruby's `Ack.park` — so all five libraries have it.
 
 ### Added
+
+- **`acemq.Envelope.Claim` and `acemq.Claim`, so the reserved `x-acemq-claim`
+  header is a field rather than a trap.** The constant has been declared here
+  since the header names were transliterated from Java, and nothing read it or
+  wrote it. That is the worst arrangement available: `x-acemq-` is the engine's
+  namespace, and **any header in it that this version does not materialise onto
+  the envelope is dropped before a handler sees it** — so the name looked
+  supported, a message carrying it arrived, and the value vanished.
+
+  Python's `Envelope.claim` and Ruby's `:claim` are first-class fields that write
+  exactly this header. A claim set by a Python or Ruby publisher now reaches a Go
+  handler instead of being swallowed on the way in.
+
+  ```go
+  pub.Send(ctx, reference, acemq.Claim("s3://payloads/2026/09/order-1"))
+  ```
+
+  ```go
+  func(ctx context.Context, m acemq.Message[Reference]) acemq.Ack {
+      if m.Envelope.Claim != "" {
+          // the payload is over there
+      }
+      return acemq.Accept()
+  }
+  ```
+
+  A convention rather than a mechanism: nothing here reads it or fetches
+  anything, and what the string means is between the publisher and the consumer.
+  What it buys is an operator looking at a dead-lettered message being able to
+  see where the payload went without decoding the body.
+
+  **The claim-check pattern is unaffected and is a different thing.**
+  `patterns.ClaimCheckCodec` frames the body — see the three bytes the family
+  agreed on — because a header can be stripped by a shovel or a federation link
+  and the body cannot, and because the framing has to say whether a payload
+  travelled inline at all, which a present-or-absent header cannot express for a
+  message that predates the codec. Setting `Claim` does not make a message a
+  claim check, and the claim check does not set `Claim`.
+
+  **Nothing changes for a message that has no claim.** An absent value is an
+  absent header, never an empty one, exactly as with `x-acemq-causation` and
+  `x-acemq-error`, so the bytes on the wire for every existing message are
+  unchanged and the envelope fixtures still pass.
 
 - **A requester and a responder count something at last.**
   `acemq.MetricRequestDuration` and `acemq.MetricRequestTotal` have been names

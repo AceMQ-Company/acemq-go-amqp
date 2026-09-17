@@ -152,11 +152,32 @@ RabbitMQ refuses a stream consumer without a prefetch, and the error it gives
 does not explain why, so `ReadStream` supplies one when `Prefetch` is zero or
 negative.
 
-**The default here is 10.** Java and .NET both default to 100. Ten is a
-conservative number for a handler doing real work per message and a slow one for
-a projection reading a large history — which is the ordinary reason to open a
-stream from `FromFirst`. Set it deliberately; treat the default as a floor rather
-than a recommendation.
+**The default here is 10. Java and .NET default to 100, and that difference is
+not a bug in any of them.**
+
+The default is a per-library choice about memory against throughput, and it is
+not part of the cross-language contract. What the five libraries promise each
+other is the wire: the header names, the envelope fields, the retention
+arguments, the `x-stream-offset` a consumer sends and the one it reads back. How
+many messages one library's reader keeps buffered while a handler works is a
+local decision about the memory of the process it runs in, and a number that
+happened to match would not make a Go service and a Java service behave the same
+anyway — the handlers, the payloads and the machines all differ.
+
+Ten is conservative: a handler doing real work per message holds ten bodies in
+memory rather than a hundred. It is also slow for a projection reading a large
+history, which is the ordinary reason to open a stream from `FromFirst`.
+
+So set it deliberately, and treat the default as a floor rather than a
+recommendation:
+
+```go
+patterns.StreamOptions{Offset: patterns.FromFirst(), Prefetch: 500}
+```
+
+Higher for a fast handler reading a lot; lower for a handler that holds
+something expensive per message. A service that cares about the number should
+say it rather than inherit it, in any of the five libraries.
 
 ## Naming the consumer
 

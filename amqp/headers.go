@@ -61,15 +61,20 @@ const (
 	// HeaderClaim is where an externalised payload is, when an application
 	// chooses to say so.
 	//
+	// Materialised onto [Envelope.Claim] and set with [Claim]. Nothing in this
+	// library writes it by itself, but the field is real: Python and Ruby carry
+	// claim as a first-class envelope field, and a header in this reserved
+	// namespace that the engine does not materialise is dropped before a handler
+	// sees it — so a claim set by a Python or Ruby publisher used to reach the
+	// wire and vanish on the way in here.
+	//
 	// The library's own claim check does not write it. That pattern frames the
 	// body — see patterns.ClaimCheckCodec — because a header can be stripped by a
 	// shovel or a federation link and the body cannot, and because the framing
 	// has to say whether a payload travelled inline or not, which a present-or-
-	// absent header cannot express for a message that predates the codec.
-	//
-	// This header is for an application that wants an operator reading a
-	// dead-letter queue to see where the payload went without decoding anything.
-	// Python and Ruby reserve it the same way and for the same reason.
+	// absent header cannot express for a message that predates the codec. The two
+	// are unrelated: this header is a note about where a payload went, and the
+	// codec is a mechanism that moves one.
 	HeaderClaim = HeaderPrefix + "claim"
 
 	// HeaderRoute is the ordered step names of a declared pipeline, comma

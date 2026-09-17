@@ -60,6 +60,29 @@ type Envelope struct {
 	// Error says why the message was dead-lettered, when it was.
 	Error string
 
+	// Claim is where the payload is, when an application stored it somewhere
+	// else and sent a reference instead.
+	//
+	// Nothing in this library writes it. It is for an application that wants an
+	// operator reading a dead-letter queue to see where a payload went without
+	// decoding anything, and for a publisher in another language that already
+	// does — Python's Envelope.claim and Ruby's :claim are first-class fields
+	// there, so a claim set by either of those reaches a Go handler here.
+	//
+	// A field rather than an entry in Headers, and that is not tidiness: the
+	// x-acemq- prefix is the engine's, and any header in it that this version
+	// does not materialise onto the envelope is dropped before a handler sees
+	// it. Reserved and unmaterialised is the worst of both — a name that looks
+	// supported, arrives on the wire, and vanishes.
+	//
+	// The claim-check pattern does not use it. That frames the body — see
+	// patterns.ClaimCheckCodec — because a header can be stripped by a shovel or
+	// a federation link and the body cannot, and because the framing has to say
+	// whether a payload travelled inline at all, which a present-or-absent
+	// header cannot express for a message that predates the codec. See
+	// [HeaderClaim].
+	Claim string
+
 	// ReplyTo is the queue an answer to this message should be sent to.
 	//
 	// It travels as AMQP's own reply-to property rather than as a header, which
@@ -190,6 +213,24 @@ func DeadLetterReason(reason string) EnvelopeOption {
 	return func(b *envelopeBuilder) error { b.env.Error = reason; return nil }
 }
 
+// Claim records where the payload is, for a message that carries a reference to
+// it rather than the payload itself.
+//
+//	pub.Send(ctx, reference, acemq.Claim("s3://payloads/2026/09/order-1"))
+//
+// A convention rather than a mechanism: nothing here reads it or fetches
+// anything, and what the string means is between the publisher and the consumer.
+// What it buys is an operator looking at a dead-lettered message being able to
+// see where the payload went without decoding the body. Python and Ruby carry
+// the same field under the same header, so a claim set in either reaches a Go
+// handler as [Envelope.Claim].
+//
+// This is not the claim-check pattern. That frames the body instead, for reasons
+// written on [HeaderClaim]; see patterns.ClaimCheckCodec.
+func Claim(location string) EnvelopeOption {
+	return func(b *envelopeBuilder) error { b.env.Claim = location; return nil }
+}
+
 // Header adds an application header.
 //
 // It refuses a name in the reserved namespace rather than accepting one that
@@ -292,6 +333,7 @@ func EnvelopeFromWire(headers map[string]any, routingKey, messageID string) Enve
 		FirstSeen:     time.UnixMilli(headerInt64(headers, HeaderFirstSeen)).UTC(),
 		Origin:        headerString(headers, HeaderOrigin),
 		Error:         headerString(headers, HeaderError),
+		Claim:         headerString(headers, HeaderClaim),
 		Route:         headerString(headers, HeaderRoute),
 		// Zero when the header is absent or unreadable, which is also the right
 		// answer for a route that has one: a position nobody can read would send
@@ -362,6 +404,12 @@ func (e Envelope) ToWire() map[string]any {
 	}
 	if e.Error != "" {
 		wire[HeaderError] = e.Error
+	}
+	if e.Claim != "" {
+		// Omitted when empty, like every other optional field. Python and Ruby
+		// write it the same way, so a message with no claim is byte-identical
+		// across the three.
+		wire[HeaderClaim] = e.Claim
 	}
 	if e.Route != "" {
 		// All three or none. A route with no position would be read as position

@@ -15,10 +15,12 @@
 package acemq
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -198,7 +200,7 @@ func TestAnAbsentValueIsAnAbsentHeaderRatherThanANullOne(t *testing.T) {
 
 	// Java omits these entirely rather than writing a null, and a message that
 	// carries a null where Java carries nothing is a different message.
-	for _, absent := range []string{HeaderCausation, HeaderError} {
+	for _, absent := range []string{HeaderCausation, HeaderError, HeaderClaim} {
 		if _, present := wire[absent]; present {
 			t.Errorf("%q was written for an envelope that has none", absent)
 		}
@@ -283,4 +285,132 @@ func TestIdsAreUniqueAndShaped(t *testing.T) {
 			t.Fatalf("%q is not a version 4 UUID", id)
 		}
 	}
+}
+
+// TestAClaimSurvivesTheRoundTrip is the field this library reserved a header for
+// and then never materialised.
+//
+// x-acemq- is the engine's namespace: a header in it that the engine does not
+// put on the envelope is dropped before a handler sees it. So a name that is
+// reserved and unmaterialised is the worst of both — it looks supported, it
+// reaches the wire, and it vanishes.
+func TestAClaimSurvivesTheRoundTrip(t *testing.T) {
+	env, err := NewEnvelope("order.placed", Claim("s3://payloads/2026/09/order-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Claim != "s3://payloads/2026/09/order-1" {
+		t.Fatalf("Claim = %q", env.Claim)
+	}
+
+	wire := env.ToWire()
+	if wire[HeaderClaim] != "s3://payloads/2026/09/order-1" {
+		t.Fatalf("%s = %v on the wire", HeaderClaim, wire[HeaderClaim])
+	}
+
+	back := EnvelopeFromWire(wire, "orders", "")
+	if back.Claim != env.Claim {
+		t.Errorf("the claim came back as %q, want %q", back.Claim, env.Claim)
+	}
+
+	// And it is the engine's, so it does not also turn up among the
+	// application's headers.
+	if _, present := back.Headers[HeaderClaim]; present {
+		t.Errorf("%s reached the application's headers as well", HeaderClaim)
+	}
+}
+
+// TestAClaimFromAnotherLanguageReachesAGoHandler is the reason to materialise it
+// rather than leave the constant sitting there.
+//
+// Python's Envelope.claim and Ruby's :claim are first-class fields that write
+// this header. Before it was a field here, a message published by either of them
+// arrived, was recognised as reserved, and had its claim dropped on the way to
+// the handler.
+func TestAClaimFromAnotherLanguageReachesAGoHandler(t *testing.T) {
+	// The shape a Python or Ruby publisher puts on the wire. A long string can
+	// arrive as bytes depending on the client, like every other header.
+	fromElsewhere := map[string]any{
+		HeaderID:    "order-1",
+		HeaderType:  "order.placed",
+		HeaderClaim: []byte("gs://payloads/order-1.json"),
+	}
+
+	env := EnvelopeFromWire(fromElsewhere, "orders", "")
+	if env.Claim != "gs://payloads/order-1.json" {
+		t.Errorf("a claim from another library reached the handler as %q", env.Claim)
+	}
+}
+
+// TestAMessageWithNoClaimIsUnchanged, because materialising a field must not
+// start writing a header onto every message the family exchanges. An absent
+// value is an absent header, never an empty one.
+func TestAMessageWithNoClaimIsUnchanged(t *testing.T) {
+	env, err := NewEnvelope("order.placed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Claim != "" {
+		t.Errorf("a message nobody set a claim on has %q", env.Claim)
+	}
+	if _, present := env.ToWire()[HeaderClaim]; present {
+		t.Errorf("%s was written for a message with no claim", HeaderClaim)
+	}
+
+	back := EnvelopeFromWire(env.ToWire(), "orders", "")
+	if back.Claim != "" {
+		t.Errorf("a message with no claim came back with %q", back.Claim)
+	}
+}
+
+// TestAPublishedClaimReachesTheHandler is the round trip through the library
+// rather than through the two envelope functions: publish with a claim, consume,
+// and read it off the envelope the handler is given.
+func TestAPublishedClaimReachesTheHandler(t *testing.T) {
+	mq := brokerFor(t)
+	declare(t, mq, "orders")
+
+	var seen string
+	var got atomicFlag
+
+	consumer, err := Consume(context.Background(), mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			seen = m.Envelope.Claim
+			got.set()
+			return Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = consumer.Close() }()
+
+	pub := NewPublisher[OrderPlaced](mq, "", "orders")
+	err = pub.Send(context.Background(), OrderPlaced{OrderID: "order-1"},
+		Claim("s3://payloads/2026/09/order-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the message to be handled", got.isSet)
+	if seen != "s3://payloads/2026/09/order-1" {
+		t.Errorf("the handler saw a claim of %q", seen)
+	}
+}
+
+// atomicFlag is a one-way flag a handler can set and a test can poll.
+type atomicFlag struct {
+	mu   sync.Mutex
+	set_ bool
+}
+
+func (f *atomicFlag) set() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.set_ = true
+}
+
+func (f *atomicFlag) isSet() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.set_
 }

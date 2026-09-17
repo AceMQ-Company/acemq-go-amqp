@@ -30,6 +30,7 @@ type Envelope struct {
 | `FirstSeen` | when it was first published | now |
 | `Origin` | the publishing process | `acemq@{hostname}` |
 | `Error` | why it was dead-lettered | empty |
+| `Claim` | where the payload is, when it travelled elsewhere | empty |
 | `ReplyTo` | where an answer should go | empty |
 | `Headers` | your own headers | empty |
 
@@ -51,6 +52,7 @@ content.
 | `x-acemq-first-seen` | `FirstSeen`, epoch milliseconds |
 | `x-acemq-origin` | `Origin`, omitted when empty |
 | `x-acemq-error` | `Error`, omitted when empty. Present only in a dead-letter queue. |
+| `x-acemq-claim` | `Claim`, omitted when empty |
 | `x-acemq-route` | `Route`, the ordered step names of a declared pipeline, comma joined. All three below are omitted together when empty. |
 | `x-acemq-route-position` | `RoutePosition`, an integer, counting from zero |
 | `x-acemq-route-id` | `RouteID`, identifying one run across every hop |
@@ -90,12 +92,40 @@ here; Java also reads the epoch milliseconds it wrote before 0.5.0.
 stamps are dropped on the way in here rather than reaching a handler — see
 [replay](patterns.md#replay).
 
-`x-acemq-claim` is reserved and **written by nothing in this library**. It is for
-an application that wants an operator reading a dead-letter queue to see where a
-payload went. The [claim check](patterns.md#claim-check) frames the body rather
-than setting a header, because a header can be stripped by a shovel or a
-federation link and because a present-or-absent header cannot say whether a
-payload travelled inline. Python and Ruby reserve it the same way.
+`x-acemq-claim` is a real field and **nothing in this library writes it by
+itself**. It is for an application that wants an operator reading a dead-letter
+queue to see where a payload went without decoding the body:
+
+```go
+pub.Send(ctx, reference, acemq.Claim("s3://payloads/2026/09/order-1"))
+```
+
+```go
+func(ctx context.Context, m acemq.Message[Reference]) acemq.Ack {
+	if m.Envelope.Claim != "" {
+		// the payload is over there
+	}
+	return acemq.Accept()
+}
+```
+
+A convention rather than a mechanism: nothing here reads it or fetches anything,
+and what the string means is between the publisher and the consumer.
+
+It is on the envelope rather than among your headers for the same reason the
+route headers are. Python and Ruby carry `claim` as a first-class envelope field,
+and any `x-acemq-` header this version does not materialise is dropped on the way
+in — so before it was a field, a claim set by a Python or Ruby publisher reached
+the wire and vanished before a Go handler saw it. Reserved and unmaterialised is
+the worst of both: a name that looks supported and is not.
+
+**This is not the [claim check](patterns.md#claim-check).** That pattern frames
+the body rather than setting a header, because a header can be stripped by a
+shovel or a federation link and because a present-or-absent header cannot say
+whether a payload travelled inline. The two are unrelated: this field is a note
+about where a payload went, and the codec is a mechanism that moves one. Setting
+`Claim` does not make anything a claim check, and the claim check does not set
+`Claim`.
 
 ## The reserved namespace
 
