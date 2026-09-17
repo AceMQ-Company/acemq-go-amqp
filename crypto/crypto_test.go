@@ -452,14 +452,16 @@ func TestEveryMessageStartsWithTheMagicByte(t *testing.T) {
 	}
 }
 
-// legacyGoBody writes the framing this library wrote up to v0.3.0, which
-// nothing writes any more. Only a test needs to build one, and only so that
-// reading it can be proven to still work.
-func legacyGoBody(t *testing.T, key Key, plaintext string) []byte {
+// bodyFromBeforeTheFramingChanged writes the framing this library wrote up to
+// v0.3.0 — a version byte, a two-byte big-endian key id length, the key id, then
+// the nonce and the ciphertext, with no magic byte in front. Nothing writes it
+// and nothing reads it; a test builds one so the refusal can be pinned rather
+// than merely assumed from the absence of the code that used to read it.
+func bodyFromBeforeTheFramingChanged(t *testing.T, key Key, plaintext string) []byte {
 	t.Helper()
 
 	header := make([]byte, 0, 3+len(key.ID))
-	header = append(header, legacyFormatVersion)
+	header = append(header, 0x01)
 	header = binary.BigEndian.AppendUint16(header, uint16(len(key.ID)))
 	header = append(header, key.ID...)
 
@@ -477,12 +479,12 @@ func legacyGoBody(t *testing.T, key Key, plaintext string) []byte {
 	return append(body, gcm.Seal(nil, nonce, []byte(plaintext), header)...)
 }
 
-// TestTheLegacyGoFramingStillReads is the migration affordance: v0.3.0 is
-// released, so queues can hold bodies in the framing this library used to
-// write, and a consumer upgraded ahead of them has to be able to drain them.
-//
-// It goes away in v0.6.0, and this test goes with it.
-func TestTheLegacyGoFramingStillReads(t *testing.T) {
+// TestABodyFromBeforeTheFramingChangedIsRefused: reading those bodies was a
+// migration affordance with an end date, and the date has passed. An encrypted
+// body fails closed — the bytes are refused rather than misread, with the same
+// error as anything else that is not in this framing, and by the holder of the
+// very key that wrote them.
+func TestABodyFromBeforeTheFramingChangedIsRefused(t *testing.T) {
 	key, err := NewKey("2026-01")
 	if err != nil {
 		t.Fatal(err)
@@ -492,67 +494,31 @@ func TestTheLegacyGoFramingStillReads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	old := legacyGoBody(t, key, "written before the framing changed")
-	if old[0] != legacyFormatVersion {
-		t.Fatalf("the fixture is not in the legacy framing: it begins %#x", old[0])
+	old := bodyFromBeforeTheFramingChanged(t, key, "written before the framing changed")
+	if old[0] != 0x01 {
+		t.Fatalf("the fixture is not in the framing v0.3.0 wrote: it begins %#x", old[0])
 	}
-
-	var back string
-	if err := Wrap(rawCodec{}, ring).Decode(old, &back); err != nil {
-		t.Fatalf("a body written by v0.3.0 no longer opens: %v", err)
-	}
-	if back != "written before the framing changed" {
-		t.Errorf("decoded %q", back)
-	}
-
-	// And an operator can still tell which key it needs.
-	id, err := KeyIDOf(old)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if id != "2026-01" {
-		t.Errorf("KeyIDOf on a legacy body = %q", id)
-	}
-}
-
-// TestALegacyBodyIsStillAuthenticated: reading the old framing must not mean
-// reading it more trustingly than the new one.
-func TestALegacyBodyIsStillAuthenticated(t *testing.T) {
-	key, err := NewKey("2026-01")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ring, err := NewKeyring(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	old := legacyGoBody(t, key, "written before the framing changed")
-	old[len(old)-1] ^= 0xff
 
 	var back string
 	err = Wrap(rawCodec{}, ring).Decode(old, &back)
 	if err == nil {
-		t.Fatal("an altered legacy body decrypted")
+		t.Fatal("a body written by v0.3.0 still decodes")
 	}
 	if !acemq.IsFatal(err) {
 		t.Error("it is not fatal, so it would be retried for ever")
 	}
-}
+	if !strings.Contains(err.Error(), "framing") {
+		t.Errorf("the error does not say what is wrong with the body: %v", err)
+	}
+	if back != "" {
+		t.Errorf("a refused body decoded into something: %q", back)
+	}
 
-// TestNothingWritesTheLegacyFraming: two writers is how the divergence this
-// change removes would come straight back.
-func TestNothingWritesTheLegacyFraming(t *testing.T) {
-	ring := keyring(t, "2026-01")
-
-	for range 20 {
-		encrypted, err := Wrap(rawCodec{}, ring).Encode("hello")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if encrypted[0] != magic {
-			t.Fatalf("a message was written in the legacy framing: it begins %#x", encrypted[0])
-		}
+	// KeyIDOf stops answering for them too. An operator triaging a dead-letter
+	// queue cannot use it to find which key one of these bodies needs, because
+	// nothing here can open it with that key either.
+	if id, err := KeyIDOf(old); err == nil {
+		t.Errorf("KeyIDOf read a key id off a body nothing can open: %q", id)
 	}
 }
 
@@ -575,10 +541,10 @@ func TestATruncatedMessageIsFatal(t *testing.T) {
 	}
 }
 
-func TestAMessageInNeitherFramingSaysSo(t *testing.T) {
+func TestAMessageNotInTheFramingSaysSo(t *testing.T) {
 	codec := Wrap(rawCodec{}, keyring(t, "2026-01"))
 
-	// Neither 0xAE nor 0x01. A protobuf body, say.
+	// Not 0xAE. A protobuf body, say.
 	var back string
 	err := codec.Decode([]byte{0x0a, 0x05, 'h', 'e', 'l', 'l', 'o'}, &back)
 

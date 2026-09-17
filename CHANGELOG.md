@@ -10,6 +10,58 @@ While the version is `0.x` the public API may change in any release.
 
 ### Removed
 
+- **Breaking change: reading the legacy Go encryption framing. `crypto` reads one
+  framing now, and a body written by this library at v0.3.0 or earlier can no
+  longer be opened.** This is the removal 0.5.0 deprecated, on the release it was
+  promised for.
+
+  Up to v0.3.0 this library framed an encrypted body as a version byte, a
+  two-byte big-endian key id length, the key id, the nonce and the ciphertext,
+  with no magic byte in front — a shape no other AceMQ library could read. 0.5.0
+  moved to the family framing, `0xAE` and a one-byte length, and kept reading the
+  old one so that a queue filled before the change could be drained by a consumer
+  that had already been upgraded. That affordance is gone. `crypto.Codec.Decode`
+  and `crypto.KeyIDOf` accept `0xAE` and nothing else, and the constants and the
+  unframing function that existed only to read the old shape have gone with it,
+  along with the tests that pinned the behaviour.
+
+  **There is no partial read and no recovery path, because these are encrypted
+  payloads.** The bytes are refused, not misread — the two framings are
+  unambiguously distinguishable by their first byte, which is what made keeping
+  both safe and makes dropping one safe as well — but refused is refused. A body
+  beginning `0x01` now fails exactly as an unencrypted body does, fatally, with
+  the error that says the message is not in the framing `crypto.Codec` reads. It
+  fails that way for the holder of the very key that wrote it.
+
+  **`crypto.KeyIDOf` stops answering for those bodies too**, and that deserves
+  saying plainly: it reads a key id out of the header without needing any key,
+  which makes it the natural tool for an operator triaging a dead-letter queue and
+  working out which key a stuck message needs. Pointed at one of these bodies it
+  now returns the same refusal rather than a key id. There is no longer any way in
+  this library to learn which key one of them was written with — the id is still
+  in the bytes, in the clear, three bytes in, but nothing here will read it out.
+
+  **What to do about it.** The instruction since 0.5.0 has been to drain the
+  queues holding those bodies or re-encrypt their contents before upgrading past
+  the removal, and that was the moment to do it. If it was not done, the way back
+  is a v0.5.x build: 0.5.0 and 0.5.x read both framings, so pin one, drain or
+  re-encrypt what is still sitting there, and upgrade afterwards. Nothing in this
+  library can be configured to read the old framing again — there is no option, no
+  constructor and no environment variable, exactly as there was never one to write
+  it, because two readers of a divergence outlive two writers of it.
+
+  **The date moved once, and this is it being kept rather than moved again.** The
+  original deprecation text said the removal landed in v0.5.0 — the release that
+  introduced the deprecation — which made the migration window zero releases long
+  and broke the promise on the day it shipped. That was corrected to v0.6.0, the
+  successor release, in every place the promise was written down. This is that
+  release.
+
+  The exposure was always narrow. The old framing was written only up to v0.3.0,
+  tagged 2026-09-08, and 0.5.0 landed 2026-09-09, so the window in which a
+  released version of this library wrote those bytes was about a day, on a library
+  distributed through the Go module proxy alone.
+
 - **`acemq.HeaderReplayedFrom`, `acemq.HeaderReplayedAt` and
   `acemq.HeaderReplayCount`, which named three headers this library never
   wrote.** They were `x-acemq-replayed-from`, `x-acemq-replayed-at` and
@@ -163,23 +215,17 @@ While the version is `0.x` the public API may change in any release.
   that resolves confirms, so a full buffer would stop confirms arriving while
   every publisher that could drain it waited for exactly those confirms.
 
-- **The legacy `crypto` framing is deprecated until v0.6.0, not v0.5.0.** The
-  0.5.0 entry below, `crypto.Codec.Decode`, the deprecation notice on the legacy
-  constants and [docs/security.md](docs/security.md) all said reading it went
-  away in v0.5.0 — the release that introduced the deprecation. As written the
-  migration window was zero releases long and the promise was already broken on
-  the day it shipped: 0.5.0 reads both framings, as it should. The successor
-  release is where it goes, and every one of those places now says v0.6.0.
-
 - **Documentation said .NET could not read an encrypted body from this
-  library.** `crypto`'s package comment, [docs/security.md](docs/security.md) and
+  library.** `crypto`'s package comment, the doc on `crypto.ContentType`,
+  [docs/security.md](docs/security.md) and
   [docs/serialization.md](docs/serialization.md) all described .NET as the
   remaining exception, using AES-256-CBC with a separate HMAC rather than
   AES-GCM. That was true up to .NET's 0.3.0 and stopped being true in its 0.5.0,
   which moved to AES-GCM in the family framing in the same round this library
   moved to it. A .NET producer and a Go consumer can share a key. What still does
-  not cross is either library's *legacy* bodies — both old framings begin `0x01`,
-  so one arriving at the wrong library is refused rather than misread.
+  not cross is .NET's own *legacy* bodies, which only .NET reads; this library's
+  own v0.3.0 bodies are now read by nothing at all — see Removed. Both of those
+  old framings begin `0x01`, so one arriving here is refused rather than misread.
 
 - **[docs/envelope.md](docs/envelope.md) documented the replay stamps under the
   wrong names**, said two and listed three, and described them as read when

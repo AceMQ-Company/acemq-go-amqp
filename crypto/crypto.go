@@ -26,13 +26,11 @@
 //
 // The framing is the family's, byte for byte — Java, .NET, Python and Ruby all
 // write it — so a producer in any of them and a Go consumer can share a key. See
-// [ContentType] for the bytes, and the security guide for what to do about
-// anything encrypted by this library up to v0.3.0, whose framing was Go's alone.
+// [ContentType] for the bytes.
 //
 // .NET wrote AES-256-CBC with a separate HMAC up to its own 0.3.0 and moved to
 // AES-GCM in the same round this library moved its framing, so it is no longer
-// the exception it was. Its old bodies are read only by .NET, as this library's
-// old bodies are read only here.
+// the exception it was. Its old bodies are read only by .NET.
 //
 // # What this does not protect
 //
@@ -52,7 +50,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"sort"
@@ -69,10 +66,10 @@ import (
 //
 //	[0xAE][1 byte version][1 byte key id length][key id][12 byte nonce][ciphertext+tag]
 //
-// which is byte for byte what Java, Python and Ruby write, so a body encrypted
-// here opens there and theirs opens here, given the same key. .NET is the
-// remaining exception: it does not use AES-GCM at all, but AES-256-CBC with a
-// separate HMAC-SHA-256, and neither library can read the other's messages.
+// which is byte for byte what Java, .NET, Python and Ruby write, so a body
+// encrypted here opens there and theirs opens here, given the same key. .NET
+// used AES-256-CBC with a separate HMAC-SHA-256 up to its own 0.3.0 and is no
+// longer the exception it was.
 //
 // The magic byte is the reason for the shape. Without it the first byte of a
 // body is a version number small enough to be the first byte of a protobuf or
@@ -275,11 +272,8 @@ func (c *Codec) Inner() acemq.Codec { return c.inner }
 // which key to try before it can decrypt anything. It names a key rather than
 // revealing one.
 //
-// This is the only framing this library writes. Bodies in the framing Go wrote
-// up to v0.3.0 are still read — see [Codec.Decode] — but never written, because
-// two writers is how a divergence survives being fixed.
-//
-// Java, .NET, Python and Ruby write these same bytes.
+// This is the only framing this library writes and the only one it reads — see
+// [Codec.Decode]. Java, .NET, Python and Ruby write these same bytes.
 func (c *Codec) Encode(payload any) ([]byte, error) {
 	plaintext, err := c.inner.Encode(payload)
 	if err != nil {
@@ -316,11 +310,9 @@ func (c *Codec) Encode(payload any) ([]byte, error) {
 
 // Decode decrypts and then decodes.
 //
-// Two framings are read. A body beginning 0xAE is the family framing, which is
-// what this library and Java, .NET, Python and Ruby write. A body beginning 0x01
-// is the legacy Go framing, written by this library up to v0.3.0; it is read so
-// that a queue filled before the change can be drained, and nothing writes it
-// any more. Reading it goes away in v0.6.0. Anything else is refused.
+// A body begins 0xAE, the family framing this library and Java, .NET, Python and
+// Ruby all write. Anything else is refused, and refused as what it is rather than
+// reported as a decryption failure.
 //
 // A body that will not decrypt is fatal: the same bytes fail the same way every
 // time, whether they were tampered with, encrypted with a key this process does
@@ -371,7 +363,8 @@ func (c *Codec) CanDecode(contentType string) bool {
 // KeyIDOf reads which key a message was encrypted with, without decrypting it.
 //
 // For working out why a message will not open, and for a tool that has to route
-// messages to whoever holds the key. It reads both framings Decode reads.
+// messages to whoever holds the key. It reads the framing [Codec.Decode] reads
+// and refuses, with the same error, everything [Codec.Decode] refuses.
 func KeyIDOf(body []byte) (string, error) {
 	id, _, _, err := unframe(body)
 	return id, err
@@ -400,9 +393,8 @@ func frame(keyID string) []byte {
 	return append(out, keyID...)
 }
 
-// unframe reads a body's header, whichever of the two framings it is in, and
-// returns the key id, the header bytes exactly as they arrived — GCM's
-// associated data — and everything after them.
+// unframe reads a body's header and returns the key id, the header bytes exactly
+// as they arrived — GCM's associated data — and everything after them.
 func unframe(body []byte) (keyID string, header, sealed []byte, err error) {
 	if len(body) >= prefixBytes && body[0] == magic {
 		if body[1] != formatVersion {
@@ -422,48 +414,10 @@ func unframe(body []byte) (keyID string, header, sealed []byte, err error) {
 		return string(body[prefixBytes:end]), body[:end], body[end:], nil
 	}
 
-	if len(body) >= legacyPrefixBytes && body[0] == legacyFormatVersion {
-		return unframeLegacyGo(body)
-	}
-
 	return "", nil, nil, acemq.Fatalf(
-		"acemq: this message was not written by crypto.Codec — it does not start with the " +
-			"framing this codec writes. A consumer configured to decrypt has been pointed at " +
-			"a queue carrying something else")
-}
-
-// The legacy Go framing.
-//
-// Up to v0.3.0 this library wrote
-//
-//	[1 byte version][2 bytes key id length, big-endian][key id][12 byte nonce][ciphertext+tag]
-//
-// with no magic byte, which no other AceMQ library could read. It is still read
-// here so that a queue filled before the change can be drained by a consumer
-// that has been upgraded, and it is deliberately never written: two writers is
-// how a divergence survives being fixed.
-//
-// Deprecated: this is a migration affordance and goes away in v0.6.0. Drain or
-// re-encrypt anything still holding these bodies before then. The two framings
-// cannot be confused — the current one begins 0xAE and this one begins 0x01 —
-// so removing it will refuse those bodies rather than misread them.
-const (
-	legacyFormatVersion = 0x01
-	legacyPrefixBytes   = 3
-)
-
-// unframeLegacyGo reads the framing described above. Deprecated along with it.
-func unframeLegacyGo(body []byte) (keyID string, header, sealed []byte, err error) {
-	idLen := int(binary.BigEndian.Uint16(body[1:legacyPrefixBytes]))
-	if idLen == 0 {
-		return "", nil, nil, acemq.Fatalf(
-			"acemq: this message carries no key id, so nothing can say which key opens it")
-	}
-	if len(body) < legacyPrefixBytes+idLen {
-		return "", nil, nil, acemq.Fatalf("acemq: the key id on this message is truncated")
-	}
-	end := legacyPrefixBytes + idLen
-	return string(body[legacyPrefixBytes:end]), body[:end], body[end:], nil
+		"acemq: this message is not in the framing crypto.Codec reads — it does not begin %#x. "+
+			"A consumer configured to decrypt has been pointed at a queue carrying something "+
+			"else, or at bodies written in a framing this library does not read", magic)
 }
 
 func isKeySize(n int) bool {

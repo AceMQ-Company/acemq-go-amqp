@@ -294,8 +294,9 @@ hashed into shape, because both would make a weak key look like a strong one.
 The framing is the family's byte for byte — `0xAE`, a version byte, a one-byte
 key id length, the key id, a 12-byte nonce, then the ciphertext and its 16-byte
 tag — so a producer in Java, .NET, Python or Ruby and a Go consumer can share a
-key. See [security](security.md#encrypted-bodies-are-portable), which also covers
-reading what v0.3.0 wrote and when that stops.
+key. It is the only framing this library writes and the only one it reads; a body
+that does not begin `0xAE` is refused as what it is. See
+[security](security.md#encrypted-bodies-are-portable).
 
 ## Several formats on one queue
 

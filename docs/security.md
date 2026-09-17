@@ -224,27 +224,13 @@ libraries accept, so a key that already works in Java works here unchanged.
 **.NET used to be the exception and no longer is.** It wrote AES-256-CBC with a
 separate HMAC-SHA-256 up to its own 0.3.0 and moved to AES-GCM in this framing in
 the same round this library did, so a .NET producer and a Go consumer can share a
-key. What does not cross is either library's *old* bodies: .NET reads its legacy
-framing, this library reads its own, and neither reads the other's. Both old
-framings begin `0x01`, so a body from the wrong one is refused rather than
-misread.
+key. What does not cross is .NET's own *old* bodies, which only .NET reads.
 
-### Reading what v0.3.0 wrote
-
-Up to v0.3.0 this library framed a message as version, a two-byte big-endian key
-id length, key id, nonce, ciphertext — no magic byte, and no other AceMQ library
-could read it. Bodies in that framing can be sitting in a queue, so `Decode`
-still reads them: a body beginning `0xAE` is the current framing, a body
-beginning `0x01` is the legacy one, and anything else is refused as it was
-before. The two cannot be confused.
-
-**Nothing writes the legacy framing.** It is read and never produced, because
-two writers is how a divergence survives being fixed.
-
-**This is deprecated and goes away in v0.6.0**, the release after the one that
-changed the framing. Drain the queues holding those bodies, or re-encrypt them,
-before upgrading past it. After that they are refused rather than misread — which
-is the safe direction, but it is still a message nobody can open.
+**This is the only framing this library writes, and the only one it reads.** A
+body that does not begin `0xAE` is refused as what it is — a fatal error naming
+the framing, not a decryption failure — so a consumer pointed at a plaintext
+queue, or at bodies some other library framed its own way, is told what has
+actually happened rather than being left to suspect its keys.
 
 ## What this library does not do
 
