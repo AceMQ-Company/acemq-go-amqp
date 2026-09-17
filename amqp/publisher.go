@@ -146,9 +146,11 @@ func (p *Publisher[T]) SendResult(
 //
 // Nothing here widens what the transport allows. Each message goes out through
 // the same path as [Publisher.Send], so whatever bounds publishes in flight
-// still bounds them — the RabbitMQ transport shares one channel under a lock,
-// because a channel is not safe for concurrent use. Publish interceptors run on
-// one goroutine per message and must be safe for concurrent use themselves.
+// still bounds them — the RabbitMQ transport writes to one channel under a lock,
+// because a channel is not safe for concurrent writes, and bounds how many may
+// be waiting for a confirm at once with rabbitmq.Config.MaxOutstandingPublishes.
+// Publish interceptors run on one goroutine per message and must be safe for
+// concurrent use themselves.
 func (p *Publisher[T]) SendAll(
 	ctx context.Context, payloads []T, opts ...EnvelopeOption,
 ) ([]PublishResult, error) {

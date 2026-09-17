@@ -148,9 +148,44 @@ count of what did arrive, and the count is the whole reason to report it.
 ### What bounds it
 
 `SendAll` does not open a second route to the broker. Every message goes out
-through the same path as `Send`, so whatever bounds publishes in flight still
-does: the RabbitMQ transport shares one channel under a lock, because an AMQP
-channel is not safe for concurrent use.
+through the same path as `Send`.
+
+What bounds it is a number you can set. The RabbitMQ transport writes to one
+channel under a lock, because an AMQP channel is not safe for concurrent
+writes — but it waits for the confirms outside that lock, so a batch costs one
+round trip's latency rather than one per message. How many publishes may be
+waiting for a confirm at the same time is `MaxOutstandingPublishes`:
+
+```go
+transport, err := rabbitmq.Dial(ctx, url, rabbitmq.Config{
+	MaxOutstandingPublishes: 200,
+})
+mq, err := acemq.NewConn(transport)
+```
+
+It defaults to **1000**, which is Java's number and .NET's. Each outstanding
+publish holds a body the broker has not acknowledged yet, so raising it buys
+latency hiding and costs memory; setting it to `1` gives back the round trip per
+message a transport without pipelining pays.
+
+A publish that finds every slot taken waits for one, and when its context is
+done it fails rather than waiting for ever:
+
+```
+acemq: 1000 publishes are already waiting for a confirm and none completed in
+time; the broker is not keeping up, so publish more slowly rather than buffering
+more (rabbitmq.Config.MaxOutstandingPublishes)
+```
+
+That refusal is the point of the bound. A publisher blocked for ever on a broker
+that has stopped confirming is indistinguishable from a wedged process; a
+publisher told it cannot get a slot can shed load, slow down, or fail the
+request.
+
+Mandatory publishes keep working with a batch outstanding. The broker sends
+`basic.return` before the confirm for the same message, so each publish finds
+its own return and no other's — a return that arrives while another publish is
+draining is filed under its message id and waits for the publish it belongs to.
 
 [Publish interceptors](interceptors.md) run on one goroutine per message during a
 batch, so an interceptor keeping state of its own has to be safe for concurrent

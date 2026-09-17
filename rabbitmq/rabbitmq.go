@@ -153,6 +153,22 @@ type Config struct {
 	// than the round trip.
 	WithoutConfirms bool
 
+	// MaxOutstandingPublishes bounds how many publishes may be waiting for a
+	// confirm at the same time. One thousand by default, which is the number
+	// Java's ConnectionConfig and .NET's ConnectionConfig both use.
+	//
+	// This is the only backpressure a pipelining publisher has. The confirm is
+	// awaited outside the channel lock, so a caller publishing faster than the
+	// broker confirms would otherwise accumulate unconfirmed messages until the
+	// process dies — which looks like throughput right up to the moment it does
+	// not. A publish that finds every slot taken waits for one, and fails when
+	// its context is done rather than waiting for ever.
+	//
+	// Raising it buys latency hiding and costs memory: each slot holds a body
+	// the broker has not yet acknowledged. Lowering it to 1 restores the
+	// one-round-trip-per-message behaviour of a transport without pipelining.
+	MaxOutstandingPublishes int
+
 	// WithoutRecovery stops the transport reconnecting when the connection
 	// drops.
 	//
@@ -204,6 +220,10 @@ type Transport struct {
 	// One channel for publishing and topology, guarded by a mutex. An AMQP
 	// channel is not safe for concurrent use, and sharing one under a lock is
 	// simpler to reason about than a pool for the traffic a publisher generates.
+	//
+	// The lock covers the write and nothing else. Waiting for the confirm used
+	// to happen under it too, which serialised every publish behind a full
+	// broker round trip and made a pipelined batch no faster than a loop.
 	mu      sync.Mutex
 	channel *amqp.Channel
 
@@ -212,6 +232,23 @@ type Transport struct {
 	// arrives before the confirm for the same publish.
 	returns    chan amqp.Return
 	confirming bool
+
+	// outstanding is the semaphore that bounds unconfirmed publishes. A slot is
+	// taken before the write and given back when the publish is finished with,
+	// so the bound is deliberate rather than an accident of the channel lock.
+	// Its capacity is also what sizes the returns buffer; see maxOutstanding.
+	outstanding chan struct{}
+
+	// returned holds returns that have arrived but whose publisher has not
+	// looked yet, keyed by message id.
+	//
+	// A map rather than the channel alone, because with several publishes
+	// outstanding a publisher draining the channel meets returns belonging to
+	// other publishers, and putting those back into a buffered channel loses
+	// them when it is full. Filed here they wait for their owner instead.
+	returnsMu    sync.Mutex
+	returned     map[string]string
+	returnedSeen []string
 
 	subsMu sync.Mutex
 	subs   []*subscription
@@ -337,7 +374,16 @@ func Dial(ctx context.Context, url string, cfg ...Config) (*Transport, error) {
 	// returns nil means the bytes reached the socket, which is not the same as
 	// the broker having taken responsibility for them — and the difference is
 	// only ever noticed after messages have been lost.
-	transport := &Transport{url: url, cfg: c, conn: conn, channel: ch, stopRecov: make(chan struct{})}
+	bound := maxOutstanding(c)
+	transport := &Transport{
+		url:         url,
+		cfg:         c,
+		conn:        conn,
+		channel:     ch,
+		stopRecov:   make(chan struct{}),
+		outstanding: make(chan struct{}, bound),
+		returned:    map[string]string{},
+	}
 	if !c.WithoutConfirms {
 		if err := ch.Confirm(false); err != nil {
 			_ = ch.Close()
@@ -345,7 +391,14 @@ func Dial(ctx context.Context, url string, cfg ...Config) (*Transport, error) {
 			return nil, fmt.Errorf("acemq: the broker will not enable publisher confirms: %w", err)
 		}
 		transport.confirming = true
-		transport.returns = ch.NotifyReturn(make(chan amqp.Return, 64))
+		// Buffered for every publish that may be in flight at once. The client
+		// hands a return to this channel with a blocking send from the same
+		// goroutine that resolves confirms, so a full buffer would stop confirms
+		// arriving — and the publishers that would drain it are all waiting for
+		// exactly those confirms. One slot per outstanding publish makes that
+		// deadlock unreachable: a publish produces at most one return, and a
+		// publish that has been answered has already been drained.
+		transport.returns = ch.NotifyReturn(make(chan amqp.Return, bound))
 	}
 
 	go transport.watchBlocked(conn.NotifyBlocked(make(chan amqp.Blocking, 4)))
@@ -443,12 +496,11 @@ func (t *Transport) Publish(
 		return result, &acemq.PublishingPausedError{Reason: reason}
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if !t.confirming {
+		t.mu.Lock()
 		err := t.channel.PublishWithContext(
 			ctx, exchange, routingKey, msg.Mandatory, false, publishing)
+		t.mu.Unlock()
 		if err != nil {
 			return result, &acemq.PublishFailedError{
 				MessageID: msg.MessageID, Exchange: exchange, RoutingKey: routingKey, Err: err}
@@ -459,8 +511,23 @@ func (t *Transport) Publish(
 		return result, nil
 	}
 
+	// Taken before the write, which is the point: the bound has to be on
+	// messages the broker has not answered for, and after the write is too late
+	// to refuse one. Java acquires its Semaphore in the same place and for the
+	// same reason.
+	if err := t.acquire(ctx); err != nil {
+		return result, err
+	}
+	defer t.release()
+
+	// The write is under the lock because an AMQP channel is not safe for
+	// concurrent writes, and because the sequence number the confirm will name
+	// is assigned by the write itself. The wait below is not, which is what
+	// makes a batch cost one round trip rather than one per message.
+	t.mu.Lock()
 	confirmation, err := t.channel.PublishWithDeferredConfirmWithContext(
 		ctx, exchange, routingKey, msg.Mandatory, false, publishing)
+	t.mu.Unlock()
 	if err != nil {
 		return result, &acemq.PublishFailedError{
 			MessageID: msg.MessageID, Exchange: exchange, RoutingKey: routingKey, Err: err}
@@ -492,37 +559,113 @@ func (t *Transport) Publish(
 	return result, nil
 }
 
+// defaultMaxOutstandingPublishes is Java's number, and .NET's.
+//
+// A default that differs between libraries would make the same batch behave
+// differently in each, and this one is a promise about memory rather than a
+// tuning knob with a right answer, so the family shares it.
+const defaultMaxOutstandingPublishes = 1000
+
+func maxOutstanding(c Config) int {
+	if c.MaxOutstandingPublishes > 0 {
+		return c.MaxOutstandingPublishes
+	}
+	return defaultMaxOutstandingPublishes
+}
+
+// acquire takes a slot for one unconfirmed publish, waiting for one when every
+// slot is taken.
+//
+// Refused rather than queued for ever. A publisher that has filled the bound is
+// publishing faster than the broker is confirming, and the honest answer is to
+// say so at the point of publishing — a caller can then shed load, slow down or
+// fail the request, none of which is available to one that is simply blocked.
+func (t *Transport) acquire(ctx context.Context) error {
+	select {
+	case t.outstanding <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case t.outstanding <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return acemq.Transportf(ctx.Err(),
+			"%d publishes are already waiting for a confirm and none completed in time; "+
+				"the broker is not keeping up, so publish more slowly rather than buffering more "+
+				"(rabbitmq.Config.MaxOutstandingPublishes)",
+			cap(t.outstanding))
+	}
+}
+
+func (t *Transport) release() {
+	select {
+	case <-t.outstanding:
+	default:
+		// Unreachable: every release pairs with an acquire. Written as a
+		// non-blocking receive so a future mistake is a lost slot rather than a
+		// publisher stuck for ever on an empty channel.
+	}
+}
+
 // takeReturn looks for a return matching a message just confirmed.
 //
 // Drained rather than waited on: the broker sends basic.return before the
-// confirm, so anything that was coming has arrived. Returns for other messages
-// are put back, because a publisher sharing this channel is entitled to its own.
+// confirm for the same publish, so by the time that confirm resolves the return
+// is already sitting in the channel this reads. That ordering is what makes a
+// non-blocking drain correct, and it survives several publishes being
+// outstanding because it is a per-message guarantee rather than a per-channel
+// one — the client hands returns and confirms to us from one goroutine, in the
+// order the broker sent them.
+//
+// Returns for other messages are filed rather than put back. Pushing them into
+// the buffered channel again would drop them once it filled, and with a batch
+// in flight a publisher meets other publishers' returns constantly.
 func (t *Transport) takeReturn(messageID string) (string, bool) {
-	var others []amqp.Return
-	defer func() {
-		for _, r := range others {
-			select {
-			case t.returns <- r:
-			default:
-				// The buffer is full and this return is for a message nobody
-				// asked about. Dropping it loses a diagnostic, not a message.
-			}
-		}
-	}()
+	t.returnsMu.Lock()
+	defer t.returnsMu.Unlock()
 
+	t.drainReturnsLocked()
+
+	reason, found := t.returned[messageID]
+	if found {
+		delete(t.returned, messageID)
+	}
+	return reason, found
+}
+
+// drainReturnsLocked moves everything waiting in the channel into the map.
+func (t *Transport) drainReturnsLocked() {
 	for {
 		select {
 		case r, ok := <-t.returns:
 			if !ok {
-				return "", false
+				return
 			}
-			if r.MessageId == messageID {
-				return fmt.Sprintf("%d %s", r.ReplyCode, r.ReplyText), true
-			}
-			others = append(others, r)
+			t.returned[r.MessageId] = fmt.Sprintf("%d %s", r.ReplyCode, r.ReplyText)
+			t.returnedSeen = append(t.returnedSeen, r.MessageId)
+			t.evictOldReturnsLocked()
 		default:
-			return "", false
+			return
 		}
+	}
+}
+
+// evictOldReturnsLocked keeps the map from growing without bound.
+//
+// A return whose publisher never asks — one whose context was cancelled between
+// the write and the confirm — would otherwise stay for the life of the process.
+// The cap is the publish bound, because that is how many publishers can be
+// waiting to ask at once; anything older than that has no one left to claim it.
+func (t *Transport) evictOldReturnsLocked() {
+	limit := cap(t.outstanding)
+	if limit < 64 {
+		limit = 64
+	}
+	for len(t.returnedSeen) > limit {
+		oldest := t.returnedSeen[0]
+		t.returnedSeen = t.returnedSeen[1:]
+		delete(t.returned, oldest)
 	}
 }
 
@@ -925,10 +1068,11 @@ func (t *Transport) reconnectOnce() (chan *amqp.Error, error) {
 	defer cancel()
 
 	fresh, err := Dial(ctx, t.url, Config{
-		Security:        t.cfg.Security,
-		TLS:             t.cfg.TLS,
-		Name:            t.cfg.Name,
-		WithoutConfirms: t.cfg.WithoutConfirms,
+		Security:                t.cfg.Security,
+		TLS:                     t.cfg.TLS,
+		Name:                    t.cfg.Name,
+		WithoutConfirms:         t.cfg.WithoutConfirms,
+		MaxOutstandingPublishes: t.cfg.MaxOutstandingPublishes,
 		// The replacement must not start a recovery loop of its own; this one
 		// takes over its connection and keeps watching.
 		WithoutRecovery: true,
@@ -940,9 +1084,18 @@ func (t *Transport) reconnectOnce() (chan *amqp.Error, error) {
 	t.mu.Lock()
 	t.conn = fresh.conn
 	t.channel = fresh.channel
-	t.returns = fresh.returns
 	t.confirming = fresh.confirming
 	t.mu.Unlock()
+
+	// The old channel's returns died with it, and anything still filed against
+	// it belongs to publishes that failed when the connection went. Keeping
+	// them would let a later publish that happened to reuse a message id read
+	// a return meant for a message nobody sent again.
+	t.returnsMu.Lock()
+	t.returns = fresh.returns
+	t.returned = map[string]string{}
+	t.returnedSeen = nil
+	t.returnsMu.Unlock()
 
 	if err := t.redeclare(ctx); err != nil {
 		_ = fresh.conn.Close()

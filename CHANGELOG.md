@@ -43,6 +43,74 @@ While the version is `0.x` the public API may change in any release.
 
 ### Fixed
 
+- **`Publisher.SendAll` pipelined at the library layer and then waited one
+  message at a time underneath, so a batch bought no throughput at all.** The
+  RabbitMQ transport took its publishing mutex at the top of `Transport.Publish`
+  and held it — deferred unlock — across `DeferredConfirmation.WaitContext`. Every
+  publish therefore owned the channel for a full broker round trip, and a batch
+  of N that `SendAll` had carefully started on N goroutines queued up behind that
+  lock and paid N round trips anyway. The batch tests could not see it: the
+  in-memory transport has no round trip to pay.
+
+  The lock now covers the write and only the write. An AMQP channel is still not
+  safe for concurrent writes, and the sequence number a confirm will name is
+  assigned by the write itself, so both stay inside; the wait moved out. Measured
+  against a local broker, a batch of 200 messages with a 1.15 ms round trip went
+  from **364 ms to 12 ms** — from slightly worse than a loop over `Send` to about
+  nineteen times better than one. `rabbitmq/confirms_test.go` asserts the batch
+  costs less than a quarter of what one round trip per message would, which is
+  the assertion that failed before this change.
+
+- **Nothing bounded how many publishes could be unconfirmed at once, and now
+  something does.** With the confirm wait under the lock the bound was one, by
+  accident. Taking the wait out from under the lock without replacing that bound
+  would have traded a throughput bug for a memory one: a caller publishing faster
+  than the broker confirms accumulates unconfirmed bodies until the process dies,
+  which looks like throughput right up to the moment it does not.
+
+  `rabbitmq.Config.MaxOutstandingPublishes` is the bound, and a publish takes its
+  slot **before** the write — after the write is too late to refuse one. It
+  defaults to **1000**, matching `maxOutstandingPublishes` in Java's
+  `ConnectionConfig` and `MaxOutstandingPublishes` in .NET's, so the same batch
+  behaves the same whichever library sends it.
+
+  ```go
+  transport, err := rabbitmq.Dial(ctx, url, rabbitmq.Config{
+      MaxOutstandingPublishes: 200,
+  })
+  ```
+
+  A publish that finds every slot taken waits for one and fails when its context
+  is done, rather than waiting for ever:
+
+  ```
+  acemq: 1000 publishes are already waiting for a confirm and none completed in
+  time; the broker is not keeping up, so publish more slowly rather than
+  buffering more (rabbitmq.Config.MaxOutstandingPublishes)
+  ```
+
+  **What you do about it:** nothing, unless you were relying on the accidental
+  serialisation. Raising the bound buys latency hiding and costs memory, because
+  each slot holds a body the broker has not acknowledged. Setting it to `1`
+  restores exactly the old behaviour — one round trip per message — for anywhere
+  that wants it back.
+
+- **A `basic.return` could be lost when several publishes were outstanding.** The
+  broker sends a return before the confirm for the same message, which is why the
+  transport drains rather than waits for one. The old drain put returns belonging
+  to other publishes back into the buffered notify channel, which was fine while
+  only one publish could be in flight and is not fine now: a full buffer drops
+  what it cannot hold, and the publish that return belonged to would then report
+  a message as routed that the broker had handed straight back.
+
+  Returns are filed by message id instead and wait there for the publish they
+  belong to, capped so a return nobody ever asks for — a publisher whose context
+  was cancelled between the write and the confirm — cannot accumulate. The notify
+  channel is also sized to the publish bound rather than to a fixed 64: the client
+  hands a return to that channel with a blocking send from the same goroutine
+  that resolves confirms, so a full buffer would stop confirms arriving while
+  every publisher that could drain it waited for exactly those confirms.
+
 - **The legacy `crypto` framing is deprecated until v0.6.0, not v0.5.0.** The
   0.5.0 entry below, `crypto.Codec.Decode`, the deprecation notice on the legacy
   constants and [docs/security.md](docs/security.md) all said reading it went
