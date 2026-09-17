@@ -11,6 +11,10 @@ carries everything is a core nobody can read.
 
 ## Request and reply
 
+The short version. [Request and reply](request-reply.md) is the whole page:
+timeouts against context cancellation, what a responder failure does to the
+request, the reply queue, and what is not measured.
+
 ```go
 requester, err := patterns.NewRequester[PriceRequest, PriceResponse](ctx, mq, "", "prices")
 defer requester.Close()
@@ -654,6 +658,10 @@ for you.
 
 Retention is unbounded by default, which for a stream means "until the disk is
 full". Set `MaxAge` or `MaxBytes` on anything that runs for long.
+
+[Streams](streams.md) is the whole page: where to start reading, checkpointing,
+why `acemq.Retry` is the wrong verb on a stream, and what the in-memory transport
+will not do.
 
 ## Delayed delivery
 
