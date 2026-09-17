@@ -174,3 +174,10 @@ if err != nil {
 }
 defer mq.Close()
 ```
+
+What `Close` waits for is more than the handler it is easy to picture: every
+delivery the transport had already handed over is run through a handler too, so
+the work a shutdown has to get through is bounded by `Prefetch` rather than by
+`Concurrency`. A retry waiting out a short backoff is inside that wait as well.
+See [the lifecycle of a service](lifecycle.md) for the whole shape, including a
+deadline.

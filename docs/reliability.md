@@ -418,3 +418,9 @@ mq.Close()
 
 Give the process long enough to drain. A container killed nine seconds into a
 ten-second handler leaves that message to be redone by somebody else.
+
+That is the whole of it for a program with one consumer and nothing else running.
+A service with several consumers, an HTTP server and a deadline it has to respect
+wants the longer version: what `Close` finishes and what it cuts off, why the
+consumers' context should outlive the signal, and how an in-process backoff ends
+up inside the drain. See [the lifecycle of a service](lifecycle.md).

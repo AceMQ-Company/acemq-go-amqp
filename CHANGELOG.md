@@ -298,6 +298,82 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`docs/lifecycle.md`, the shape of a long-running consumer process: signal
+  handling, graceful drain, a bounded shutdown, and what a probe should say to an
+  orchestrator.** Nothing about the library changes. What the page adds is the
+  four things `Close` does at shutdown, stated separately because they are not
+  the same thing, and two of them are not what the short answer in
+  `reliability.md` implies.
+
+  A handler in flight is finished — `Close` blocks on it, which is the guarantee
+  and also the reason a shutdown needs a deadline. **A delivery that has arrived
+  but reached no handler yet is finished too**, because the subscription waits for
+  the delivery channel to close and the loop reading it passes on everything still
+  in it: the work a drain has to get through is bounded by `Prefetch`, not by
+  `Concurrency`, and with `Prefetch(100)` and a 200ms handler that is twenty
+  seconds of work in hand before the drain starts. **A publish waiting for its
+  confirm is cut off** — nothing tracks publishers, so nothing waits for them, and
+  the error a cut-off publish returns is genuinely ambiguous about whether the
+  broker took the message. **A retry waiting out a backoff in this process is
+  waited out in full**, so a consumer whose rung queue is missing, on a five-minute
+  schedule, makes the drain take five minutes, which is to say makes it fail.
+
+  The consequence that earns the page is about **which context the consumers get**,
+  and it is the opposite of the obvious answer. The context given to `Consume` is
+  the one the engine settles on, and every interesting settlement is a publish: a
+  retry republishes, a dead letter republishes onto `{queue}.dlq`, a park
+  republishes onto `{queue}.parked`. All of them check the context first. So a
+  consumer handed the signal context loses the ability to file messages correctly
+  at the moment it is asked to stop — verified on `memory://`: with the context
+  live a rejected message reaches `orders.dlq`, and with it cancelled a fraction of
+  a second earlier the same rejection is a `basic.nack` with no requeue and
+  `acemq.MetricSetAsideFailed`. Cancelling it is still the only lever that shortens
+  a drain — an aborted ten-second in-process wait returned in microseconds, with
+  the delivery requeued rather than lost — which makes it the thing to do *after*
+  the deadline has gone, never before.
+
+  `Close` takes no context and cannot be abandoned, which the page says plainly
+  rather than showing a timeout that is not one: what a deadline bounds is how long
+  the process waits before giving up, not how long `Close` takes, so it has to sit
+  well inside `terminationGracePeriodSeconds`.
+
+  On health, the page draws the line the Java starter's health indicator draws and
+  Go's `ConnHealth` does not: **liveness must not consult the broker**, because a
+  process that cannot reach its broker is not one a restart fixes, and a fleet
+  restarting in unison drops every held message onto a broker that is already
+  struggling. `Conn.Health` has no notion of a blocked connection — it declares a
+  temporary queue and reports what came back — so a broker under disk pressure can
+  read as `down`. The page composes a `HealthCheck` that asks
+  `rabbitmq.Transport.BlockedReason()` first and reports `HealthDegraded`, and
+  names the two wrinkles honestly: `BlockedReason()` is on the transport, so the
+  connection has to be built as `rabbitmq.Dial` plus `acemq.NewConn` to keep the
+  handle, and the check has to be passed through `actuator.Options.Checks` with
+  `Conn` left unset, because setting `Conn` appends the library's own `ConnHealth`
+  beside it and `AggregateHealth` takes the worst of them. The cost of leaving
+  `Conn` unset is that `/acemq-info` stops listing the transport's capabilities.
+  There is currently no way to have both.
+
+  `MaxOutstandingPublishes` gets a shutdown reading as well: it is ordinarily a
+  memory bound, and at `Close` it is the size of what gets cut off, so a batch
+  larger than the bound is several waves of confirms and a signal partway through
+  leaves the later waves in an unknown state. `SendAll` is where that is
+  recoverable, through `BatchPublishFailedError.Confirmed` and the per-index
+  `Errors`, and the page says to size a batch to the deadline or keep an outbox.
+
+  **Go deliberately gets no dependency-injection integration**, and the page says
+  so in its own section rather than leaving it to be inferred. The other four
+  libraries each have one obvious convention to integrate with; Go has `fx` and
+  `wire`, neither dominant, and a large share of services that use neither. There
+  is also nothing to bridge: a constructor returning `(T, error)`, a `Close()` and
+  a `context` on everything that blocks is exactly what `fx.Provide` and
+  `fx.Lifecycle` want, and `wire` wants a provider function, which `NewConn` is.
+
+  Every sample on the page was compiled and vetted as a package before being
+  written down, and the four shutdown situations were run against `memory://`
+  rather than reasoned about. The page is linked from the navigation, from
+  `docs/index.md`, and from the shutdown sections of `reliability.md` and
+  `consuming.md`, which now point at it rather than repeating it.
+
 - **A source-side link check in `.github/scripts/build-docs-site.sh`, which reads
   `docs/*.md` rather than the rendered site.** It walks every markdown link,
   skips external, `mailto:` and pure-fragment targets, and requires each of the

@@ -252,6 +252,7 @@ NAV='<nav class="top">
     <div class="menu">
       <a href="security.html">Security</a>
       <a href="reliability.html">Retries, redelivery, shutdown</a>
+      <a href="lifecycle.html">Lifecycle of a service</a>
       <a href="serialization.html">Codecs</a>
       <a href="observability.html">Metrics, tracing and health</a>
       <a href="licence.html">Licence</a>

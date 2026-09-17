@@ -158,6 +158,8 @@ elsewhere.
 - [Interceptors](interceptors.md) — one place for what belongs on every message
 - [Security](security.md) — TLS, trust and credentials
 - [Retries, redelivery and shutdown](reliability.md)
+- [The lifecycle of a service](lifecycle.md) — signals, graceful drain, bounded
+  shutdown, and what a probe should say
 - [Patterns](patterns.md) — idempotency, outbox, ordering, pipelines, replay,
   routing slips, claim check, sagas, delayed delivery, consumer groups, schema
   registry
