@@ -107,6 +107,70 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`Publisher.SendAll`, which publishes a batch and then waits for every
+  confirm, instead of waiting for each one where it was published.** Java has had
+  `Publisher.sendAll` and .NET `IPublisher.SendAllAsync`; in Go the only way to
+  send a thousand messages was a loop over `Send`, and a loop over `Send` pays a
+  full broker round trip per message — publish, wait, publish the next, with the
+  broker idle for nearly all of it.
+
+  ```go
+  results, err := pub.SendAll(ctx, orders)
+  ```
+
+  Everything goes out before anything is awaited, and only then is the whole
+  batch checked. That ordering is the entire feature: a version that awaited each
+  confirm as it published would be the loop the caller could already write, with
+  goroutines added to it for nothing. The results come back in the order the
+  payloads were given, whatever order the broker answered in, and there is
+  exactly one per payload, so `results[i]` is `payloads[i]`.
+
+  Envelope options apply to every message in the batch, which is what makes a
+  shared `CorrelationID` or `Header` useful here. Leave `MessageID` to be
+  generated: pinning it sends the whole batch under one identifier, which is an
+  instruction to a deduplicating consumer to keep one message and discard the
+  rest.
+
+  **It is not atomic and does not pretend to be.** AMQP has no all-or-nothing
+  publish — there is no way to send a hundred messages such that all or none
+  arrive — and a library offering one would be lying about what the protocol can
+  do. What this promises is narrower: everything was attempted, and everything was
+  waited for.
+
+  So a batch can fail halfway, and that is the ordinary outcome of a broker
+  problem partway through rather than an exotic case. A caller told only "it
+  failed" resends messages that already arrived, so the new
+  `acemq.BatchPublishFailedError` carries the counts as fields — `Total`,
+  `Confirmed`, `Failed` — along with `First`, the first failure *in payload
+  order* rather than the first one the broker answered, and `Errors`, one entry
+  per payload and `nil` where the message was confirmed. The results slice is
+  returned alongside the error and is always as long as the batch, so
+  `results[i]`, `err.Errors[i]` and `payloads[i]` are the same message and
+  resending exactly what did not arrive is a loop over `Errors`.
+
+  Its message reads `2 of 5 messages were not confirmed; 3 were. The first
+  failure was: ...` — word for word what Java and .NET produce for the same
+  failure, and deliberately without this library's `acemq:` prefix so that one
+  line in a runbook covers a fleet in three languages. The error unwraps to
+  `First`, so `errors.As` still reaches the `*PublishFailedError` underneath it.
+
+  A failure early in the batch does not cut the rest short: every send is awaited
+  before the error is returned. Stopping at the first failure is what loses the
+  count of what arrived, and the count is the reason the error exists.
+
+  **Nothing about it widens what the transport allows.** Each message goes out
+  through the same publish path as `Send`, so whatever bounds publishes in flight
+  still bounds them — the RabbitMQ transport shares one channel under a lock,
+  because an AMQP channel is not safe for concurrent use. One consequence worth
+  knowing: publish interceptors now run on one goroutine per message during a
+  batch, so an interceptor keeping state of its own has to be safe for concurrent
+  use. The same was already true of a program publishing from several goroutines.
+
+  What a reader does about it: replace loops that publish a known set of messages
+  one at a time, handle `*BatchPublishFailedError` where a partial batch matters,
+  and check any publish interceptor for state it shares between calls. Nothing
+  that compiled before changes — this is a new method and a new error type.
+
 - **`avro.ReadAs`, so a registered Avro codec reads every message against the
   schema the consumer was written against rather than the one the producer
   sent.** Java has had `AvroCodec.registered(registry, readerSchema)` and .NET

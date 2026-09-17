@@ -58,6 +58,103 @@ err := pub.Send(ctx, order,
 | `Header` | one of your own headers |
 | `Attempt`, `FirstSeen`, `DeadLetterReason` | for a message being replayed or moved by hand |
 
+## Publishing a batch
+
+A loop over `Send` pays a full broker round trip per message: publish, wait for
+the confirm, publish the next. A thousand messages is a thousand waits, one
+after another, and the broker spends nearly all of that time idle.
+
+`SendAll` publishes every message first and waits for all the confirms
+afterwards:
+
+```go
+results, err := pub.SendAll(ctx, orders)
+if err != nil {
+	return err
+}
+```
+
+The results come back in the order the payloads were given, whatever order the
+broker answered in, and there is one per payload:
+
+```go
+for i, r := range results {
+	log.Printf("%s went out as %s, routed=%v", orders[i].OrderID, r.MessageID, r.Routed)
+}
+```
+
+Options apply to every message in the batch, which is what makes a shared
+correlation worth having here:
+
+```go
+results, err := pub.SendAll(ctx, orders,
+	acemq.CorrelationID(incoming.Envelope.CorrelationID),
+	acemq.Header("x-tenant", "acme"))
+```
+
+Do not pin `MessageID` for a batch. Every message would go out under the same
+identifier, which is an instruction to a deduplicating consumer to keep one of
+them and discard the rest. Leave it to be generated.
+
+### It is not atomic
+
+There is no such thing in AMQP. There is no way to publish a hundred messages so
+that all or none arrive, and a library offering one would be lying about what
+the protocol can do. What `SendAll` promises is narrower and still worth having:
+every message was attempted, and every message was waited for.
+
+So a batch can fail halfway. That is the ordinary outcome of a broker problem
+partway through, and it is why the error carries counts rather than just a
+reason:
+
+```go
+results, err := pub.SendAll(ctx, orders)
+
+var failed *acemq.BatchPublishFailedError
+if errors.As(err, &failed) {
+	log.Printf("%d of %d confirmed", failed.Confirmed, failed.Total)
+	for i, err := range failed.Errors {
+		if err != nil {
+			resend(orders[i]) // only the ones that did not arrive
+		}
+	}
+}
+```
+
+| | |
+|---|---|
+| `Total` | how many payloads were in the batch |
+| `Confirmed` | how many the broker took |
+| `Failed` | how many it did not |
+| `First` | the first failure **in payload order**, not the first the broker answered. The error unwraps to it. |
+| `Errors` | one entry per payload, in payload order, `nil` where the message was confirmed |
+
+`results` is returned alongside the error and is always as long as the batch, so
+`results[i]`, `failed.Errors[i]` and `payloads[i]` are the same message.
+
+The message reads:
+
+```
+2 of 5 messages were not confirmed; 3 were. The first failure was: ...
+```
+
+word for word what the Java and .NET libraries produce for the same failure, so
+one line in a runbook covers a fleet in three languages.
+
+A failure early in the batch does not cut the rest short. Everything is awaited
+before the error is returned — stopping at the first failure is what loses the
+count of what did arrive, and the count is the whole reason to report it.
+
+### What bounds it
+
+`SendAll` does not open a second route to the broker. Every message goes out
+through the same path as `Send`, so whatever bounds publishes in flight still
+does: the RabbitMQ transport shares one channel under a lock, because an AMQP
+channel is not safe for concurrent use.
+
+Publish interceptors run on one goroutine per message during a batch, so an
+interceptor keeping state of its own has to be safe for concurrent use.
+
 ## Carrying context forward
 
 Correlation is what lets somebody follow one business action across a dozen

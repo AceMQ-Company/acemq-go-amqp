@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -108,6 +109,95 @@ func (p *Publisher[T]) SendResult(
 		return PublishResult{}, err
 	}
 	return p.publish(ctx, payload, env)
+}
+
+// SendAll publishes a batch and waits for every confirm.
+//
+// What most bulk publishing actually wants: the throughput of pipelining with
+// the safety of having waited. Every payload goes out before any confirm is
+// awaited, and only then are they all checked together. A loop around
+// [Publisher.Send] pays a full broker round trip per message, and that is the
+// cost this exists to remove — a caller who wanted the loop could always write
+// the loop.
+//
+// The results come back in the order the payloads were given, whatever order
+// the broker answered in, and the slice is always as long as the batch. A
+// payload that failed has at its index whatever the transport managed to report
+// about it, and the entry at the same index of [BatchPublishFailedError.Errors]
+// says why it failed.
+//
+// It fails if any message failed, and the error carries how many did not: a
+// batch that half succeeded is the ordinary outcome of a broker problem partway
+// through, and a caller told only "it failed" resends messages that already
+// arrived. Every send is awaited before the error is returned, so a failure
+// early in the batch does not cut the rest short and does not lose the count of
+// what did get through.
+//
+// This is not atomic. AMQP has no such thing: there is no way to publish a
+// hundred messages such that all or none arrive, and a library that offered one
+// would be lying. What it offers is that everything was attempted and
+// everything was waited for.
+//
+// The options are applied to every message in the batch, which is what makes a
+// shared [CorrelationID] or [Header] worth having here. Leave [MessageID] to be
+// generated: pin it and every message in the batch goes out under the same
+// identifier, which is a deduplicating consumer's instruction to keep one of
+// them.
+//
+// Nothing here widens what the transport allows. Each message goes out through
+// the same path as [Publisher.Send], so whatever bounds publishes in flight
+// still bounds them — the RabbitMQ transport shares one channel under a lock,
+// because a channel is not safe for concurrent use. Publish interceptors run on
+// one goroutine per message and must be safe for concurrent use themselves.
+func (p *Publisher[T]) SendAll(
+	ctx context.Context, payloads []T, opts ...EnvelopeOption,
+) ([]PublishResult, error) {
+	results := make([]PublishResult, len(payloads))
+	errs := make([]error, len(payloads))
+
+	// Everything is started first and awaited afterwards. Awaiting each publish
+	// where it is started would be Send in a loop with goroutines added to it.
+	var wg sync.WaitGroup
+	for i, payload := range payloads {
+		env, err := p.envelope(opts)
+		if err != nil {
+			// One payload whose envelope will not build is one failure out of
+			// the batch, not a reason to abandon the ones already in flight.
+			errs[i] = err
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = p.publish(ctx, payload, env)
+		}()
+	}
+	wg.Wait()
+
+	var first error
+	failed, confirmed := 0, 0
+	for _, err := range errs {
+		if err == nil {
+			confirmed++
+			continue
+		}
+		failed++
+		if first == nil {
+			// The first in payload order, which is not necessarily the first
+			// the broker answered.
+			first = err
+		}
+	}
+	if failed > 0 {
+		return results, &BatchPublishFailedError{
+			Total:     len(payloads),
+			Confirmed: confirmed,
+			Failed:    failed,
+			First:     first,
+			Errors:    errs,
+		}
+	}
+	return results, nil
 }
 
 // SendEnvelope publishes a message with an envelope you built yourself, for

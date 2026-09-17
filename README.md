@@ -69,6 +69,24 @@ AMQP client out of programs that only use the in-memory transport.
 `orders` there is a **durable quorum queue**, which is what a durable queue is
 in all five AceMQ libraries. See [what type a queue is](#what-type-a-queue-is).
 
+## Publishing a batch
+
+`SendAll` publishes everything before it waits for anything, then waits for all
+of it:
+
+```go
+results, err := pub.SendAll(ctx, orders)
+```
+
+A loop over `Send` pays a broker round trip per message. This pays one wait for
+the batch, and still has the broker's answer for every message in it — in the
+order the payloads were given, whatever order the confirms came back in.
+
+It is not atomic, and nothing in AMQP is. When part of a batch fails the error
+is an `*acemq.BatchPublishFailedError` carrying how many were confirmed and how
+many were not, because a caller told only "it failed" resends messages that
+already arrived. See [publishing](docs/publishing.md#publishing-a-batch).
+
 ## Deciding what happens to a message
 
 A handler returns its decision rather than calling a method, so a handler that

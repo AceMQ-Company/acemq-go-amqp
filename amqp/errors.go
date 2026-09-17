@@ -145,6 +145,48 @@ func (e *PublishFailedError) Error() string {
 
 func (e *PublishFailedError) Unwrap() error { return e.Err }
 
+// BatchPublishFailedError is a [Publisher.SendAll] in which at least one
+// message was not confirmed.
+//
+// The counts are the point of it. A batch that half succeeded is the ordinary
+// outcome of a broker problem partway through, and a caller told only "it
+// failed" resends messages that already arrived. They are here as fields as
+// well as in the message, so a service can act on them without parsing prose.
+//
+// Its message deliberately reads without this library's "acemq:" prefix,
+// because it is word for word what the Java and .NET libraries produce for the
+// same failure. One sentence in a runbook then covers a fleet in three
+// languages, which is worth more than the prefix.
+type BatchPublishFailedError struct {
+	// Total is how many payloads the batch held.
+	Total int
+
+	// Confirmed is how many of them the broker took.
+	Confirmed int
+
+	// Failed is how many it did not.
+	Failed int
+
+	// First is the first failure in payload order, which is not necessarily the
+	// first one the broker answered. Errors unwraps to it, so errors.As reaches
+	// a [PublishFailedError] underneath.
+	First error
+
+	// Errors is one entry per payload, in payload order, nil where the message
+	// was confirmed. It is what says which messages to send again, and lines up
+	// index for index with the results [Publisher.SendAll] returned alongside
+	// this error.
+	Errors []error
+}
+
+func (e *BatchPublishFailedError) Error() string {
+	return fmt.Sprintf(
+		"%d of %d messages were not confirmed; %d were. The first failure was: %v",
+		e.Failed, e.Total, e.Confirmed, e.First)
+}
+
+func (e *BatchPublishFailedError) Unwrap() error { return e.First }
+
 // ConnectionBlockedError is the broker telling publishers to stop.
 //
 // RabbitMQ sends connection.blocked when it is low on memory or disk, and every
