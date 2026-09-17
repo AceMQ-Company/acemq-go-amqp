@@ -147,7 +147,7 @@ CSS
 NAV='<nav class="top">
   <span class="brand"><img src="assets/acemq.png" alt="AceMQ"> for Go</span>
   <a href="index.html">Overview</a>
-  <a class="tutorials" href="getting-started.html">Getting started</a>
+  <a href="getting-started.html">Getting started</a>
 
   <div class="group">
     <button type="button" aria-haspopup="true">Guide</button>
@@ -156,8 +156,11 @@ NAV='<nav class="top">
       <a href="consuming.html">Consuming</a>
       <a href="topology.html">Exchanges, queues and bindings</a>
       <a href="envelope.html">The envelope</a>
+      <a href="interceptors.html">Interceptors</a>
       <a href="testing.html">Testing without a broker</a>
       <a href="patterns.html">Patterns</a>
+      <a href="request-reply.html">Request and reply</a>
+      <a href="streams.html">Streams</a>
     </div>
   </div>
 
@@ -172,6 +175,7 @@ NAV='<nav class="top">
     </div>
   </div>
 
+  <a class="tutorials" href="tutorials.html">Tutorials</a>
   <a class="api" href="https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp">API reference</a>
   <a class="enterprise" href="https://acemq.org/">JVM libraries</a>
   <a class="enterprise" href="https://acemq.org/acemq-dotnet-amqp/">.NET library</a>

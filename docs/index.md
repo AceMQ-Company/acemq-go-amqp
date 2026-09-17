@@ -60,7 +60,8 @@ sub, err := acemq.Consume(ctx, mq, "orders",
 defer sub.Close()
 ```
 
-[Getting started](getting-started.md) takes this apart line by line.
+[Getting started](getting-started.md) takes this apart line by line, and the
+[tutorials](tutorials.md) build a working service in four steps.
 
 ## What it does for you
 
@@ -148,14 +149,21 @@ elsewhere.
 
 ## Where to go next
 
+- [Tutorials](tutorials.md) — four of them, in order, each ending with something
+  that runs
 - [Getting started](getting-started.md) — the first message, explained
 - [Publishing](publishing.md) and [consuming](consuming.md)
 - [Exchanges, queues and bindings](topology.md)
+- [The envelope](envelope.md) — what travels with every message
+- [Interceptors](interceptors.md) — one place for what belongs on every message
 - [Security](security.md) — TLS, trust and credentials
 - [Retries, redelivery and shutdown](reliability.md)
-- [Patterns](patterns.md) — request-reply, idempotency, outbox, ordering,
-  pipelines, replay, routing slips, claim check, sagas, delayed delivery,
-  streams, consumer groups, schema registry
+- [Patterns](patterns.md) — idempotency, outbox, ordering, pipelines, replay,
+  routing slips, claim check, sagas, delayed delivery, consumer groups, schema
+  registry
+- [Request and reply](request-reply.md) — the synchronous shape, and its cost
+- [Streams](streams.md) — a log that keeps what it is given
+- [Codecs](serialization.md) — JSON, XML, YAML, TOML, Protocol Buffers, Avro
 - [Metrics, tracing and health](observability.md)
 - [Testing without a broker](testing.md)
 - [API reference](https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp) on
