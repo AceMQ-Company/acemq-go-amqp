@@ -437,7 +437,7 @@ While the version is `0.x` the public API may change in any release.
   and check any publish interceptor for state it shares between calls. Nothing
   that compiled before changes — this is a new method and a new error type.
 
-- **`avro.ReadAs`, so a registered Avro codec reads every message against the
+- **`avro.ReaderSchema`, so a registered Avro codec reads every message against the
   schema the consumer was written against rather than the one the producer
   sent.** Java has had `AvroCodec.registered(registry, readerSchema)` and .NET
   resolves against its own schema on every message; this library looked the
@@ -446,7 +446,7 @@ While the version is `0.x` the public API may change in any release.
 
   ```go
   consumer, err := avro.Registered(registry, "order.placed", schema,
-      avro.ReadAs(schema))
+      avro.ReaderSchema(schema))
   ```
 
   What the missing half cost: a consumer decoded whatever shape the producer
@@ -479,7 +479,17 @@ While the version is `0.x` the public API may change in any release.
   arriving as a default — and a silent change of meaning is worse than an
   argument. Opting in is one argument.
 
-  **The wire format is untouched.** `ReadAs` is a read-side decision and the
+  **It was called `avro.ReadAs` earlier in this same unreleased cycle, and it is
+  `avro.ReaderSchema` now.** Renamed outright, with no alias: the library is
+  pre-1.0, nothing has shipped under the old name, and an alias kept for
+  compatibility nobody needs is a second spelling that outlives the reason for
+  it. Java names this `readerSchema`, Python `reader_schema`, Ruby
+  `reader_schema:` and .NET is gaining `readerSchema` in the same round — so one
+  idea has one spelling in all five, and a reader moving between them is not
+  learning a synonym. If you took this library from `main` between the two
+  commits, the fix is the name.
+
+  **The wire format is untouched.** `ReaderSchema` is a read-side decision and the
   bytes a producer writes are identical with it and without it: one zero byte,
   four bytes of identifier, big-endian, then the Avro body. Content types,
   `CanDecode` and the gate between the two modes are unchanged, and there is a
@@ -488,7 +498,7 @@ While the version is `0.x` the public API may change in any release.
   messages they always did.
 
   What a reader has to do about it: nothing, unless producers and consumers are
-  deployed independently — in which case add `avro.ReadAs(schema)` to the
+  deployed independently — in which case add `avro.ReaderSchema(schema)` to the
   consumer's `avro.Registered` call, passing the same schema the codec was built
   with, and audit any handler that has been treating a zero value as *the
   producer has not sent this yet*. That reading stops being true once the

@@ -201,12 +201,12 @@ of it still reads the message. There is a test for exactly that.
 Looking the writer's schema up is half of what evolution needs. On its own it
 means a consumer decodes whatever shape the producer sent: a field it has never
 heard of arrives, and a field it expects is simply absent — read back as the
-zero value — until the producer starts sending it. `ReadAs` supplies the other
-half, the schema this consumer was written against:
+zero value — until the producer starts sending it. `ReaderSchema` supplies the
+other half, the schema this consumer was written against:
 
 ```go
 consumer, err := avro.Registered(registry, "order.placed", schema,
-	avro.ReadAs(schema))
+	avro.ReaderSchema(schema))
 ```
 
 Avro is then given both schemas and resolves them. A field the writer added and
@@ -227,9 +227,13 @@ changed to one Avro will not promote — is an error naming both schemas rather
 than a decode that returns the wrong values. Both are printed in full, because
 the two are usually versions of one record and share a name.
 
-**`ReadAs` changes nothing on the wire.** It is a read-side decision: the bytes a
-producer writes are identical with it and without it, so Java, .NET, Python and
-Ruby go on reading them.
+**`ReaderSchema` changes nothing on the wire.** It is a read-side decision: the
+bytes a producer writes are identical with it and without it, so Java, .NET,
+Python and Ruby go on reading them.
+
+The name is the family's. Java calls it `readerSchema`, Python `reader_schema`,
+Ruby `reader_schema:` and .NET `readerSchema`, so one idea has one spelling in
+all five and a reader moving between them is not learning a synonym.
 
 The other libraries reach the same behaviour by different routes, and the routes
 are worth knowing when messages cross between them. Java has an explicit second

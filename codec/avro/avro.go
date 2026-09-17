@@ -25,7 +25,7 @@
 // message with a schema identifier, the way Confluent's clients do, so a
 // consumer can look up what a message was written with.
 //
-// Looking it up is half of what evolution needs. The other half is [ReadAs],
+// Looking it up is half of what evolution needs. The other half is [ReaderSchema],
 // which hands Avro a reader schema alongside the writer's and lets it resolve
 // the two: a field the writer added and this consumer has never heard of is
 // skipped, and a field the writer has not started sending yet is filled in from
@@ -96,7 +96,7 @@ func Of(schema string) (*Codec, error) {
 // subject groups the versions of one message type, conventionally the message
 // type itself.
 //
-// Pass [ReadAs] to read every message against a schema of this consumer's own
+// Pass [ReaderSchema] to read every message against a schema of this consumer's own
 // rather than the producer's.
 func Registered(
 	registry patterns.SchemaRegistry, subject, schema string, options ...Option,
@@ -119,7 +119,7 @@ func Registered(
 // Option configures a codec built with [Registered].
 type Option func(*Codec) error
 
-// ReadAs resolves every message onto a schema of this consumer's own, instead
+// ReaderSchema resolves every message onto a schema of this consumer's own, instead
 // of reading it with the schema the producer wrote it with.
 //
 // This is the half of schema evolution a registry alone does not give you. A
@@ -132,7 +132,7 @@ type Option func(*Codec) error
 // was written against, whichever version wrote the message.
 //
 //	consumer, err := avro.Registered(registry, "order.placed", schema,
-//	    avro.ReadAs(schema))
+//	    avro.ReaderSchema(schema))
 //
 // Passing the codec's own schema, as above, is the ordinary case: a consumer
 // reads what it was compiled against. The two are separate arguments because
@@ -144,7 +144,11 @@ type Option func(*Codec) error
 // paid on the first message carrying an identifier and not again. A writer
 // schema that cannot be resolved onto this one is an error naming both, rather
 // than a decode that returns the wrong values.
-func ReadAs(schema string) Option {
+//
+// The name is the family's: Java's readerSchema, Python's reader_schema, Ruby's
+// reader_schema: and .NET's readerSchema all say the same thing, so one idea has
+// one spelling everywhere rather than a synonym per language.
+func ReaderSchema(schema string) Option {
 	return func(c *Codec) error {
 		parsed, err := avro.Parse(schema)
 		if err != nil {
@@ -208,7 +212,7 @@ func (c *Codec) Decode(body []byte, dst any) error {
 		}
 		schema = writer
 		if c.reader != nil {
-			// Both schemas go to Avro, which is the whole point of ReadAs: it
+			// Both schemas go to Avro, which is the whole point of ReaderSchema: it
 			// resolves the difference, so a field the writer added and this
 			// reader does not know is skipped rather than shifting every field
 			// after it, and one the writer omitted comes back as the reader's

@@ -348,7 +348,7 @@ func TestABadSchemaIsRefusedAtConstruction(t *testing.T) {
 	}
 }
 
-// TestAFieldTheWriterNeverSentComesBackAsItsDefault is what ReadAs is for.
+// TestAFieldTheWriterNeverSentComesBackAsItsDefault is what ReaderSchema is for.
 //
 // The consumer has been redeployed with a field the producer has not started
 // sending. Without a reader schema Avro is never told the field exists, so it
@@ -366,7 +366,7 @@ func TestAFieldTheWriterNeverSentComesBackAsItsDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	consumer, err := Registered(registry, "order.placed", v2Tenanted, ReadAs(v2Tenanted))
+	consumer, err := Registered(registry, "order.placed", v2Tenanted, ReaderSchema(v2Tenanted))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestWithoutAReaderSchemaTheDefaultIsNotApplied(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The same consumer schema, and no ReadAs: decoding happens against the
+	// The same consumer schema, and no ReaderSchema: decoding happens against the
 	// writer's schema, which has never heard of tenant.
 	consumer, err := Registered(registry, "order.placed", v2Tenanted)
 	if err != nil {
@@ -409,7 +409,7 @@ func TestWithoutAReaderSchemaTheDefaultIsNotApplied(t *testing.T) {
 	}
 
 	if back.Tenant != "" {
-		t.Errorf("tenant is %q, and a codec without ReadAs applies no default", back.Tenant)
+		t.Errorf("tenant is %q, and a codec without ReaderSchema applies no default", back.Tenant)
 	}
 }
 
@@ -428,7 +428,7 @@ func TestAFieldTheReaderNeverHeardOfIsSkipped(t *testing.T) {
 	}
 
 	// The consumer still holds v1 and reads against it explicitly.
-	consumer, err := Registered(registry, "order.placed", v1, ReadAs(v1))
+	consumer, err := Registered(registry, "order.placed", v1, ReaderSchema(v1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +457,7 @@ func TestResolutionIsGenuineAndNotAReparse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	consumer, err := Registered(registry, "order.placed", v1, ReadAs(v1))
+	consumer, err := Registered(registry, "order.placed", v1, ReaderSchema(v1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +491,7 @@ func TestAnIncompatibleChangeNamesBothSchemas(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	consumer, err := Registered(registry, "order.placed", v3Required, ReadAs(v3Required))
+	consumer, err := Registered(registry, "order.placed", v3Required, ReaderSchema(v3Required))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +514,7 @@ func TestAnIncompatibleChangeNamesBothSchemas(t *testing.T) {
 
 func TestAnUnparseableReaderSchemaIsRefusedAtConstruction(t *testing.T) {
 	_, err := Registered(
-		patterns.NewInMemorySchemaRegistry(), "order.placed", v1, ReadAs(`{not a schema`))
+		patterns.NewInMemorySchemaRegistry(), "order.placed", v1, ReaderSchema(`{not a schema`))
 	if err == nil {
 		t.Fatal("an unparseable reader schema was accepted")
 	}
@@ -533,7 +533,7 @@ func TestAReaderSchemaChangesNothingOnTheWire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolving, err := Registered(registry, "order.placed", v1, ReadAs(v2Tenanted))
+	resolving, err := Registered(registry, "order.placed", v1, ReaderSchema(v2Tenanted))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +573,7 @@ func TestResolutionIsRememberedPerWriterSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	consumer, err := Registered(registry, "order.placed", v2Tenanted, ReadAs(v2Tenanted))
+	consumer, err := Registered(registry, "order.placed", v2Tenanted, ReaderSchema(v2Tenanted))
 	if err != nil {
 		t.Fatal(err)
 	}
