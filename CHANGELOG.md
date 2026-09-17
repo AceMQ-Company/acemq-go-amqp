@@ -86,6 +86,31 @@ While the version is `0.x` the public API may change in any release.
   groups and the schema registry landed. The table earlier on the same page
   listed them all, so the page disagreed with itself.
 
+- **Three doc comments that described something the code does not do**, all
+  found by checking them before writing them into a page.
+
+  `patterns.ReadStream` said acknowledging advances this consumer's position
+  "so restarting from `FromNext` carries on rather than re-reading". It does not:
+  the function always puts an explicit `x-stream-offset` on the wire, so where a
+  run starts is `StreamOptions.Offset` and never a position the broker kept. A
+  consumer restarted on `FromNext` misses everything published while it was down.
+  The comment now says that, says what `acemq.Retry` does to a stream — appends a
+  second copy of the message — and corrects "rejecting does not dead-letter it
+  either", which is true of the broker's mechanism and not of this library's
+  republish to `{stream}.dlq`.
+
+  `otel.Tracing.PublishInterceptor` claimed it covered "the ones inside
+  `patterns.Requester` and the outbox relay". The relay publishes through
+  `Conn.PublishRaw`, which has no interceptor chain, so an outbox-relayed message
+  never carried a trace context from it. The comment now lists what the chain
+  does and does not reach.
+
+  `patterns.Chain`'s example did not compile: it passed
+  `patterns.Idempotent[OrderPlaced](store)` where a `Middleware[T]` is wanted,
+  and `Idempotent` takes the handler as well as the store.
+  `patterns.WithIdempotency` is the middleware, and the comment now says which is
+  which.
+
 - **[docs/observability.md](docs/observability.md) counted the metrics that are
   named but not written as four. There are five** — `acemq.consume.attempts`,
   `acemq.request.duration`, `acemq.request.total`,
@@ -227,6 +252,69 @@ While the version is `0.x` the public API may change in any release.
   with, and audit any handler that has been treating a zero value as *the
   producer has not sent this yet*. That reading stops being true once the
   reader's default fills the field in.
+
+- **Eight documentation pages this library was missing, and a place in the
+  navigation for each.** Java and .NET both had a page on request and reply, a
+  page on streams and four tutorials; .NET had just gained a page on
+  interceptors. This library had a paragraph on the first two inside
+  [docs/patterns.md](docs/patterns.md), nothing at all on the third, and no
+  tutorials. A reader arriving at the Go site was told less about the same
+  library than a reader arriving at either of the others.
+
+  [docs/request-reply.md](docs/request-reply.md),
+  [docs/streams.md](docs/streams.md),
+  [docs/interceptors.md](docs/interceptors.md),
+  [docs/tutorials.md](docs/tutorials.md) and four numbered tutorials —
+  `tutorial-first-message`, `tutorial-surviving-failure`, `tutorial-exactly-once`
+  and `tutorial-observability` — teaching the same four subjects in the same
+  order as Java's and .NET's, so a team moving between the five learns each idea
+  once.
+
+  They are not translations. Where this library's design differs the page argues
+  the Go side rather than describing another language's API in Go syntax: errors
+  as values and the `if err != nil` that follows, `context.Context` first,
+  functions where a generic method would need Go 1.27, options rather than
+  builders, and closures rather than an interface with an `Order` field.
+
+  Every sample was compiled against the current API before it shipped, and the
+  behavioural claims were run rather than reasoned about. Several came back
+  different from what the equivalent page in another language says, and the
+  pages say the Go answer:
+
+  - **A consume interceptor that refuses a message dead-letters it**, with
+    `an interceptor refused it: …` on the envelope, counted as `dead_lettered`
+    like anything else. .NET's equivalent escapes the retry ladder into an
+    unbounded redelivery loop with no counter moving.
+  - **A consume interceptor's envelope changes reach the handler**, which .NET's
+    read-only context cannot do — while `ConsumeContext.Body` and `ContentType`
+    are copies and rewriting them does nothing, silently, because the decode
+    reads the delivery. That trap is stated where a reader will meet it.
+  - **Retries, dead letters, parks, `patterns.Replay`, the outbox relay and the
+    scheduler publish through `Conn.PublishRaw` and never run the publish
+    chain.** Requests, replies, pipeline steps and routing-slip forwards do.
+    .NET's page says every publish the library makes goes through its chain; four
+    of the six named there do not go through this one.
+  - **A publish interceptor runs inside the span** for an `otel.Publisher`,
+    because the wrapper opens the span before delegating — the reverse of .NET,
+    where the chain runs first. It is what makes `Tracing.PublishInterceptor`
+    work at all.
+  - **A stream's default prefetch is 10 here and 100 in Java and .NET.**
+  - **`acemq.Retry` from a stream handler appends a second copy of the message to
+    the log**, because a retry republishes onto the queue it came from and a
+    stream never removes anything. There is no `skipFailures` and no
+    `lastHandledOffset` in this library; the two honest handler shapes are
+    written out instead.
+  - **`acemq.Reject` on a stream does reach `{stream}.dlq`**, because this
+    library republishes rather than using the broker's dead-lettering — which
+    Java's streams page says is impossible, correctly, of the broker's mechanism
+    and not of this one. The original stays in the stream, so the dead letter is
+    a copy rather than a move.
+  - **A requester counts nothing.** `acemq.MetricRequestDuration` and
+    `MetricRequestTotal` are names this library never writes, and there is no
+    equivalent of Java's `timedOut()`, `unmatched()`, `answered()` or
+    `unanswerable()`. The page says so and points at `otel.Ask` and the
+    responder's ordinary consume metrics instead of implying numbers that are not
+    there.
 
 - A test asserting the three replay stamps stay outside the `x-acemq-` namespace
   and keep their exact spelling, and one asserting a replayed message reaches a
