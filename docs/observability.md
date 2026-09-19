@@ -450,16 +450,53 @@ already has this written for it.
 
 ```go
 report := mq.Health(ctx)
-// {Status: up, Parts: {consumers: 3, roundTripMillis: 2}}
+// {Status: up, Parts: {consumers: 3, blocked: false, roundTripMillis: 2}}
 ```
 
 The check declares a temporary exclusive queue, which is the cheapest thing AMQP
 offers that actually proves the connection works. A TCP connection that is open
-but wedged — the broker paused, the network black-holing — looks identical to a
+but wedged — the network black-holing, the broker paused — looks identical to a
 healthy one until something is asked of it.
 
 It costs a round trip, so wire it to a readiness probe and let the probe's
 interval decide how often.
+
+**The round trip is bounded**, by `ctx` and by `acemq.DefaultHealthTimeout` —
+three seconds — when `ctx` carries no deadline of its own, which is the shape an
+`http.Request` context has. A probe that runs out of time is abandoned rather
+than waited for: cancelling a request to a broker that is not reading means
+waiting for a cancellation that travels the same way the request did.
+
+**It is not made at all while the broker has blocked this connection**, and the
+report then says `up` with the broker's reason — see [a blocked connection is not
+a reason to restart](lifecycle.md#a-blocked-connection-is-not-a-reason-to-restart),
+which is where that decision is argued.
+
+```go
+// {Status: up,
+//  Detail: "the broker has blocked this connection; publishing is paused: low on memory",
+//  Parts: {consumers: 3, blocked: true, blockedReason: "low on memory"}}
+```
+
+`parts.blocked` is `true`, `false`, or **`null`** — the last meaning the question
+could not be asked, because the transport does not answer it. The in-memory
+transport is one such. `null` is not `false`: a report saying nobody looked is
+worth more in an incident than one that guessed.
+
+### Asking without a round trip
+
+```go
+if reason := mq.BlockedReason(); reason != "" {
+	// Shed load, buffer, fail the request — anything but hand it over.
+}
+
+blocked, known := mq.Blocked() // known is false when nobody could be asked
+```
+
+Free, with no round trip, for a publisher that would rather shed load than hand a
+message to a broker that has stopped reading. It is the same state Java exposes
+as `isBlocked()`, .NET as `IsBlocked`, Python as `Connection.blocked` and Ruby as
+`blocked?`.
 
 ### Combining checks
 
@@ -483,8 +520,25 @@ instance out of rotation, because its replacement will almost certainly be
 degraded too.
 
 Checks run at once rather than in turn, so a slow one does not add its latency to
-the others. A check that ignores its context can still hang the whole report,
-which is why the interface says not to.
+the others, and the whole aggregate is bounded by `ctx`: a check that hangs is
+reported as down **by name** rather than hanging the readiness endpoint with it.
+The interface still says a check must not hang, because a check named in a report
+as having failed to answer is a worse answer than one that answered.
+
+`ConnHealth` takes a `Timeout` of its own, three seconds by default against the
+actuator's five, so a broker that has gone quiet is described by the check that
+looked rather than by the aggregate giving up on it.
+
+**The detail names every part that had something to say, and repeats what it
+said** — not only the parts that were not up:
+
+```
+up: broker: the broker has blocked this connection; publishing is paused: low on memory
+```
+
+Summarising by status alone answered `up` with an *empty* detail for an aggregate
+holding a blocked connection, throwing away the one fact the check had gone to
+the trouble of finding at exactly the line an operator reads first.
 
 ## The HTTP endpoints
 

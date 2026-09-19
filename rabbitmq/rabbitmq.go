@@ -436,7 +436,15 @@ func Dial(ctx context.Context, url string, cfg ...Config) (*Transport, error) {
 // with PRECONDITION_FAILED, and that refusal is passed on rather than
 // swallowed: it means the code and the broker disagree about what the queue is,
 // which is worth stopping for.
-func (t *Transport) DeclareQueue(_ context.Context, name string, spec acemq.QueueSpec) error {
+//
+// The context bounds starting the call, not the call itself — see
+// [errContextSpent]. A caller that needs a deadline the broker cannot be made to
+// honour has to bound this from outside, as [acemq.Conn.Health] does.
+func (t *Transport) DeclareQueue(ctx context.Context, name string, spec acemq.QueueSpec) error {
+	if err := errContextSpent(ctx, "declare queue %q", name); err != nil {
+		return err
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -449,8 +457,36 @@ func (t *Transport) DeclareQueue(_ context.Context, name string, spec acemq.Queu
 	return nil
 }
 
+// errContextSpent refuses a synchronous AMQP round trip whose caller has already
+// run out of time, and explains why that is all the context can do here.
+//
+// amqp091-go's declarations are request-and-wait calls with no context in their
+// signatures: once the frame is written there is no way to abandon the wait
+// without abandoning the channel, and a channel abandoned mid-RPC is one whose
+// next caller reads somebody else's reply. So the context is honoured at the one
+// point where honouring it costs nothing — before the frame goes out — and the
+// library bounds the wait itself where it has to, by running the call on a
+// goroutine and giving up on it rather than on the channel.
+//
+// That matters most for a connection the broker has blocked: it stops reading,
+// so the declaration is not refused, it goes unanswered for as long as the alarm
+// lasts. [acemq.Conn.Health] reads the blocked state instead of asking.
+func errContextSpent(ctx context.Context, format string, args ...any) error {
+	if err := ctx.Err(); err != nil {
+		return acemq.Transportf(err, "acemq: cannot "+format, args...)
+	}
+	return nil
+}
+
 // DeclareExchange creates an exchange if it is not already there.
-func (t *Transport) DeclareExchange(_ context.Context, name string, spec acemq.ExchangeSpec) error {
+//
+// The context bounds starting the call, not the call itself — see
+// [errContextSpent].
+func (t *Transport) DeclareExchange(ctx context.Context, name string, spec acemq.ExchangeSpec) error {
+	if err := errContextSpent(ctx, "declare exchange %q", name); err != nil {
+		return err
+	}
+
 	kind := spec.Kind
 	if kind == "" {
 		kind = "direct"
@@ -470,7 +506,14 @@ func (t *Transport) DeclareExchange(_ context.Context, name string, spec acemq.E
 }
 
 // Bind routes messages from an exchange to a queue.
-func (t *Transport) Bind(_ context.Context, queue, exchange, routingKey string) error {
+//
+// The context bounds starting the call, not the call itself — see
+// [errContextSpent].
+func (t *Transport) Bind(ctx context.Context, queue, exchange, routingKey string) error {
+	if err := errContextSpent(ctx, "bind %q to %q", queue, exchange); err != nil {
+		return err
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 

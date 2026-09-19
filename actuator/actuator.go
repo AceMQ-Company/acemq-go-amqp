@@ -66,11 +66,21 @@ type Options struct {
 	// without metrics.
 	Metrics *acemq.Metrics
 
-	// Conn is checked by /acemq-health.
+	// Conn is checked by /acemq-health, and tells /acemq-info what the
+	// transport can do.
 	Conn *acemq.Conn
 
 	// Checks are the application's own, combined with the connection's.
 	Checks []acemq.HealthCheck
+
+	// WithoutConnHealth leaves the library's own check of Conn out of
+	// /acemq-health, for an application that checks the same connection its own
+	// way through Checks and does not want two opinions of it in one report.
+	//
+	// Conn still feeds /acemq-info either way, which is the point of the option:
+	// leaving Conn unset used to be the only way to keep the library's check out
+	// of the aggregate, and it took the transport's capabilities with it.
+	WithoutConnHealth bool
 
 	// Prefix replaces the default paths, for a service that already namespaces
 	// its operational endpoints.
@@ -184,7 +194,7 @@ func (a *Actuator) health(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	checks := append([]acemq.HealthCheck(nil), a.opts.Checks...)
-	if a.opts.Conn != nil {
+	if a.opts.Conn != nil && !a.opts.WithoutConnHealth {
 		checks = append(checks, acemq.ConnHealth{Conn: a.opts.Conn})
 	}
 

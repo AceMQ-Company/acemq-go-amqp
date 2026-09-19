@@ -167,6 +167,17 @@ jobs:
           # broker of its own rather than a shared one.
           ACEMQ_TEST_RESTARTABLE_CONTAINER: acemq-tls
           ACEMQ_TEST_RESTARTABLE_URL: amqp://guest:guest@localhost:5672/
+          # The broker's own CLI, as a command prefix. The blocked-connection
+          # tests drop the memory high watermark with it until RabbitMQ raises
+          # an alarm and really blocks a connection; nothing else can produce
+          # one, and a health check that has never met a blocked broker has
+          # never been tested. They fail rather than skip when this is unset.
+          #
+          # HOME is the server's rather than the container's: the node wrote its
+          # Erlang cookie to /var/lib/rabbitmq, and rabbitmqctl started with the
+          # container's HOME=/tmp reads a different one and cannot authenticate
+          # to the node beside it.
+          ACEMQ_TEST_RABBITMQCTL: docker exec -e HOME=/var/lib/rabbitmq acemq-tls rabbitmqctl
         run: |
           set -o pipefail
           go test -race -count=1 -v ./rabbitmq/ 2>&1 | tee "$RUNNER_TEMP/broker-tests.log"
@@ -183,7 +194,7 @@ jobs:
             exit 1
           fi
           passed=$(grep -c -- "--- PASS" "$log" || true)
-          if [ "$passed" -lt 23 ]; then
+          if [ "$passed" -lt 25 ]; then
             echo "::error::only $passed broker tests passed; expected at least 23"
             exit 1
           fi

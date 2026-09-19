@@ -34,6 +34,11 @@ type Conn struct {
 	onPublish []PublishInterceptor
 	onConsume []ConsumeInterceptor
 
+	// probe is the queue [Conn.Health] declares, named once per connection so
+	// that a readiness probe running every few seconds reuses one queue rather
+	// than leaving a fresh one on the broker for every check it runs.
+	probe string
+
 	mu     sync.Mutex
 	closed bool
 	subs   []*Consumer
@@ -203,6 +208,7 @@ func newConn(transport Transport, cfg connConfig) *Conn {
 		observer:  cfg.observer,
 		onPublish: cfg.publishInterceptors,
 		onConsume: cfg.consumeInterceptors,
+		probe:     "acemq-health-" + newID(),
 	}
 }
 

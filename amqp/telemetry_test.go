@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -551,6 +552,7 @@ func TestAConnectionCanBeAHealthCheck(t *testing.T) {
 type staticCheck struct {
 	name   string
 	status HealthStatus
+	detail string
 	delay  time.Duration
 }
 
@@ -560,5 +562,352 @@ func (c staticCheck) Check(context.Context) HealthReport {
 	if c.delay > 0 {
 		time.Sleep(c.delay)
 	}
-	return HealthReport{Status: c.status, Checked: time.Now()}
+	return HealthReport{Status: c.status, Detail: c.detail, Checked: time.Now()}
+}
+
+// ---- health: a blocked connection ------------------------------------
+
+// wedgedTransport is a broker that has stopped answering, optionally because it
+// has blocked this connection. It stands in for the thing that cannot be built
+// in memory: a socket the broker is no longer reading.
+type wedgedTransport struct {
+	Transport
+
+	blocked atomic.Pointer[string]
+
+	declares atomic.Int64
+	names    chan string
+	release  chan struct{}
+}
+
+func newWedgedTransport() *wedgedTransport {
+	return &wedgedTransport{names: make(chan string, 8), release: make(chan struct{})}
+}
+
+func (w *wedgedTransport) BlockedReason() string {
+	if reason := w.blocked.Load(); reason != nil {
+		return *reason
+	}
+	return ""
+}
+
+func (w *wedgedTransport) block(reason string) { w.blocked.Store(&reason) }
+
+func (w *wedgedTransport) DeclareQueue(ctx context.Context, name string, _ QueueSpec) error {
+	w.declares.Add(1)
+	select {
+	case w.names <- name:
+	default:
+	}
+	select {
+	case <-w.release:
+		return nil
+	case <-ctx.Done():
+		// A transport that honours its context. The RabbitMQ one does not and
+		// cannot, which is exactly why Health bounds the call from outside; a
+		// fake that answered instantly would test the wrong thing.
+		return ctx.Err()
+	}
+}
+
+func (w *wedgedTransport) Close() error { return nil }
+
+// TestABlockedConnectionIsReportedUpWithoutBeingProbed is the defect this file
+// was extended for. A blocked connection is one the broker has stopped reading,
+// so the probe's declaration is not refused — it goes unanswered — and the
+// report used to be down for a broker that was up and talking.
+func TestABlockedConnectionIsReportedUpWithoutBeingProbed(t *testing.T) {
+	transport := newWedgedTransport()
+	transport.block("low on memory")
+	mq, err := NewConn(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	report := mq.Health(context.Background())
+	took := time.Since(started)
+
+	if report.Status != HealthUp {
+		t.Errorf("Status = %s, want up for a blocked connection (%s)", report.Status, report.Detail)
+	}
+	if !strings.Contains(report.Detail, "low on memory") {
+		t.Errorf("Detail = %q, want the broker's own reason", report.Detail)
+	}
+	if !strings.HasPrefix(report.Detail, blockedPrefix) {
+		t.Errorf("Detail = %q, want the sentence an alert rule matches on", report.Detail)
+	}
+	if report.Parts["blocked"] != true {
+		t.Errorf("blocked = %v, want true", report.Parts["blocked"])
+	}
+	if report.Parts["blockedReason"] != "low on memory" {
+		t.Errorf("blockedReason = %v", report.Parts["blockedReason"])
+	}
+	if _, timed := report.Parts["roundTripMillis"]; timed {
+		t.Error("the report timed a round trip that should not have been made")
+	}
+	if n := transport.declares.Load(); n != 0 {
+		t.Errorf("the broker was asked %d times while it was not reading", n)
+	}
+	if took > time.Second {
+		t.Errorf("a blocked connection took %s to answer", took)
+	}
+}
+
+// TestAProbeThatGoesUnansweredHasADeadline is the other half. Without one,
+// Health on a wedged connection never returns at all, and takes the readiness
+// endpoint it was wired to down with it.
+func TestAProbeThatGoesUnansweredHasADeadline(t *testing.T) {
+	transport := newWedgedTransport()
+	mq, err := NewConn(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	report := mq.Health(ctx)
+	took := time.Since(started)
+
+	if report.Status != HealthDown {
+		t.Errorf("Status = %s, want down for a broker that never answered", report.Status)
+	}
+	if !strings.Contains(report.Detail, "did not answer within") {
+		t.Errorf("Detail = %q", report.Detail)
+	}
+	if took > 2*time.Second {
+		t.Errorf("Health took %s with a 150ms deadline", took)
+	}
+	if _, timed := report.Parts["roundTripMillis"]; timed {
+		t.Error("the report timed its own deadline and called it a round trip")
+	}
+}
+
+// TestHealthBoundsItselfWhenTheCallerDidNot covers the readiness endpoint whose
+// context has no deadline at all, which is the shape http.Request.Context has.
+func TestHealthBoundsItselfWhenTheCallerDidNot(t *testing.T) {
+	if DefaultHealthTimeout > 5*time.Second {
+		t.Fatalf("DefaultHealthTimeout is %s, too long to assert on here", DefaultHealthTimeout)
+	}
+
+	transport := newWedgedTransport()
+	mq, err := NewConn(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	report := mq.Health(context.Background())
+	took := time.Since(started)
+
+	if report.Status != HealthDown {
+		t.Errorf("Status = %s", report.Status)
+	}
+	if took > DefaultHealthTimeout+2*time.Second {
+		t.Errorf("Health took %s without a deadline of its own", took)
+	}
+}
+
+// TestABlockArrivingDuringAProbeExplainsTheSilence: the block is the reason the
+// probe went unanswered, not a second fault standing beside it.
+func TestABlockArrivingDuringAProbeExplainsTheSilence(t *testing.T) {
+	transport := newWedgedTransport()
+	mq, err := NewConn(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		transport.block("low on disk space")
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	report := mq.Health(ctx)
+
+	if report.Status != HealthUp {
+		t.Errorf("Status = %s, want up (%s)", report.Status, report.Detail)
+	}
+	if !strings.Contains(report.Detail, "low on disk space") {
+		t.Errorf("Detail = %q", report.Detail)
+	}
+	if report.Parts["blocked"] != true {
+		t.Errorf("blocked = %v, want true", report.Parts["blocked"])
+	}
+}
+
+// TestBlockedIsNullWhenNobodyCanBeAsked keeps "no" apart from "nobody looked".
+func TestBlockedIsNullWhenNobodyCanBeAsked(t *testing.T) {
+	mq := brokerFor(t)
+
+	report := mq.Health(context.Background())
+
+	blocked, present := report.Parts["blocked"]
+	if !present {
+		t.Fatal("the report says nothing at all about blocking")
+	}
+	if blocked != nil {
+		t.Errorf("blocked = %v, want null for a transport that cannot be asked", blocked)
+	}
+	if reason := mq.BlockedReason(); reason != "" {
+		t.Errorf("BlockedReason = %q", reason)
+	}
+	if b, known := mq.Blocked(); b || known {
+		t.Errorf("Blocked = (%v, %v), want (false, false)", b, known)
+	}
+}
+
+func TestBlockedIsFalseWhenTheTransportCanBeAsked(t *testing.T) {
+	transport := newWedgedTransport()
+	close(transport.release)
+	mq, err := NewConn(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report := mq.Health(context.Background())
+
+	if report.Parts["blocked"] != false {
+		t.Errorf("blocked = %v, want false", report.Parts["blocked"])
+	}
+	if b, known := mq.Blocked(); b || !known {
+		t.Errorf("Blocked = (%v, %v), want (false, true)", b, known)
+	}
+}
+
+// TestTheProbeQueueIsOnePerConnection: a readiness probe runs every few seconds
+// for the life of the process, and a queue per check is a queue per check left
+// on the broker until the connection goes.
+func TestTheProbeQueueIsOnePerConnection(t *testing.T) {
+	transport := newWedgedTransport()
+	close(transport.release)
+	mq, err := NewConn(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if report := mq.Health(context.Background()); report.Status != HealthUp {
+			t.Fatalf("Status = %s", report.Status)
+		}
+	}
+
+	seen := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		seen[<-transport.names] = true
+	}
+	if len(seen) != 1 {
+		t.Errorf("three checks declared %d different queues: %v", len(seen), seen)
+	}
+	for name := range seen {
+		if !strings.HasPrefix(name, "acemq-health-") {
+			t.Errorf("the probe queue is named %q", name)
+		}
+	}
+
+	other, err := NewConn(newWedgedTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.probe == mq.probe {
+		t.Error("two connections share a probe queue, so they can collide")
+	}
+}
+
+// ---- health: the aggregate keeps the reason --------------------------
+
+// TestTheAggregateKeepsTheReason is Ruby's defect, asserted here. Summarising by
+// status alone answered up with an empty detail for an aggregate holding a
+// blocked connection, throwing away the one fact the check had found at exactly
+// the line an operator reads first.
+func TestTheAggregateKeepsTheReason(t *testing.T) {
+	report := AggregateHealth(context.Background(),
+		staticCheck{name: "database", status: HealthUp},
+		staticCheck{
+			name:   "broker",
+			status: HealthUp,
+			detail: blockedDetail("low on memory"),
+		})
+
+	if report.Status != HealthUp {
+		t.Errorf("Status = %s, want up", report.Status)
+	}
+	if !strings.Contains(report.Detail, "low on memory") {
+		t.Errorf("Detail = %q, want the reason the broker gave", report.Detail)
+	}
+	if !strings.Contains(report.Detail, "broker") {
+		t.Errorf("Detail = %q, want the part that said it named", report.Detail)
+	}
+	if strings.Contains(report.Detail, "database") {
+		t.Errorf("Detail = %q names a part that had nothing to say", report.Detail)
+	}
+}
+
+func TestTheAggregateRepeatsWhatADownPartSaid(t *testing.T) {
+	report := AggregateHealth(context.Background(),
+		staticCheck{name: "broker", status: HealthDown, detail: "the broker did not answer"})
+
+	if !strings.Contains(report.Detail, "broker: the broker did not answer") {
+		t.Errorf("Detail = %q", report.Detail)
+	}
+}
+
+// TestACheckThatNeverAnswersIsNamedRatherThanWaitedFor: the interface says a
+// check must not hang, and the aggregate used to take that on trust — one that
+// did hung the readiness endpoint for ever.
+func TestACheckThatNeverAnswersIsNamedRatherThanWaitedFor(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	report := AggregateHealth(ctx,
+		staticCheck{name: "database", status: HealthUp},
+		staticCheck{name: "broker", status: HealthUp, delay: 30 * time.Second})
+	took := time.Since(started)
+
+	if took > 5*time.Second {
+		t.Fatalf("the aggregate waited %s for a check that never answered", took)
+	}
+	if report.Status != HealthDown {
+		t.Errorf("Status = %s, want down", report.Status)
+	}
+	if !strings.Contains(report.Detail, "broker") {
+		t.Errorf("Detail = %q, want the check that went quiet named", report.Detail)
+	}
+	if _, ok := report.Parts["broker"]; !ok {
+		t.Error("the check that went quiet is missing from the parts entirely")
+	}
+	if _, ok := report.Parts["database"]; !ok {
+		t.Error("the check that did answer was thrown away")
+	}
+}
+
+// TestConnHealthGivesUpBeforeTheAggregateDoes: a check that answers first can
+// say what it found; one the aggregate gives up on is described by the aggregate
+// as having said nothing.
+func TestConnHealthGivesUpBeforeTheAggregateDoes(t *testing.T) {
+	transport := newWedgedTransport()
+	mq, err := NewConn(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	report := AggregateHealth(ctx, ConnHealth{Conn: mq, Timeout: 100 * time.Millisecond})
+
+	if report.Status != HealthDown {
+		t.Errorf("Status = %s", report.Status)
+	}
+	if !strings.Contains(report.Detail, "did not answer within") {
+		t.Errorf("Detail = %q, want the connection's own account", report.Detail)
+	}
+	if strings.Contains(report.Detail, "the check did not answer") {
+		t.Error("the aggregate gave up on a check that had an answer ready")
+	}
 }

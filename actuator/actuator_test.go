@@ -194,6 +194,49 @@ func TestInfoSaysWhatIsRunning(t *testing.T) {
 	}
 }
 
+// TestConnCanFeedInfoWithoutBeingCheckedTwice is the trade that used to have no
+// way out. Setting Conn appended the library's own check beside the
+// application's, and leaving Conn unset to avoid that took the transport's
+// capabilities out of /acemq-info with it.
+func TestConnCanFeedInfoWithoutBeingCheckedTwice(t *testing.T) {
+	mq := brokerFor(t)
+	act := New(Options{
+		Conn:              mq,
+		WithoutConnHealth: true,
+		Checks:            []acemq.HealthCheck{mine{}},
+	})
+
+	var report acemq.HealthReport
+	if err := json.Unmarshal(get(t, act, HealthPath).Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := report.Parts["broker"]; ok {
+		t.Errorf("the library's own check was added anyway: %v", report.Parts)
+	}
+	if _, ok := report.Parts["my-broker"]; !ok {
+		t.Errorf("the application's own check is missing: %v", report.Parts)
+	}
+
+	var info map[string]any
+	if err := json.Unmarshal(get(t, act, InfoPath).Body.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := info["transport"]; !ok {
+		t.Errorf("the transport's capabilities went with the health check: %v", info)
+	}
+}
+
+func TestConnIsCheckedByDefault(t *testing.T) {
+	var report acemq.HealthReport
+	body := get(t, New(Options{Conn: brokerFor(t)}), HealthPath).Body.Bytes()
+	if err := json.Unmarshal(body, &report); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := report.Parts["broker"]; !ok {
+		t.Errorf("Conn alone no longer checks the connection: %v", report.Parts)
+	}
+}
+
 func TestThePathsMatchTheOtherLibraries(t *testing.T) {
 	// A scrape configuration or a probe written for Java or .NET has to work
 	// here without being rewritten.
@@ -221,6 +264,14 @@ type failing struct{}
 func (failing) Name() string { return "database" }
 func (failing) Check(context.Context) acemq.HealthReport {
 	return acemq.HealthReport{Status: acemq.HealthDown, Detail: "unreachable"}
+}
+
+// mine is an application's own check of the same connection.
+type mine struct{}
+
+func (mine) Name() string { return "my-broker" }
+func (mine) Check(context.Context) acemq.HealthReport {
+	return acemq.HealthReport{Status: acemq.HealthUp}
 }
 
 type degraded struct{}

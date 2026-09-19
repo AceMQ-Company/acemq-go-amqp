@@ -52,9 +52,12 @@ if err != nil {
 `acemq.Connect(ctx, url)` is shorter and is the right thing in a test. A
 long-running service wants the two-step form, because `*Conn` deliberately does
 not expose the transport underneath it — so the handle returned by `Dial` is the
-only route to `OnRecovery` and to `BlockedReason()`, and both of those are
-things a readiness probe wants to know. Reaching for them after the fact is not
-possible; keeping the handle costs one variable.
+only route to `OnRecovery`, which is something a service wants to log. Reaching
+for it after the fact is not possible; keeping the handle costs one variable.
+
+`BlockedReason()` used to be on that list and no longer is: `*Conn` forwards it,
+so a health check does not need the transport handle to ask whether the broker
+has blocked this connection — and the built-in check asks for itself.
 
 ### The consumers get a context of their own
 
@@ -362,16 +365,22 @@ answer with one handler:
 ```go
 // probes serves what an orchestrator asks for and what a scrape asks for, on
 // one loopback port.
-func probes(metrics *acemq.Metrics, mq *acemq.Conn, transport *rabbitmq.Transport) http.Handler {
-	checks := []acemq.HealthCheck{brokerHealth{conn: mq, transport: transport}}
+func probes(metrics *acemq.Metrics, mq *acemq.Conn) http.Handler {
+	// ConnHealth reads the blocked state itself and reports it up with the
+	// reason, so there is nothing here to compose around it. Three seconds
+	// rather than the aggregate's five, so the check that looked is the one
+	// that describes what it found.
+	checks := []acemq.HealthCheck{acemq.ConnHealth{Conn: mq, Timeout: 3 * time.Second}}
 
-	// Checks rather than Conn: setting Conn would append the library's own
-	// ConnHealth beside this one, and then a blocked broker would be reported
-	// down by that check however carefully this one reports it degraded.
+	// Conn as well as Checks: it is what /acemq-info reads the transport's
+	// capabilities from, and WithoutConnHealth keeps /acemq-health to the
+	// checks above rather than adding a second opinion of the same connection.
 	act := actuator.New(actuator.Options{
-		Metrics: metrics,
-		Checks:  checks,
-		Name:    "orders-worker",
+		Metrics:           metrics,
+		Conn:              mq,
+		WithoutConnHealth: true,
+		Checks:            checks,
+		Name:              "orders-worker",
 	})
 
 	mux := http.NewServeMux()
@@ -430,53 +439,90 @@ broker answers. That is the cheapest thing AMQP offers that actually proves the
 connection works: a TCP connection that is open but wedged answers exactly like
 a healthy one until something is asked of it.
 
-What it does **not** do is distinguish a connection the broker has deliberately
-blocked. RabbitMQ sends `connection.blocked` when it is low on memory or disk,
-and a blocked connection is one the broker has stopped reading from — so the
-probe's declaration may get no answer, the context deadline expires, and
-`ConnHealth` reports `down`. Which is to say: a broker under disk pressure can
-put every consumer of it into a restart loop, and each restart drops the
-messages that instance was holding onto a broker that is already struggling.
-
-Java's health indicator takes the opposite line on purpose, reporting a blocked
-connection as *up, with the reason*. Go's `ConnHealth` has no notion of blocking
-at all, so an application that wants the same answer composes it:
+**Unless the broker has blocked this connection, in which case nothing is
+asked.** RabbitMQ sends `connection.blocked` when it is low on memory or disk,
+and a blocked connection is one the broker has **stopped reading**. The probe's
+declaration is therefore not refused — it goes unanswered, for as long as the
+alarm lasts. The check reads the blocked state instead and answers straight
+away:
 
 ```go
-// brokerHealth reports the connection, and reports a broker that has blocked it
-// as degraded rather than down.
-type brokerHealth struct {
-	conn      *acemq.Conn
-	transport *rabbitmq.Transport
-}
-
-func (b brokerHealth) Name() string { return "broker" }
-
-func (b brokerHealth) Check(ctx context.Context) acemq.HealthReport {
-	if reason := b.transport.BlockedReason(); reason != "" {
-		return acemq.HealthReport{
-			Status:  acemq.HealthDegraded,
-			Detail:  "the broker has blocked this connection: " + reason,
-			Checked: time.Now().UTC(),
-		}
-	}
-	return b.conn.Health(ctx)
-}
+report := mq.Health(ctx)
+// {Status: up,
+//  Detail: "the broker has blocked this connection; publishing is paused: low on memory",
+//  Parts: {consumers: 3, blocked: true, blockedReason: "low on memory"}}
 ```
 
-`HealthDegraded` is deliberately not down — worth an alert, not worth taking the
-instance out of rotation, because its replacement will be just as degraded. The
-check is asked before the round trip rather than after, so a blocked connection
-answers immediately instead of spending the probe's whole timeout finding out.
+Both halves of that are deliberate.
 
-Two things to notice. `BlockedReason()` lives on `*rabbitmq.Transport`, which is
-why the connection was built in two steps at the top of this page. And the
-actuator is given this check through `Checks` with `Conn` left unset: setting
-`Conn` appends the library's own `ConnHealth` alongside, and then the careful
-answer above is overruled by the plain one, since `AggregateHealth` takes the
-worst of them. The cost of leaving `Conn` unset is that `/acemq-info` stops
-listing the transport's capabilities. That is a real trade and there is currently
-no way to have both.
+**Nothing is asked** because the broker telling this socket that it blocked it is
+livelier proof that the broker is there than any declaration could be. Against a
+real broker under a memory alarm, `Health` answers in **under a millisecond**
+where the round trip it used to make had not come back after twelve seconds — and
+that was with a five-second context, because the RabbitMQ transport's declaration
+is a synchronous AMQP round trip that no context reaches.
+
+**It is `up`** because a blocked connection is the broker protecting itself, and
+an application that fails its own readiness check for it is one an orchestrator
+restarts into the same blocked broker, having thrown away whatever it was
+holding. A fleet doing that together stops draining the queues at the moment the
+broker most needs them drained. Java's `AceMqHealthIndicator`, .NET's `Health()`,
+Python's `health()` and Ruby's `Health` all say the same thing in the same words:
+the text before the colon is fixed, because it is what an alert rule matches on,
+and the broker's own words follow it.
+
+It is not `degraded` either, which is what this page used to recommend composing
+by hand. Degraded is for this instance being worse at its job than it should be;
+a block is the broker's state, identical for every replica, and saying `degraded`
+for it means a fleet-wide alert that no deployment can act on.
+
+**The probe that is made has a deadline.** `ctx` bounds it, and
+`acemq.DefaultHealthTimeout` — three seconds — bounds it when `ctx` carries none,
+which is the shape `http.Request.Context()` has. A probe that runs out of time is
+abandoned rather than waited for, because cancelling a request to a broker that
+is not reading means waiting for a cancellation that travels the same way the
+request did. A block that arrives *during* a probe is read as the explanation for
+the silence rather than as a second fault beside it.
+
+### Asking about it without a round trip
+
+```go
+if reason := mq.BlockedReason(); reason != "" {
+	// Shed load, buffer, fail the request — anything but hand it over.
+}
+
+blocked, known := mq.Blocked() // known is false when nobody could be asked
+```
+
+`BlockedReason()` also still lives on `*rabbitmq.Transport`, where it always did;
+`*acemq.Conn` now forwards it through a `BlockedReporter` seam, so a check does
+not have to be handed the concrete transport to ask, and a test double answers it
+by implementing one method. `Blocked()`'s second return keeps "no" apart from
+"nobody looked": a transport that cannot be asked reports `blocked: null` rather
+than `blocked: false`, and in an incident those are not the same sentence.
+
+### Keeping `Conn` without being checked twice
+
+An application whose own check of the connection is the one it wants in the
+report says so, and keeps `Conn` for what else it feeds:
+
+```go
+act := actuator.New(actuator.Options{
+	Metrics: metrics,
+	Conn:    mq,                 // /acemq-info still lists the transport's capabilities
+	WithoutConnHealth: true,     // but /acemq-health takes only the checks below
+	Checks:  []acemq.HealthCheck{myBrokerCheck{mq}},
+	Name:    "orders-worker",
+})
+```
+
+This used to be a trade with no way out. `AggregateHealth` takes the worst report,
+so the library's own `ConnHealth` overruled any more careful answer composed
+beside it, and the only way to keep it out was to leave `Conn` unset — which took
+the transport's capabilities out of `/acemq-info` with it. Both halves are fixed:
+`ConnHealth` passes the connection's own answer through and adds no opinion of its
+own, so there is usually nothing to get out from under; and when there is,
+`WithoutConnHealth` is how, without giving up the rest of what `Conn` is for.
 
 ### Marking the drain
 
