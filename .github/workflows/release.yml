@@ -183,6 +183,13 @@ jobs:
           ACEMQ_TEST_CA: ${{ runner.temp }}/certs/ca.crt
           ACEMQ_TEST_RESTARTABLE_CONTAINER: acemq-tls
           ACEMQ_TEST_RESTARTABLE_URL: amqp://guest:guest@localhost:5672/
+          # The same line ci.yml carries, and it was missing here: the release
+          # ran the blocked-connection tests with no way to reach rabbitmqctl,
+          # and they fail rather than skip, so the release failed. HOME is set
+          # because the node writes its Erlang cookie to /var/lib/rabbitmq and
+          # rabbitmqctl started with the container's HOME=/tmp reads a different
+          # one and cannot authenticate to the node beside it.
+          ACEMQ_TEST_RABBITMQCTL: docker exec -e HOME=/var/lib/rabbitmq acemq-tls rabbitmqctl
         run: |
           set -o pipefail
           go test -race -count=1 -v ./rabbitmq/ 2>&1 | tee "$RUNNER_TEMP/broker-tests.log"
