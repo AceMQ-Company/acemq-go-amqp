@@ -1,9 +1,9 @@
 name: ci
 
+# Manual only. push and pull_request were removed so that a commit no longer
+# starts a run — nothing here verifies a change unless a person asks it to.
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
