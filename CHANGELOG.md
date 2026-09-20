@@ -8,6 +8,21 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [telemetry/otel/v0.7.1] - 2026-09-20
+
+Tagged as `telemetry/otel/v0.7.1`. **Only the optional OpenTelemetry module is
+released here** — the core library stays at `v0.7.0`, its `go.mod` and `go.sum`
+are byte-identical, and a service that does not import `telemetry/otel` has
+nothing to take.
+
+> **This patch raises the module's Go floor from 1.23 to 1.25.** A patch number
+> does not usually carry that, so it is said here instead: `go get -u` of this
+> module on Go 1.23 will stop building. The core library still declares
+> `go 1.23` and is unaffected. The reason is below — every OpenTelemetry release
+> from v1.39.0 raises its own floor, and the earliest one clearing all four
+> advisories requires 1.25, so holding the floor would have meant shipping the
+> unpatched versions.
+
 ### Security
 
 - **`telemetry/otel` moves to OpenTelemetry v1.46.0, clearing four advisories
