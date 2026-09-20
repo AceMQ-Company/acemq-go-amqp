@@ -78,7 +78,7 @@ While the version is `0.x` the public API may change in any release.
 [GHSA-mh2q-q3fh-2475]: https://github.com/open-telemetry/opentelemetry-go/security/advisories/GHSA-mh2q-q3fh-2475
 [GHSA-8wmf-6v46-5gfg]: https://github.com/open-telemetry/opentelemetry-go/security/advisories/GHSA-8wmf-6v46-5gfg
 
-## [0.7.0] - 2026-09-18
+## [0.7.0] - 2026-09-20
 
 ### Fixed
 
