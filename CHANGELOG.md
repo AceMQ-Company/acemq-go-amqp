@@ -8,6 +8,76 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Security
+
+- **`telemetry/otel` moves to OpenTelemetry v1.46.0, clearing four advisories
+  against v1.38.0. None of the four was reachable through this module, and the
+  core library was never affected by any of them.** The core is a separate
+  module and does not depend on OpenTelemetry at all, so a service that does not
+  import `telemetry/otel` was never exposed — that is the whole point of the
+  split, and it held.
+
+  What the four actually are, and where each one stops:
+
+  - **[GHSA-9h8m-3fm2-qjrq][] / CVE-2026-24051** (high) and
+    **[GHSA-hfvc-g4fc-pqhx][] / CVE-2026-39883** (high), both in
+    `go.opentelemetry.io/otel/sdk`, are the same defect twice: the SDK's host-ID
+    resource detector ran `ioreg` on macOS, and then `kenv` on the BSDs and
+    Solaris, by bare name rather than absolute path, so a local attacker who
+    could prepend to `PATH` got arbitrary code execution inside the application.
+    The detector is `resource.WithHostID()`, which is opt-in — `resource.Default()`
+    is service name, environment and SDK attributes and nothing else — and this
+    module never builds a resource, never constructs a `TracerProvider`, and
+    imports `otel/sdk` only from its tests. Reaching it needed an application to
+    ask for host-ID detection itself, on one of those platforms, with a
+    compromised `PATH`.
+
+  - **[GHSA-mh2q-q3fh-2475][] / CVE-2026-29181** (high) in
+    `go.opentelemetry.io/otel` is remote DoS amplification in baggage
+    extraction: `extractMultiBaggage` parsed each `baggage` header value against
+    its own 8192-byte limit rather than a combined one, so many header lines
+    multiplied CPU and allocations. Two things keep it out of reach here. The
+    multi-value path is taken only when the carrier implements
+    `propagation.ValuesGetter` — an HTTP header map — and this module's carrier
+    over AMQP headers offers `Get`, `Set` and `Keys` only, so extraction takes
+    the single-value path. And the default propagator is `TraceContext`, not
+    `Baggage`. This one is an HTTP-server-instrumentation bug, the way the
+    Micrometer advisory before it was; a message header is not a repeated HTTP
+    field.
+
+  - **[GHSA-8wmf-6v46-5gfg][] / CVE-2026-81870** (low) in
+    `go.opentelemetry.io/otel/sdk` is `sdk/trace.NewTracerProvider` logging its
+    exporter configuration at Info, which discloses an endpoint URL and any
+    credentials embedded in one. The application builds the `TracerProvider`,
+    never this module — `otel.New()` takes the process's provider precisely so
+    the exporter stays the application's business — and the only provider built
+    in this repository is a test's, over an in-memory exporter with no endpoint.
+
+  Bumped rather than pinned because being unreachable is not a reason to ship
+  known-vulnerable versions: reachability is an argument about today's call
+  sites, and the call sites move.
+
+- **`telemetry/otel` now declares `go 1.25`; the core library still declares
+  `go 1.23`.** Every OpenTelemetry release from v1.39.0 on raises its own Go
+  floor — 1.24 at v1.39.0, 1.25 at v1.45.0 — and the earliest release clearing
+  all four advisories is v1.45.0. The note in that module's `go.mod` about
+  v1.38.0 being the newest that builds on Go 1.23 is therefore retired: holding
+  the floor now means shipping the unpatched versions, which is the worse trade.
+
+  The core's floor is untouched and its `go.mod` and `go.sum` are byte-identical
+  — no OpenTelemetry module appears in either, and none of the codec modules
+  moved. A project on Go 1.23 can still take the library; it cannot take
+  `telemetry/otel` with it. `patterns/sqltest` already sat at 1.25 for a
+  comparable reason. See [docs/observability.md](docs/observability.md).
+
+  No span name, attribute or propagation assertion changed. The tracing tests
+  are unedited and the same 37 pass on v1.46.0 as on v1.38.0.
+
+[GHSA-9h8m-3fm2-qjrq]: https://github.com/open-telemetry/opentelemetry-go/security/advisories/GHSA-9h8m-3fm2-qjrq
+[GHSA-hfvc-g4fc-pqhx]: https://github.com/open-telemetry/opentelemetry-go/security/advisories/GHSA-hfvc-g4fc-pqhx
+[GHSA-mh2q-q3fh-2475]: https://github.com/open-telemetry/opentelemetry-go/security/advisories/GHSA-mh2q-q3fh-2475
+[GHSA-8wmf-6v46-5gfg]: https://github.com/open-telemetry/opentelemetry-go/security/advisories/GHSA-8wmf-6v46-5gfg
+
 ## [0.7.0] - 2026-09-18
 
 ### Fixed

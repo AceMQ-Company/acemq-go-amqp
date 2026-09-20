@@ -255,6 +255,13 @@ A module of its own, so `go.opentelemetry.io/otel` never becomes a dependency of
 the core — the same arrangement as the codec modules. A service that publishes
 messages and traces nothing resolves nothing new.
 
+**This module needs Go 1.25**, where the core library still needs only 1.23. The
+OpenTelemetry releases carrying the current security fixes declare `go 1.25`
+themselves, and a floor is the one thing a dependency sets that its dependents
+cannot argue with. Keeping tracing in a module of its own is what confines that
+to the services that trace: the core's floor is unmoved, and a project on Go 1.23
+can still take the library — it just cannot take this package with it.
+
 `otel.New()` takes the process's tracer provider, so **nothing is emitted until
 the application configures an SDK**. The exporter and the sampler are the
 application's business; this module only says what happened.
