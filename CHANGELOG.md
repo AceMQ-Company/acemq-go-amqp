@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-18
+
 ### Fixed
 
 - **`Conn.Health` no longer hangs on a connection the broker has blocked. It is

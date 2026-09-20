@@ -15,8 +15,9 @@ anything. So everything that can be checked is checked before the tag exists.
    const Version = "0.1.0"
    ```
 
-2. **Point the nested modules at the version being released.** Each codec module
-   and `patterns/sqltest` has its own `go.mod` requiring the parent:
+2. **Point the nested modules at the version being released.** Each codec
+   module, `telemetry/otel` and `patterns/sqltest` has its own `go.mod`
+   requiring the parent:
 
    ```
    require github.com/AceMQ-Company/acemq-go-amqp v0.1.0
@@ -43,12 +44,17 @@ anything. So everything that can be checked is checked before the tag exists.
    carrying its path:
 
    ```bash
-   for m in codec/yaml codec/toml codec/protobuf codec/avro; do
+   for m in codec/yaml codec/toml codec/protobuf codec/avro telemetry/otel; do
      git tag -a "$m/v0.1.0" v0.1.0^{} -m "AceMQ for Go $m 0.1.0"
    done
    git push origin codec/yaml/v0.1.0 codec/toml/v0.1.0 \
-                   codec/protobuf/v0.1.0 codec/avro/v0.1.0
+                   codec/protobuf/v0.1.0 codec/avro/v0.1.0 \
+                   telemetry/otel/v0.1.0
    ```
+
+   `telemetry/otel` is not a codec but is published exactly like one — its own
+   module, its own path-prefixed tag — so it is tagged with them.
+   `./scripts/release-preflight.sh <version>` prints the full list to push.
 
    Tagged at the same commit as the root, so the version numbers mean the same
    thing. Without these tags `go get .../codec/yaml@v0.1.0` fails with
@@ -64,7 +70,7 @@ anything. So everything that can be checked is checked before the tag exists.
 
    `patterns/sqltest` is not tagged: it holds tests and nothing imports it.
 
-The release workflow then verifies the tag: that it is a `0.6.x` version, that
+The release workflow then verifies the tag: that it is a `0.7.x` version, that
 `go.mod` still targets Go 1.23, that `acemq.Version` matches the tag, that every
 codec module builds, that the nested modules require the version being released,
 and that the whole suite passes against a real broker with nothing skipped.
@@ -99,5 +105,5 @@ curl -s "https://proxy.golang.org/github.com/!ace!m!q-!company/acemq-go-amqp/cod
 
 ## The version line
 
-`0.6.x` until somebody decides otherwise. The release workflow refuses anything
+`0.7.x` until somebody decides otherwise. The release workflow refuses anything
 else, so moving the line is a deliberate edit rather than a typo in a tag.
