@@ -196,7 +196,7 @@ jobs:
           fi
           passed=$(grep -c -- "--- PASS" "$log" || true)
           if [ "$passed" -lt 25 ]; then
-            echo "::error::only $passed broker tests passed; expected at least 23"
+            echo "::error::only $passed broker tests passed; expected at least 25"
             exit 1
           fi
           echo "$passed broker tests passed"
@@ -204,3 +204,121 @@ jobs:
       - name: What the broker said, if anything went wrong
         if: failure()
         run: docker logs acemq-tls
+
+  compatibility:
+    # The same suite against RabbitMQ 3.13, which is the version most production
+    # estates are actually on. The integration job above runs 4.x and nothing
+    # else, so "works on 3.13" was a claim with nothing behind it: every green
+    # run only ever proved 4.x.
+    #
+    # A job of its own rather than another dimension on an existing matrix. The
+    # two matrices this repository already has are about the Go toolchain — the
+    # oldest one the module supports and the newest release — and a toolchain is
+    # a compile-time question. A broker version is a runtime one. Crossing them
+    # would start four containers to re-prove twice over what one run shows,
+    # and a failure in the crossed job would not say which axis broke it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Generate development certificates
+        # This job runs the TLS tests too, and therefore needs the same
+        # certificate dance as the job above rather than a service container.
+        #
+        # Running them is the point rather than an extra: 3.13 is a different
+        # Erlang/OTP release from 4.x, so it is a different TLS implementation
+        # underneath, with its own defaults for protocol versions and peer
+        # verification. That is precisely where a broker-version difference
+        # would show up, and it is the half of the transport a plaintext-only
+        # compatibility job would leave unproven. Skipping them would also trip
+        # the skip guard below, which is the guard doing its job.
+        run: go run ./cmd/acemq-certs --out "$RUNNER_TEMP/certs" --broker localhost --days 1
+
+      - name: Start a 3.13 broker serving them
+        run: |
+          # Readable by the broker's user inside the container, which is not
+          # the user that generated them.
+          chmod 644 "$RUNNER_TEMP"/certs/*.key
+          # The alpine image rather than -management: the 4.x job above runs
+          # alpine, and the one thing this job should be changing is the
+          # broker version. Nothing here talks to the management API.
+          docker run -d --name acemq-tls-313 \
+            -e HOME=/tmp \
+            -p 5671:5671 -p 5672:5672 \
+            -v "$RUNNER_TEMP/certs:/certs:ro" \
+            -v "$RUNNER_TEMP/certs/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+            rabbitmq:3.13-alpine
+          # The broker's own word for it, from this boot only — the same check
+          # as the 4.x job, and for the same reasons. A TCP connect succeeds
+          # against a published port seconds before RabbitMQ is listening on
+          # it, rabbitmq-diagnostics cannot authenticate to its own node here,
+          # and without --since a restarted container matches the previous
+          # boot's line immediately. 3.13 prints the same sentence, so none of
+          # that needed weakening for the older broker.
+          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          for i in $(seq 1 60); do
+            if docker logs --since "$started" acemq-tls-313 2>&1 | grep -q "Server startup complete"; then
+              echo "the broker is up"
+              docker logs --since "$started" acemq-tls-313 2>&1 | grep -E "started (TCP|TLS) listener"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::the broker never became ready"
+          docker logs acemq-tls-313
+          exit 1
+
+      - name: Test over TLS and plaintext together
+        # Once, and judge that run — running it twice raced the recovery test's
+        # broker restart, and a 3.13 restart is no faster than a 4.x one.
+        env:
+          ACEMQ_TEST_AMQPS_URL: amqps://guest:guest@localhost:5671/
+          ACEMQ_TEST_AMQP_URL: amqp://guest:guest@localhost:5672/
+          ACEMQ_TEST_CA: ${{ runner.temp }}/certs/ca.crt
+          ACEMQ_TEST_RESTARTABLE_CONTAINER: acemq-tls-313
+          ACEMQ_TEST_RESTARTABLE_URL: amqp://guest:guest@localhost:5672/
+          # HOME is the server's rather than the container's, exactly as in the
+          # 4.x job: the node wrote its Erlang cookie to /var/lib/rabbitmq, and
+          # rabbitmqctl started with the container's HOME=/tmp reads a
+          # different one and is rejected by the node beside it with "Invalid
+          # challenge reply". The blocked-connection tests fail rather than
+          # skip when this is unset, so getting it wrong here would read as a
+          # 3.13 incompatibility rather than the cookie mistake it is.
+          ACEMQ_TEST_RABBITMQCTL: docker exec -e HOME=/var/lib/rabbitmq acemq-tls-313 rabbitmqctl
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v ./rabbitmq/ 2>&1 | tee "$RUNNER_TEMP/broker-tests.log"
+
+      - name: Check nothing skipped
+        # The same guard as the 4.x job, and it carries more weight here: this
+        # job exists only to prove the suite passes against 3.13, so a test
+        # that quietly stopped running would leave the whole claim resting on
+        # nothing.
+        #
+        # The same floor as 4.x, deliberately. The two brokers run the identical
+        # set of tests — 52 pass on each, none skip on either, TLS and streams
+        # and the blocked-connection tests included — so there is nothing about
+        # 3.13 that earns a lower bar. Lowering it to fit would be the guard
+        # conceding a regression instead of reporting one; if 3.13 ever stops
+        # running a test, this should fail and say so.
+        run: |
+          log="$RUNNER_TEMP/broker-tests.log"
+          if grep -q -- "--- SKIP" "$log"; then
+            echo "::error::a broker test skipped while a 3.13 broker was running"
+            grep -- "--- SKIP" "$log"
+            exit 1
+          fi
+          passed=$(grep -c -- "--- PASS" "$log" || true)
+          if [ "$passed" -lt 25 ]; then
+            echo "::error::only $passed broker tests passed on 3.13; expected at least 25"
+            exit 1
+          fi
+          echo "$passed broker tests passed against RabbitMQ 3.13"
+
+      - name: What the broker said, if anything went wrong
+        if: failure()
+        run: docker logs acemq-tls-313
