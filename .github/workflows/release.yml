@@ -101,24 +101,64 @@ jobs:
         # they were pushed -- and `git fetch --tags` failing under `bash -e`
         # took the step down before it could say so. 0.1.2 failed here with the
         # tags all present and the release itself perfectly good.
+        # Existing is not the same as correct, and the difference is a release
+        # nobody can withdraw.
+        #
+        # telemetry/otel spent v0.7.1 on its own account, for an OpenTelemetry
+        # bump that raised its Go floor. That tag points at a commit whose
+        # go.mod requires the parent at v0.7.0 -- correct for that release, and
+        # wrong for any later one. Cutting the root at v0.7.1 would then have
+        # satisfied a check that asks only whether a tag of that name exists:
+        # the release would have gone green while
+        # `go get .../telemetry/otel@v0.7.1` served the older code against the
+        # older parent, permanently, because the proxy caches on first fetch.
+        #
+        # So the tag has to point at *this* release's commit. Compared by sha,
+        # peeled: an annotated tag gives ls-remote two lines, the tag object and
+        # a "^{}" line carrying the commit, and the commit is the thing that
+        # decides what a consumer downloads.
         run: |
           version="${GITHUB_REF_NAME}"
-          tags="$(git ls-remote --tags origin | sed -e 's#.*refs/tags/##' -e 's#\^{}$##')"
-          missing=""
+          refs="$(git ls-remote --tags origin)"
+
+          commit_of() {  # commit_of <tag name> -> sha, empty when absent
+            printf '%s\n' "$refs" | awk -v peeled="refs/tags/$1^{}" -v plain="refs/tags/$1" '
+              $2 == peeled { found = $1 }
+              $2 == plain && found == "" { found = $1 }
+              END { print found }'
+          }
+
+          root="$(commit_of "$version")"
+          if [ -z "$root" ]; then
+            echo "::error::the root tag $version is not on the remote, which should be impossible in a run it triggered"
+            exit 1
+          fi
+          echo "$version is $root"
+
+          missing=""; wrong=""
           for module in codec/yaml codec/toml codec/protobuf codec/avro telemetry/otel; do
-            if ! printf '%s\n' "$tags" | grep -qx "$module/$version"; then
+            sha="$(commit_of "$module/$version")"
+            if [ -z "$sha" ]; then
               missing="$missing $module/$version"
+            elif [ "$sha" != "$root" ]; then
+              wrong="$wrong $module/$version($sha)"
             fi
           done
+
           if [ -n "$missing" ]; then
             echo "::error::these module tags are missing, so those formats cannot be consumed:$missing"
             echo "Tag them at this commit and push:"
             for tag in $missing; do
               echo "  git tag -a $tag $version^{} -m '...'"
             done
-            exit 1
           fi
-          echo "every nested module is tagged"
+          if [ -n "$wrong" ]; then
+            echo "::error::these module tags exist but point somewhere else, so consumers would get different code:$wrong"
+            echo "::error::the root tag is $root. A published tag cannot be moved once the proxy has served it,"
+            echo "::error::so the answer is a version number nothing has claimed yet, not a retag."
+          fi
+          [ -z "$missing" ] && [ -z "$wrong" ] || exit 1
+          echo "every nested module is tagged at this release's commit"
 
       - name: Check the nested modules require a released parent
         # A replace directive is ignored by anyone importing the module, so a
