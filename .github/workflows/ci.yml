@@ -142,7 +142,7 @@ jobs:
           # been restarted still has the previous boot's startup line in its
           # log and the check passes immediately against a broker that is not
           # up yet.
-          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           for i in $(seq 1 60); do
             if docker logs --since "$started" acemq-tls 2>&1 | grep -q "Server startup complete"; then
               echo "the broker is up"
@@ -259,7 +259,7 @@ jobs:
           # and without --since a restarted container matches the previous
           # boot's line immediately. 3.13 prints the same sentence, so none of
           # that needed weakening for the older broker.
-          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           for i in $(seq 1 60); do
             if docker logs --since "$started" acemq-tls-313 2>&1 | grep -q "Server startup complete"; then
               echo "the broker is up"

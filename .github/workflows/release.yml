@@ -161,7 +161,7 @@ jobs:
           # --since bounds this to the current boot. A restarted container
           # still carries the previous boot's startup line, and without the
           # bound the check passes against a broker that is not up.
-          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           for i in $(seq 1 60); do
             if docker logs --since "$started" acemq-tls 2>&1 | grep -q "Server startup complete"; then
               echo "the broker is up"
