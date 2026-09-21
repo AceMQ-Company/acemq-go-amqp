@@ -8,6 +8,36 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-21
+
+### Changed
+
+- **RabbitMQ 3.13 is now tested rather than assumed.** CI runs the broker suite
+  twice on every push, once against 4.x and once against 3.13, each generating
+  certificates and starting a broker that serves them so the TLS tests run on
+  both. Nothing in the library changed: the same fifty-two tests pass on each,
+  and the set of passing test names is identical. 3.13 is where most production
+  estates still are, and a version nothing runs against is a version nobody has
+  checked.
+- The README's version badge said **0.1.4**. The library was at 0.7.0 - six
+  minor versions adrift, on the first thing a reader sees. Java's release
+  rewrites its documented version and this one does not, so nothing had kept the
+  badge in step since 0.1.4 was current. Corrected, and the broker badge now
+  names the two versions that are actually tested instead of saying only
+  "RabbitMQ".
+
+### Fixed
+
+- The integration job's skip guard compared the passed count against 25 while
+  its error message said 23, so a real shortfall would have reported a threshold
+  the job does not use.
+- The broker readiness loop bounded `docker logs` with a `date -u` timestamp and
+  no zone. Docker reads a naked timestamp as host-local, so anywhere west of UTC
+  `--since` hid the very line being waited for and the loop reported a broker
+  that had started normally as one that never came up. It worked in CI only
+  because runners are UTC, and this is the copy somebody runs locally to
+  reproduce a failure, which is exactly when it misled.
+
 ## [telemetry/otel/v0.7.1] - 2026-09-20
 
 Tagged as `telemetry/otel/v0.7.1`. **Only the optional OpenTelemetry module is
