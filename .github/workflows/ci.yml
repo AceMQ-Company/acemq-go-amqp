@@ -322,3 +322,55 @@ jobs:
       - name: What the broker said, if anything went wrong
         if: failure()
         run: docker logs acemq-tls-313
+
+  badge-matches-the-release:
+    name: the README badge names the current release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare the version badge against the newest release tag
+        # A README badge is the first thing a reader sees and nothing keeps it
+        # in step. This one said 0.1.4 while the library was at 0.7.0 -- six
+        # minor versions, sitting at the top of the page, wrong since 0.1.4 was
+        # the truth. acemq-java-amqp stays correct only because its release
+        # rewrites the documented version; every other repository updates the
+        # badge by hand, which means sometimes.
+        #
+        # Tags come from ls-remote so this needs no token on a scheduled run.
+        # Only plain vX.Y.Z tags count: Go publishes nested modules as
+        # codec/avro/vX.Y.Z, and those are not the repository's version.
+        run: |
+          newest=$(git ls-remote --tags origin \
+            | sed -e 's#.*refs/tags/##' -e 's#\^{}$##' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sed 's/^v//' | sort -V | tail -1)
+          badge=$(grep -oE 'badge/version-[0-9][0-9.]*' README.md | head -1 | sed 's|badge/version-||')
+
+          if [ -z "$newest" ]; then
+            echo "no release tags yet, so there is nothing for the badge to disagree with"
+            exit 0
+          fi
+          if [ -z "$badge" ]; then
+            echo "::error::no version badge found in README.md, so this check cannot do its job"
+            exit 1
+          fi
+          # Behind is the failure; ahead is a release being prepared.
+          #
+          # The badge is bumped in the commit that readies a release, which is
+          # pushed before the tag exists -- so for a few minutes the badge names
+          # a version no tag does. Failing on any difference would redden that
+          # commit and block the release it is part of, which is the check
+          # sabotaging the thing it is meant to protect. Only a badge older than
+          # the newest release is wrong.
+          older=$(printf '%s\n%s\n' "$badge" "$newest" | sort -V | head -1)
+          if [ "$badge" != "$newest" ] && [ "$older" = "$badge" ]; then
+            echo "::error::the README badge says $badge but the newest release is $newest."
+            echo "::error::Edit the version badge in README.md and set it to $newest."
+            exit 1
+          fi
+          if [ "$badge" != "$newest" ]; then
+            echo "the badge says $badge and the newest release is $newest; a release looks to be in flight"
+            exit 0
+          fi
+          echo "the badge says $badge, which is the newest release"
