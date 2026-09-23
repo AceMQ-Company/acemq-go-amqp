@@ -249,6 +249,58 @@ jobs:
           fi
           echo "$passed broker tests passed"
 
+  # The releases page. This creates nothing a consumer needs -- the proxy already
+  # has the version, because in Go the tag *is* the release -- but a tag is not a
+  # release to anybody reading GitHub, and this page was empty while twelve
+  # versions were resolvable from the proxy.
+  #
+  # After the checks rather than beside them. The tag is already out, so nothing
+  # here can prevent anyone from resolving it; what the gate protects is the
+  # announcement. A release object is read as "this one is fit to depend on", and
+  # putting that on a version whose own checks did not pass is how somebody ends
+  # up depending on it before anyone has looked at the run. Tags only, so a
+  # workflow_dispatch against a branch still stops at the checks.
+  #
+  # Nothing is attached. There is no artifact to attach: a source archive here
+  # would be a second copy of what the proxy serves, hashed differently from the
+  # line go.sum records, and the first person to compare the two would be right
+  # to worry.
+  announce:
+    needs: [verify, integration]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "AceMQ for Go ${TAG#v}.
+
+          \`\`\`bash
+          go get github.com/AceMQ-Company/acemq-go-amqp@$TAG
+          \`\`\`
+
+          The optional modules are tagged at this same commit and carry the same version. Each is a module of its own, so each is asked for by name:
+
+          \`\`\`bash
+          go get github.com/AceMQ-Company/acemq-go-amqp/codec/yaml@$TAG
+          go get github.com/AceMQ-Company/acemq-go-amqp/codec/toml@$TAG
+          go get github.com/AceMQ-Company/acemq-go-amqp/codec/protobuf@$TAG
+          go get github.com/AceMQ-Company/acemq-go-amqp/codec/avro@$TAG
+          go get github.com/AceMQ-Company/acemq-go-amqp/telemetry/otel@$TAG
+          \`\`\`
+
+          Documentation: https://acemq.org/acemq-go-amqp/
+          Reference: https://pkg.go.dev/github.com/AceMQ-Company/acemq-go-amqp/amqp
+          Changelog: https://github.com/AceMQ-Company/acemq-go-amqp/blob/$TAG/CHANGELOG.md" \
+            || echo "release $TAG already exists"
+
   notify:
     needs: [verify, integration]
     if: always()

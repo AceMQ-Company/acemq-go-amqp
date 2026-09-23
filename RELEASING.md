@@ -103,6 +103,14 @@ against the proxy itself rather than trusting a local error:
 curl -s "https://proxy.golang.org/github.com/!ace!m!q-!company/acemq-go-amqp/codec/yaml/@v/list"
 ```
 
+The workflow creates the release on GitHub once the checks pass, with the
+`go get` line for the root module and one for each nested module. It is only an
+announcement — the proxy had the version the moment the tag was pushed — but a
+tag is not a release to anybody reading GitHub, and the page is where they look.
+Nothing is attached to it: there is no artifact, and a source archive here would
+be a second copy of what the proxy serves, hashed differently from the line
+`go.sum` records.
+
 ## The version line
 
 `0.7.x` until somebody decides otherwise. The release workflow refuses anything
