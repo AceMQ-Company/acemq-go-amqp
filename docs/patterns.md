@@ -242,6 +242,77 @@ key := patterns.PartitionedRoutingKey("orders", order.ID, 8)  // "orders.3"
 
 ## Pipelines
 
+### Declaring one
+
+A flow with named steps, each its own queue and its own consumers:
+
+```go
+pipeline, err := patterns.NewPipeline[Order](ctx, mq, "fulfilment",
+	patterns.PipelineStep("validate", validate),
+	patterns.PipelineStep("reserve", reserve,
+		patterns.StepConsumers(4),
+		patterns.StepRetry(acemq.ExponentialRetry(4, time.Second, time.Minute)),
+		patterns.StepDescribedAs("hold stock for 15 minutes so payment cannot oversell")),
+	patterns.PipelineStep("dispatch", dispatch))
+if err != nil {
+	return err
+}
+defer pipeline.Close()
+
+runID, err := pipeline.Send(ctx, Order{ID: "A-1"})
+```
+
+A step's handler takes what the previous one produced and returns what the next
+one consumes:
+
+```go
+func reserve(ctx context.Context, m acemq.Message[Order]) (Reservation, bool, error) {
+	if m.Payload.Digital {
+		return Reservation{}, false, nil    // nothing to reserve; the run stops here
+	}
+	return stock.Reserve(ctx, m.Payload)
+}
+```
+
+`NewPipeline` declares the exchange, one queue per step and the bindings, then
+starts the consumers — so a pipeline that returns without an error is one whose
+topology exists and whose steps are running. Declaring is idempotent and every
+service that declares the same pipeline agrees about it, which is what lets two
+services run different steps of one flow.
+
+Each step gets `{pipeline}.{step}`, so a slow stage is a deep queue you can see
+and scale on its own with `StepConsumers`. A single consumer doing all four in
+sequence gives you none of that.
+
+**The topology is Java's, to the letter**: exchange named for the pipeline and
+declared `direct`, queue `{pipeline}.{step}`, binding key the step's name, and the
+declared route carried on the message as `x-acemq-route` plus a position. So a
+Go-declared pipeline can be continued by a Java, .NET, Python or Ruby service, and
+a Go step can be one hop of a pipeline any of them declared — see
+[Being one step of a Java pipeline](#being-one-step-of-a-java-pipeline) for that
+direction, which needs no `Pipeline` at all.
+
+**What Go cannot do, and says instead.** Java's builder threads the types through
+at compile time: a step producing a `Reservation` can only be followed by one
+consuming a `Reservation`. Go's generics cannot express that — a method cannot
+introduce type parameters, so a fluent chain cannot carry the previous step's
+output type forward. Each step is built on its own and `NewPipeline` checks the
+chain with reflection when it assembles it:
+
+```
+acemq: pipeline "fulfilment" step "reserve" produces patterns_test.Reservation
+but the next step "dispatch" consumes patterns_test.Order
+```
+
+A worse guarantee than Java's, and the honest one: it fails at start-up rather
+than on the first message, and it names both steps and both types.
+
+Nothing here logs. `pipeline.Describe()` returns the one-line summary — steps and
+their descriptions — for you to log where you log things, because a library that
+picks a logger picks it for every application that imports it.
+
+### Wrapping one handler
+
 ```go
 handler := patterns.Chain(handle,
 	patterns.WithLogging[OrderPlaced](log.Printf),

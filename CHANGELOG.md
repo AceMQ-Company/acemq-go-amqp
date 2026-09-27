@@ -8,6 +8,41 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-27
+
+### Added
+
+- **A pipeline Go can declare, rather than only join.** `NewPipeline` takes a name
+  and its steps, declares the exchange, one queue per step and the bindings, and
+  starts a consumer on each — then `Send` starts a run and returns its identifier.
+  Until now a four-step flow in Go meant four services each naming the same
+  pipeline through `InPipeline`/`AtStep` and each declaring its own queue, with
+  nothing holding the shape in one place. Java, .NET, Python and Ruby all had the
+  declaration; this is Go's.
+
+  `PipelineStep` builds one step, with `StepConsumers` to scale a slow stage on its
+  own, `StepRetry` to give it a schedule of its own, `StepDescribedAs` for the
+  humans, and `StepConsumeWith` as the escape hatch. A step returning `false`
+  publishes nothing and reports `ended_early`, which is the same three-value shape
+  `Then` already used.
+
+  **The topology is Java's to the letter** — exchange named for the pipeline and
+  declared `direct`, queue `{pipeline}.{step}`, binding key the step's name, and the
+  declared route carried as `x-acemq-route` with a position — so a Go-declared
+  pipeline can be continued by any of the other four, and a Go step can be one hop
+  of a pipeline any of them declared. A test asserts the hop arrives carrying the
+  route, the advanced position and the unchanged run identifier.
+
+  What Go cannot do is check the chain at compile time: a method cannot introduce
+  type parameters, so a fluent builder cannot carry the previous step's output type
+  forward. `NewPipeline` checks it with reflection instead and fails at start-up
+  naming both steps and both types. That is stated in the package documentation
+  rather than glossed over.
+
+  Nothing in the package logs: `Pipeline.Describe()` returns the one-line summary
+  for the application to log, because a library that picks a logger picks it for
+  everything that imports it.
+
 ## [0.9.0] - 2026-09-27
 
 ### Fixed
