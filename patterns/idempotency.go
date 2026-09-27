@@ -27,14 +27,36 @@ import (
 // Retries and redeliveries mean a message can arrive more than once, so a
 // handler that changes anything needs to be able to tell. [acemq.Envelope.ID]
 // is stable across every redelivery of the same message and is the natural key.
+// The three-step shape is deliberate, and it is what makes this safe under
+// failure. A store offering "have I seen this?" and "record that I have" loses
+// either way round: record before the handler and a crash mid-handler means the
+// work never happens and never can, because the message now looks handled;
+// record after and two concurrent deliveries both pass the check. Claiming,
+// then confirming only on success and releasing on failure, closes both.
+//
+// This interface had two methods until 0.8.0 and was the first of the five
+// libraries to have it wrong. A claim was an insert with no expiry and no
+// confirm, so a process killed between claiming and finishing left a row
+// indistinguishable from a completion -- and the redelivery was accepted
+// without the work ever being done. Java, .NET, Python and Ruby all had a lease;
+// Go did not, and nothing detected it because the loss is silent: no error, no
+// duplicate, no metric, just work that never happened.
 type IdempotencyStore interface {
-	// FirstTime records the key and reports whether this is the first time it
-	// has been seen. It must be atomic: two consumers handling the same message
-	// at once must not both be told they are first.
-	FirstTime(ctx context.Context, key string) (bool, error)
+	// Claim takes ownership of a key, and reports whether this caller got it.
+	//
+	// It must be atomic: two consumers handling the same message at once must not
+	// both be told they own it. A claim that nobody confirms or releases must
+	// become claimable again after a while, because the only thing that abandons
+	// one is a process that died, and its work still needs doing.
+	Claim(ctx context.Context, key string) (bool, error)
 
-	// Forget removes a key, so a message that failed can be tried again.
-	Forget(ctx context.Context, key string) error
+	// Confirm records that the work for a key is done. A key confirmed is a key
+	// whose redelivery must be accepted without running the handler again.
+	Confirm(ctx context.Context, key string) error
+
+	// Release gives up a claim without confirming it, so a message that failed
+	// can be tried again.
+	Release(ctx context.Context, key string) error
 }
 
 // InMemoryIdempotencyStore remembers keys in this process.
@@ -48,8 +70,21 @@ type IdempotencyStore interface {
 // transaction, which is the only arrangement that actually holds.
 type InMemoryIdempotencyStore struct {
 	mu   sync.Mutex
-	seen map[string]time.Time
+	seen map[string]entry
 	ttl  time.Duration
+
+	// claimTimeout is how long a claim nobody confirmed stays somebody's.
+	//
+	// It exists because the alternative is losing work: a claim with no expiry,
+	// left behind by a process that was killed, suppresses the redelivery for
+	// ever. Five minutes matches Java, Python and Ruby.
+	claimTimeout time.Duration
+}
+
+// entry is one key, and whether the work for it finished.
+type entry struct {
+	at        time.Time
+	confirmed bool
 }
 
 // NewInMemoryIdempotencyStore remembers keys for a window.
@@ -61,11 +96,35 @@ func NewInMemoryIdempotencyStore(ttl time.Duration) *InMemoryIdempotencyStore {
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
-	return &InMemoryIdempotencyStore{seen: map[string]time.Time{}, ttl: ttl}
+	return &InMemoryIdempotencyStore{
+		seen:         map[string]entry{},
+		ttl:          ttl,
+		claimTimeout: DefaultClaimTimeout,
+	}
 }
 
-// FirstTime records a key and says whether it is new.
-func (s *InMemoryIdempotencyStore) FirstTime(_ context.Context, key string) (bool, error) {
+// DefaultClaimTimeout is how long an unconfirmed claim is honoured before another
+// consumer may take it. The same five minutes Java, Python and Ruby use.
+const DefaultClaimTimeout = 5 * time.Minute
+
+// SetClaimTimeout changes how long an unconfirmed claim is honoured.
+//
+// Worth shortening in a test that wants to watch a claim expire; worth leaving
+// alone otherwise. It must comfortably exceed the longest a handler can take, or
+// a slow handler's message is handed to a second consumer while the first is
+// still working on it.
+func (s *InMemoryIdempotencyStore) SetClaimTimeout(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if d <= 0 {
+		d = DefaultClaimTimeout
+	}
+	s.claimTimeout = d
+}
+
+// Claim takes a key, unless it is confirmed or claimed by somebody still inside
+// the claim window.
+func (s *InMemoryIdempotencyStore) Claim(_ context.Context, key string) (bool, error) {
 	now := time.Now()
 
 	s.mu.Lock()
@@ -73,21 +132,38 @@ func (s *InMemoryIdempotencyStore) FirstTime(_ context.Context, key string) (boo
 
 	// Swept here rather than on a timer, so the store needs no goroutine and
 	// nothing to close.
-	for k, at := range s.seen {
-		if now.Sub(at) > s.ttl {
+	for k, e := range s.seen {
+		if now.Sub(e.at) > s.ttl {
 			delete(s.seen, k)
 		}
 	}
 
-	if _, present := s.seen[key]; present {
-		return false, nil
+	if e, present := s.seen[key]; present {
+		// Confirmed is done, and stays done for the retention window.
+		if e.confirmed {
+			return false, nil
+		}
+		// An unconfirmed claim inside its window belongs to whoever took it.
+		if now.Sub(e.at) <= s.claimTimeout {
+			return false, nil
+		}
+		// Outside the window: whoever held it is not coming back, and the work
+		// still has to happen.
 	}
-	s.seen[key] = now
+	s.seen[key] = entry{at: now}
 	return true, nil
 }
 
-// Forget removes a key.
-func (s *InMemoryIdempotencyStore) Forget(_ context.Context, key string) error {
+// Confirm records that the work is done.
+func (s *InMemoryIdempotencyStore) Confirm(_ context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seen[key] = entry{at: time.Now(), confirmed: true}
+	return nil
+}
+
+// Release gives up a claim without confirming it.
+func (s *InMemoryIdempotencyStore) Release(_ context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.seen, key)
@@ -127,7 +203,7 @@ func Idempotent[T any](
 	return func(ctx context.Context, m acemq.Message[T]) acemq.Ack {
 		key := m.Envelope.ID
 
-		first, err := store.FirstTime(ctx, key)
+		first, err := store.Claim(ctx, key)
 		if err != nil {
 			// The store is the thing that is broken, not the message. Retrying
 			// is right; carrying on and risking a duplicate is not.
@@ -138,10 +214,15 @@ func Idempotent[T any](
 		}
 
 		ack := handler(ctx, m)
-		if ack.String() != "accept" {
-			// It did not work, so it has not been handled. Forgetting lets the
+		if ack.String() == "accept" {
+			// Done, and recorded as done rather than merely claimed -- which is
+			// what lets a claim left behind by a crash expire without this one
+			// expiring with it.
+			_ = store.Confirm(ctx, key)
+		} else {
+			// It did not work, so it has not been handled. Releasing lets the
 			// retry actually run.
-			_ = store.Forget(ctx, key)
+			_ = store.Release(ctx, key)
 		}
 		return ack
 	}
@@ -162,7 +243,7 @@ func IdempotentBy[T any](
 				"acemq: message %s produced an empty idempotency key", m.Envelope.ID))
 		}
 
-		first, err := store.FirstTime(ctx, k)
+		first, err := store.Claim(ctx, k)
 		if err != nil {
 			return acemq.Retry(err)
 		}
@@ -171,8 +252,10 @@ func IdempotentBy[T any](
 		}
 
 		ack := handler(ctx, m)
-		if ack.String() != "accept" {
-			_ = store.Forget(ctx, k)
+		if ack.String() == "accept" {
+			_ = store.Confirm(ctx, k)
+		} else {
+			_ = store.Release(ctx, k)
 		}
 		return ack
 	}

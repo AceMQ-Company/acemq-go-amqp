@@ -7,7 +7,7 @@ module github.com/AceMQ-Company/acemq-go-amqp/codec/yaml
 go 1.23
 
 require (
-	github.com/AceMQ-Company/acemq-go-amqp v0.7.2
+	github.com/AceMQ-Company/acemq-go-amqp v0.8.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

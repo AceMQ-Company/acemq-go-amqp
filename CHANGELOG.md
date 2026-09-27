@@ -8,6 +8,51 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-27
+
+### Fixed
+
+- **A crash mid-handler no longer loses the work.** `IdempotencyStore` recorded a
+  key before the handler ran and had no way to say the handler had finished, so a
+  process killed in between left a row indistinguishable from a completion. Nothing
+  released it — nothing runs when a process is killed — and the redelivery was
+  accepted without the work ever being done. Not a duplicate, which this pattern is
+  allowed to produce: a silent loss, in the pattern that exists to prevent exactly
+  that. No error, no metric, no duplicate; just work that never happened.
+
+  Java, .NET, Python and Ruby all expire an unconfirmed claim. Go was the only one
+  of the five that did not, and the gap was invisible to every test because a test
+  that does not kill a process mid-handler cannot see it.
+
+### Changed
+
+- **`IdempotencyStore` is three methods, not two.** `FirstTime`/`Forget` become
+  `Claim`/`Confirm`/`Release`, matching Java, .NET, Python and Ruby. The third
+  method is the fix above: without somewhere to record that the work finished, a
+  claim and a completion are the same row.
+
+  The two-method shape could not be repaired from inside the implementation, so
+  anyone with their own `IdempotencyStore` has to add `Confirm` and rename the
+  other two. A store that keeps the old two-method behaviour keeps the defect.
+
+- **`SQLIdempotencyStore` gains a `confirmed` column.** Existing tables need a
+  migration:
+
+  ```sql
+  ALTER TABLE acemq_idempotency ADD COLUMN confirmed BOOLEAN NOT NULL DEFAULT TRUE;
+  ```
+
+  `DEFAULT TRUE` rather than `FALSE` deliberately: every existing row was written
+  by code that treated it as handled, so calling them confirmed preserves the
+  suppression that was intended. New rows default to `FALSE` — claimed, not yet
+  done.
+
+- **An unconfirmed claim expires after `DefaultClaimTimeout`** (five minutes, as in
+  Java, Python and Ruby), after which another consumer may take it. Adjust with
+  `SetClaimTimeout` on either store, and keep it comfortably above the slowest
+  handler — and keep `Prune`'s cutoff comfortably above *it*, or housekeeping
+  deletes a claim somebody is working under.
+
 ## [0.7.2] - 2026-09-21
 
 ### Changed

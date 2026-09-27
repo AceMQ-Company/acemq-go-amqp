@@ -100,6 +100,24 @@ type SQLIdempotencyStore struct {
 	db      DB
 	dialect Dialect
 	table   string
+
+	// claimTimeout is how long a claim nobody confirmed stays somebody's.
+	//
+	// Without one, a row left behind by a process that was killed mid-handler is
+	// indistinguishable from a completed one, and it suppresses the redelivery for
+	// ever: the work is silently lost. Five minutes matches Java, Python and Ruby.
+	claimTimeout time.Duration
+}
+
+// SetClaimTimeout changes how long an unconfirmed claim is honoured.
+//
+// It must comfortably exceed the longest a handler can take, or a slow handler's
+// message is handed to a second consumer while the first is still working on it.
+func (s *SQLIdempotencyStore) SetClaimTimeout(d time.Duration) {
+	if d <= 0 {
+		d = DefaultClaimTimeout
+	}
+	s.claimTimeout = d
 }
 
 // NewSQLIdempotencyStore uses the table named by [SQLIdempotencyStore.Schema].
@@ -108,7 +126,9 @@ func NewSQLIdempotencyStore(db DB, dialect Dialect, table ...string) *SQLIdempot
 	if len(table) > 0 && table[0] != "" {
 		name = table[0]
 	}
-	return &SQLIdempotencyStore{db: db, dialect: dialect, table: name}
+	return &SQLIdempotencyStore{
+		db: db, dialect: dialect, table: name, claimTimeout: DefaultClaimTimeout,
+	}
 }
 
 // Schema is the table this store needs.
@@ -117,40 +137,88 @@ func NewSQLIdempotencyStore(db DB, dialect Dialect, table ...string) *SQLIdempot
 // somebody's database on start-up is a library that fights their migration
 // tool. Put it in a migration.
 func (s *SQLIdempotencyStore) Schema() string {
+	// `confirmed` is the column that makes this crash-safe, and the table had no
+	// equivalent of it until 0.8.0. A row used to mean only "somebody has seen this
+	// key", which a process killed mid-handler leaves behind looking exactly like a
+	// completion -- so the redelivery was accepted and the work never done. Telling a
+	// claim from a completion is the whole point of it.
+	//
+	// An upgrade needs a migration:
+	//
+	//	ALTER TABLE acemq_idempotency ADD COLUMN confirmed BOOLEAN NOT NULL DEFAULT TRUE;
+	//
+	// DEFAULT TRUE rather than FALSE on purpose: existing rows were written by the
+	// old code, which only ever wrote a row it treated as handled. Calling them
+	// confirmed keeps their suppression, which is the behaviour that was intended.
 	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
   key         VARCHAR(255) PRIMARY KEY,
-  handled_at  TIMESTAMP    NOT NULL
+  handled_at  TIMESTAMP    NOT NULL,
+  confirmed   BOOLEAN      NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS %s_handled_at ON %s (handled_at);`, s.table, s.table, s.table)
 }
 
-// FirstTime claims a key, and reports whether this caller got it.
+// Claim takes a key, unless it is confirmed or claimed by somebody still inside
+// the claim window.
 //
-// The claim is an insert that does nothing when the key is already there, and
-// the answer is whether a row was written. That makes it atomic in the database
-// rather than in this process, which is what two consumers racing requires.
-func (s *SQLIdempotencyStore) FirstTime(ctx context.Context, key string) (bool, error) {
-	args := s.dialect.args(2)
-	query := fmt.Sprintf("INSERT INTO %s (key, handled_at) VALUES (%s, %s)%s",
-		s.table, args[0], args[1], s.dialect.InsertIgnoreSuffix)
+// Two statements rather than one, and in this order. The insert is the fast path
+// and is atomic in the database rather than in this process, which is what two
+// consumers racing requires. The update is the recovery path: it takes a claim
+// that is unconfirmed and stale, which is what a process killed mid-handler leaves
+// behind, and it is conditional on both so it cannot steal a live claim or reopen
+// finished work.
+func (s *SQLIdempotencyStore) Claim(ctx context.Context, key string) (bool, error) {
+	now := time.Now().UTC()
 
-	result, err := s.db.ExecContext(ctx, query, key, time.Now().UTC())
+	args := s.dialect.args(3)
+	insert := fmt.Sprintf("INSERT INTO %s (key, handled_at, confirmed) VALUES (%s, %s, %s)%s",
+		s.table, args[0], args[1], args[2], s.dialect.InsertIgnoreSuffix)
+
+	result, err := s.db.ExecContext(ctx, insert, key, now, false)
 	if err != nil {
 		return false, fmt.Errorf("acemq: cannot claim idempotency key %q: %w", key, err)
 	}
-
-	affected, err := result.RowsAffected()
-	if err != nil {
-		// Some drivers do not report it. Saying "not first" would drop the
-		// message; saying "first" risks a duplicate, which is the recoverable
+	if affected, err := result.RowsAffected(); err != nil {
+		// Some drivers do not report it. Saying "not claimed" would drop the
+		// message; saying "claimed" risks a duplicate, which is the recoverable
 		// half of the choice.
 		return true, nil
+	} else if affected > 0 {
+		return true, nil
+	}
+
+	// The key is already there. Take it only if it was claimed and abandoned.
+	steal := s.dialect.args(3)
+	update := fmt.Sprintf(
+		"UPDATE %s SET handled_at = %s WHERE key = %s AND confirmed = FALSE AND handled_at < %s",
+		s.table, steal[0], steal[1], steal[2])
+
+	stolen, err := s.db.ExecContext(ctx, update, now, key, now.Add(-s.claimTimeout))
+	if err != nil {
+		return false, fmt.Errorf("acemq: cannot reclaim idempotency key %q: %w", key, err)
+	}
+	affected, err := stolen.RowsAffected()
+	if err != nil {
+		// Cannot tell whether the stale claim was taken. Not claiming is the safe
+		// answer here: the alternative is two consumers believing they own it.
+		return false, nil
 	}
 	return affected > 0, nil
 }
 
-// Forget releases a key so a failed message can be tried again.
-func (s *SQLIdempotencyStore) Forget(ctx context.Context, key string) error {
+// Confirm records that the work for a key is done.
+func (s *SQLIdempotencyStore) Confirm(ctx context.Context, key string) error {
+	args := s.dialect.args(2)
+	query := fmt.Sprintf("UPDATE %s SET confirmed = TRUE, handled_at = %s WHERE key = %s",
+		s.table, args[0], args[1])
+	if _, err := s.db.ExecContext(ctx, query, time.Now().UTC(), key); err != nil {
+		return fmt.Errorf("acemq: cannot confirm idempotency key %q: %w", key, err)
+	}
+	return nil
+}
+
+// Release gives up a claim so a failed message can be tried again.
+func (s *SQLIdempotencyStore) Release(ctx context.Context, key string) error {
 	query := fmt.Sprintf("DELETE FROM %s WHERE key = %s", s.table, s.dialect.Placeholder(1))
 	if _, err := s.db.ExecContext(ctx, query, key); err != nil {
 		return fmt.Errorf("acemq: cannot release idempotency key %q: %w", key, err)

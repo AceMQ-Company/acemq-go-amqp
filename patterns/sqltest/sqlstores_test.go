@@ -85,11 +85,11 @@ func TestAKeyIsClaimedOnce(t *testing.T) {
 	store := patterns.NewSQLIdempotencyStore(db, patterns.SQLiteDialect)
 	apply(t, db, store.Schema())
 
-	first, err := store.FirstTime(ctx, "m-1")
+	first, err := store.Claim(ctx, "m-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.FirstTime(ctx, "m-1")
+	second, err := store.Claim(ctx, "m-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestAKeyIsClaimedOnce(t *testing.T) {
 	}
 }
 
-func TestAForgottenKeyCanBeClaimedAgain(t *testing.T) {
+func TestAReleasedKeyCanBeClaimedAgain(t *testing.T) {
 	// The ordering that makes this a duplicate guard rather than a message
 	// eater: a failed message has to be able to run again.
 	ctx := context.Background()
@@ -110,19 +110,19 @@ func TestAForgottenKeyCanBeClaimedAgain(t *testing.T) {
 	store := patterns.NewSQLIdempotencyStore(db, patterns.SQLiteDialect)
 	apply(t, db, store.Schema())
 
-	if _, err := store.FirstTime(ctx, "m-1"); err != nil {
+	if _, err := store.Claim(ctx, "m-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Forget(ctx, "m-1"); err != nil {
+	if err := store.Release(ctx, "m-1"); err != nil {
 		t.Fatal(err)
 	}
 
-	again, err := store.FirstTime(ctx, "m-1")
+	again, err := store.Claim(ctx, "m-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !again {
-		t.Error("a forgotten key was still remembered, so the retry would silently do nothing")
+		t.Error("a released key was still held, so the retry would silently do nothing")
 	}
 }
 
@@ -139,7 +139,7 @@ func TestClaimingInATransactionHoldsWithTheWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	inTx := patterns.NewSQLIdempotencyStore(tx, patterns.SQLiteDialect)
-	if _, err := inTx.FirstTime(ctx, "m-1"); err != nil {
+	if _, err := inTx.Claim(ctx, "m-1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Rollback(); err != nil {
@@ -147,7 +147,7 @@ func TestClaimingInATransactionHoldsWithTheWork(t *testing.T) {
 	}
 
 	after := patterns.NewSQLIdempotencyStore(db, patterns.SQLiteDialect)
-	first, err := after.FirstTime(ctx, "m-1")
+	first, err := after.Claim(ctx, "m-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestPruningRemovesOldKeys(t *testing.T) {
 	store := patterns.NewSQLIdempotencyStore(db, patterns.SQLiteDialect)
 	apply(t, db, store.Schema())
 
-	if _, err := store.FirstTime(ctx, "old"); err != nil {
+	if _, err := store.Claim(ctx, "old"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -416,5 +416,90 @@ func TestALookupThatFindsNothingSaysSo(t *testing.T) {
 	}
 	if _, err := registry.Latest(ctx, "nothing"); !errors.Is(err, patterns.ErrSchemaNotFound) {
 		t.Errorf("got %v, want ErrSchemaNotFound", err)
+	}
+}
+
+// The claim a killed process leaves behind, against the real store.
+//
+// This is the defect 0.8.0 fixed, and the table is where it lived: a row used to say
+// only "somebody has seen this key", so a process killed mid-handler left one that
+// suppressed the redelivery for ever and the work was silently lost. The `confirmed`
+// column is what tells a claim from a completion, and the claim timeout is what lets
+// an abandoned one go.
+func TestAnAbandonedClaimExpiresAndTheWorkCanBeDone(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	store := patterns.NewSQLIdempotencyStore(db, patterns.SQLiteDialect)
+	apply(t, db, store.Schema())
+	store.SetClaimTimeout(time.Millisecond)
+
+	// The process that is about to be killed claims the key, and never confirms.
+	claimed, err := store.Claim(ctx, "m-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatal("a fresh key must be claimable")
+	}
+
+	time.Sleep(20 * time.Millisecond)
+
+	// The consumer that took over gets the redelivery.
+	again, err := store.Claim(ctx, "m-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again {
+		t.Fatal("an abandoned claim still suppresses the redelivery: the work a killed " +
+			"process never finished would be silently dropped")
+	}
+}
+
+// A confirmed key is a completion, and no timeout reopens it.
+func TestAConfirmedKeyIsNotReclaimedWhenTheClaimWindowPasses(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	store := patterns.NewSQLIdempotencyStore(db, patterns.SQLiteDialect)
+	apply(t, db, store.Schema())
+	store.SetClaimTimeout(time.Millisecond)
+
+	if _, err := store.Claim(ctx, "m-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Confirm(ctx, "m-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+
+	again, err := store.Claim(ctx, "m-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again {
+		t.Error("a confirmed key was reclaimed after the claim window, so completed work " +
+			"would be done twice")
+	}
+}
+
+// A live claim is not stealable, which is the other half of the window: two consumers
+// must not both hold the same key while the first is still working.
+func TestALiveClaimIsNotStolen(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	store := patterns.NewSQLIdempotencyStore(db, patterns.SQLiteDialect)
+	apply(t, db, store.Schema())
+	store.SetClaimTimeout(time.Hour)
+
+	if _, err := store.Claim(ctx, "m-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	again, err := store.Claim(ctx, "m-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again {
+		t.Error("a claim inside its window was taken by a second caller")
 	}
 }

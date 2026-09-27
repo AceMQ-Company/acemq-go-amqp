@@ -89,20 +89,41 @@ handler := patterns.IdempotentBy(store,
 The work was done, so the message has been handled. Dead-lettering it would raise
 an alarm about something that went right.
 
-### The key is forgotten when the handler fails
+### Three methods, because two lose work
 
 ```go
-FirstTime(ctx, key) (bool, error)   // claim
-Forget(ctx, key) error              // release
+Claim(ctx, key) (bool, error)   // take it, if nobody has it
+Confirm(ctx, key) error         // the work is done
+Release(ctx, key) error         // it failed; let the retry run
 ```
 
-Two methods, not three. When the handler fails, `Idempotent` calls `Forget`, so
-the retry can run. That is the honest ordering — remembering a message that then
-failed would mean the retry silently does nothing — and it is why this is a guard
-against duplicates rather than a guarantee of exactly-once. Between the handler
-finishing and the acknowledgement reaching the broker, a crash still leaves a
-message that will be delivered again. Only a store written in the same
-transaction as the work closes that gap, which is the next section.
+`Idempotent` claims, runs your handler, then confirms on success and releases on
+failure.
+
+The third method is the one worth explaining, because this library shipped without
+it until 0.8.0 and the omission lost work. With only a claim and a release, a row
+in the store means "somebody has seen this key" and nothing more — so a process
+killed *mid-handler* leaves a row indistinguishable from a finished one. Nothing
+releases it, because nothing runs. The broker redelivers, the store says "already
+handled", the message is accepted, and the work never happens. Not a duplicate,
+which this pattern is allowed to produce: a silent loss, which is the thing it
+exists to prevent.
+
+A confirmed key suppresses redeliveries for the retention window. An unconfirmed
+claim is honoured only for `DefaultClaimTimeout` — five minutes — after which
+another consumer may take it, because the only thing that abandons a claim is a
+process that died and its work still needs doing. Set it above your slowest
+handler:
+
+```go
+store.SetClaimTimeout(15 * time.Minute)
+```
+
+None of this makes the pattern exactly-once. Between your handler finishing and
+the acknowledgement reaching the broker, a crash still leaves a message that will
+be delivered again — and the claim is confirmed by then, so the redelivery is
+correctly accepted without repeating the work. Only a store written in the same
+transaction as the work closes the remaining gap, which is the next section.
 
 ### The in-memory one is not enough
 
@@ -140,7 +161,8 @@ is already there" — and getting either wrong fails at runtime on one database 
 not another.
 
 Keys do not expire by themselves. `store.Prune(ctx, 30*24*time.Hour)` on a
-schedule is the housekeeping.
+schedule is the housekeeping. Keep the cutoff well above the claim timeout: a
+cutoff shorter than it would delete a claim somebody is still working under.
 
 ## Closing the gap properly
 
@@ -154,8 +176,9 @@ func handle(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	first, err := patterns.NewSQLIdempotencyStore(tx, patterns.SQLiteDialect).
-		FirstTime(ctx, m.Envelope.ID)
+	store := patterns.NewSQLIdempotencyStore(tx, patterns.SQLiteDialect)
+
+	first, err := store.Claim(ctx, m.Envelope.ID)
 	if err != nil {
 		return acemq.Retry(err)
 	}
@@ -164,6 +187,12 @@ func handle(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
 	}
 
 	if err := charge(ctx, tx, m.Payload); err != nil {
+		return acemq.Retry(err)
+	}
+	// Confirmed inside the transaction, so the key is marked done by the same
+	// commit that does the work. A crash before the commit rolls both back and the
+	// redelivery reclaims cleanly; a crash after it finds the key confirmed.
+	if err := store.Confirm(ctx, m.Envelope.ID); err != nil {
 		return acemq.Retry(err)
 	}
 	if err := tx.Commit(); err != nil {

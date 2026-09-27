@@ -332,16 +332,17 @@ func TestAStoreThatIsBrokenRetriesRatherThanRisksADuplicate(t *testing.T) {
 
 type failingStore struct{}
 
-func (failingStore) FirstTime(context.Context, string) (bool, error) {
+func (failingStore) Claim(context.Context, string) (bool, error) {
 	return false, errors.New("the store is unreachable")
 }
-func (failingStore) Forget(context.Context, string) error { return nil }
+func (failingStore) Confirm(context.Context, string) error { return nil }
+func (failingStore) Release(context.Context, string) error { return nil }
 
 func TestTheWindowStopsTheStoreGrowingForEver(t *testing.T) {
 	store := patterns.NewInMemoryIdempotencyStore(50 * time.Millisecond)
 
 	for i := range 10 {
-		if _, err := store.FirstTime(context.Background(), string(rune('a'+i))); err != nil {
+		if _, err := store.Claim(context.Background(), string(rune('a'+i))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -352,7 +353,7 @@ func TestTheWindowStopsTheStoreGrowingForEver(t *testing.T) {
 	time.Sleep(120 * time.Millisecond)
 	// The sweep happens on use rather than on a timer, so the store needs no
 	// goroutine and nothing to close.
-	if _, err := store.FirstTime(context.Background(), "z"); err != nil {
+	if _, err := store.Claim(context.Background(), "z"); err != nil {
 		t.Fatal(err)
 	}
 

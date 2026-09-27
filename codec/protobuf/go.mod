@@ -4,7 +4,7 @@ module github.com/AceMQ-Company/acemq-go-amqp/codec/protobuf
 go 1.23
 
 require (
-	github.com/AceMQ-Company/acemq-go-amqp v0.7.2
+	github.com/AceMQ-Company/acemq-go-amqp v0.8.0
 	google.golang.org/protobuf v1.36.10
 )
 
