@@ -47,7 +47,27 @@ type OutboxRecord struct {
 
 	// CreatedAt is when it was written.
 	CreatedAt time.Time
+
+	// Attempts is how many times publishing this record has failed.
+	//
+	// The relay publishes in the order records were written and stops at the
+	// first failure, so a record the broker will never take — an exchange
+	// somebody deleted, a payload a policy will always refuse — would otherwise
+	// be retried on every sweep and hold up everything written after it for
+	// ever. Once this reaches the store's maximum the record stops being
+	// offered, and the queue behind it moves.
+	Attempts int
+
+	// LastError is what went wrong the last time, so an operator finding a stuck
+	// record reads the reason off the record instead of correlating a log line
+	// from ten sweeps ago.
+	LastError string
 }
+
+// DefaultOutboxMaxAttempts is how many failures a record takes before a store
+// stops offering it to the relay. The same ten Python and Ruby use, so a record
+// that is stuck is stuck after the same number of tries in all three.
+const DefaultOutboxMaxAttempts = 10
 
 // OutboxStore holds messages that have been decided but not yet published.
 //
@@ -70,6 +90,24 @@ type OutboxStore interface {
 	MarkPublished(ctx context.Context, id string) error
 }
 
+// outboxFailureRecorder is the part of a store that bounds how long the relay
+// stops at a record nothing can publish.
+//
+// Deliberately not part of [OutboxStore]. Adding a method to that interface
+// would stop every custom store compiling, and the cost of that is higher than
+// the cost of a store without this keeping the behaviour it already has: a
+// record the broker will never take is retried on every sweep and holds up
+// everything behind it. The relay type-asserts for this and calls it when it is
+// there; both stores here have it.
+//
+// A custom store should implement it, and exclude records at the limit from
+// Pending:
+//
+//	func (s *MyStore) RecordFailure(ctx context.Context, id, cause string) error
+type outboxFailureRecorder interface {
+	RecordFailure(ctx context.Context, id, cause string) error
+}
+
 // InMemoryOutboxStore is an outbox in this process.
 //
 // It has none of the property the pattern exists for: nothing here shares a
@@ -79,11 +117,34 @@ type OutboxStore interface {
 type InMemoryOutboxStore struct {
 	mu      sync.Mutex
 	records map[string]OutboxRecord
+
+	// maxAttempts is how many failures a record takes before it stops being
+	// offered. See [DefaultOutboxMaxAttempts].
+	maxAttempts int
 }
 
 // NewInMemoryOutboxStore returns an empty store.
 func NewInMemoryOutboxStore() *InMemoryOutboxStore {
-	return &InMemoryOutboxStore{records: map[string]OutboxRecord{}}
+	return &InMemoryOutboxStore{
+		records:     map[string]OutboxRecord{},
+		maxAttempts: DefaultOutboxMaxAttempts,
+	}
+}
+
+// SetMaxAttempts changes how many failures a record takes before it stops being
+// offered to the relay.
+//
+// Worth shortening in a test that wants to watch a record retire; worth leaving
+// alone otherwise. Anything below one is read as the default, because a store
+// that retires a record before trying it once is an outbox that publishes
+// nothing.
+func (s *InMemoryOutboxStore) SetMaxAttempts(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n < 1 {
+		n = DefaultOutboxMaxAttempts
+	}
+	s.maxAttempts = n
 }
 
 // Add records a message.
@@ -109,6 +170,13 @@ func (s *InMemoryOutboxStore) Pending(_ context.Context, limit int) ([]OutboxRec
 
 	out := make([]OutboxRecord, 0, len(s.records))
 	for _, r := range s.records {
+		// A record that has run out of attempts is skipped, which is what lets
+		// the relay past it: it stops at the first failure to keep the order the
+		// writer chose, and without this bound it stops at the same record for
+		// ever.
+		if r.Attempts >= s.maxAttempts {
+			continue
+		}
 		out = append(out, r)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
@@ -126,7 +194,43 @@ func (s *InMemoryOutboxStore) MarkPublished(_ context.Context, id string) error 
 	return nil
 }
 
-// Len is how many records are waiting.
+// RecordFailure counts a failed publish against a record, and says why.
+//
+// The record is kept either way. One nothing could publish is evidence: somebody
+// has to be able to read it, fix whatever refuses it and release it, and
+// deleting it would be the silent loss this pattern exists to prevent arrived at
+// from another direction.
+func (s *InMemoryOutboxStore) RecordFailure(_ context.Context, id, cause string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, present := s.records[id]
+	if !present {
+		return nil
+	}
+	record.Attempts++
+	record.LastError = cause
+	s.records[id] = record
+	return nil
+}
+
+// Retired is the records the relay has stopped trying.
+//
+// Nothing else surfaces them: Pending exists to skip them, so without this they
+// are invisible.
+func (s *InMemoryOutboxStore) Retired() []OutboxRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []OutboxRecord
+	for _, r := range s.records {
+		if r.Attempts >= s.maxAttempts {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// Len is how many records are held, retired ones included.
 func (s *InMemoryOutboxStore) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -276,6 +380,19 @@ func (r *OutboxRelay) Sweep(ctx context.Context) (int, error) {
 			// intended.
 			acemq.ObserveOutbox(observer, record.Exchange, record.RoutingKey,
 				acemq.OutcomeFailed, 0)
+
+			// Counted against the record too, so stopping here is bounded. A
+			// record the broker will never take would otherwise hold up
+			// everything written after it on every tick, for ever.
+			//
+			// Optional on the store, so a custom one keeps compiling and keeps
+			// the behaviour it already has — see [outboxFailureRecorder]. A
+			// failure to write the count is not worth losing the publish error
+			// over: that error is what the caller needs, and the next sweep will
+			// try to count again.
+			if recorder, ok := r.store.(outboxFailureRecorder); ok {
+				_ = recorder.RecordFailure(ctx, record.ID, err.Error())
+			}
 			return published, fmt.Errorf(
 				"acemq: cannot publish outbox record %s: %w", record.ID, err)
 		}

@@ -250,6 +250,10 @@ type SQLOutboxStore struct {
 	db      DB
 	dialect Dialect
 	table   string
+
+	// maxAttempts is how many failures a record takes before it stops being
+	// offered. See [DefaultOutboxMaxAttempts].
+	maxAttempts int
 }
 
 // NewSQLOutboxStore uses the table named by [SQLOutboxStore.Schema].
@@ -258,10 +262,29 @@ func NewSQLOutboxStore(db DB, dialect Dialect, table ...string) *SQLOutboxStore 
 	if len(table) > 0 && table[0] != "" {
 		name = table[0]
 	}
-	return &SQLOutboxStore{db: db, dialect: dialect, table: name}
+	return &SQLOutboxStore{
+		db: db, dialect: dialect, table: name, maxAttempts: DefaultOutboxMaxAttempts,
+	}
+}
+
+// SetMaxAttempts changes how many failures a record takes before it stops being
+// offered to the relay. Anything below one is read as the default.
+func (s *SQLOutboxStore) SetMaxAttempts(n int) {
+	if n < 1 {
+		n = DefaultOutboxMaxAttempts
+	}
+	s.maxAttempts = n
 }
 
 // Schema is the table this store needs. Put it in a migration.
+//
+// A table created before v0.9.0 has neither attempts nor last_error, and Pending
+// fails on the missing column until they are added. Both are additive and take a
+// default, so the old code is unaffected by them and the migration can — and
+// should — go out before the deployment does:
+//
+//	ALTER TABLE acemq_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+//	ALTER TABLE acemq_outbox ADD COLUMN last_error TEXT;
 func (s *SQLOutboxStore) Schema() string {
 	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
   id            VARCHAR(255) PRIMARY KEY,
@@ -270,7 +293,9 @@ func (s *SQLOutboxStore) Schema() string {
   body          BLOB         NOT NULL,
   content_type  VARCHAR(255) NOT NULL,
   headers       TEXT         NOT NULL,
-  created_at    TIMESTAMP    NOT NULL
+  created_at    TIMESTAMP    NOT NULL,
+  attempts      INTEGER      NOT NULL DEFAULT 0,
+  last_error    TEXT
 );
 CREATE INDEX IF NOT EXISTS %s_created_at ON %s (created_at);`, s.table, s.table, s.table)
 }
@@ -309,28 +334,69 @@ func (s *SQLOutboxStore) Add(ctx context.Context, record OutboxRecord) error {
 }
 
 // Pending returns records waiting to be published, oldest first.
+//
+// A record that has run out of attempts is left out, which is what lets the relay
+// past it: the relay stops at the first failure to keep the order the writer
+// chose, and without this bound it stops at the same record for ever. See
+// [SQLOutboxStore.Retired] for reading the ones it has given up on.
 func (s *SQLOutboxStore) Pending(ctx context.Context, limit int) ([]OutboxRecord, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	args := s.dialect.args(2)
 	query := fmt.Sprintf(
-		"SELECT id, exchange, routing_key, body, content_type, headers, created_at "+
-			"FROM %s ORDER BY created_at ASC LIMIT %s", s.table, s.dialect.Placeholder(1))
+		"SELECT id, exchange, routing_key, body, content_type, headers, created_at, "+
+			"attempts, last_error FROM %s WHERE attempts < %s "+
+			"ORDER BY created_at ASC LIMIT %s", s.table, args[0], args[1])
 
-	rows, err := s.db.QueryContext(ctx, query, limit)
+	rows, err := s.db.QueryContext(ctx, query, s.maxAttempts, limit)
 	if err != nil {
 		return nil, fmt.Errorf("acemq: cannot read the outbox: %w", err)
 	}
+	return s.records(rows)
+}
+
+// Retired is the records the relay has stopped trying, oldest first.
+//
+// Nothing else surfaces them: Pending exists to skip them, so without this they
+// are invisible to everything but a hand-written query. Each carries its
+// LastError, which is the broker's own reason for refusing it.
+//
+// Releasing one is a matter of putting its attempts back to zero, once whatever
+// refused it has been fixed. The record is kept rather than deleted precisely so
+// that is possible — deleting it would be the silent loss this pattern exists to
+// prevent, arrived at from another direction.
+func (s *SQLOutboxStore) Retired(ctx context.Context) ([]OutboxRecord, error) {
+	query := fmt.Sprintf(
+		"SELECT id, exchange, routing_key, body, content_type, headers, created_at, "+
+			"attempts, last_error FROM %s WHERE attempts >= %s ORDER BY created_at ASC",
+		s.table, s.dialect.Placeholder(1))
+
+	rows, err := s.db.QueryContext(ctx, query, s.maxAttempts)
+	if err != nil {
+		return nil, fmt.Errorf("acemq: cannot read the retired outbox records: %w", err)
+	}
+	return s.records(rows)
+}
+
+// records reads outbox rows in the column order both queries above select.
+func (s *SQLOutboxStore) records(rows *sql.Rows) ([]OutboxRecord, error) {
 	defer func() { _ = rows.Close() }()
 
 	var out []OutboxRecord
 	for rows.Next() {
 		var record OutboxRecord
 		var headers string
+		// last_error has no NOT NULL, because a record that has never failed has
+		// no error rather than an empty one, and every driver has its own idea of
+		// what a NULL string scans into.
+		var lastError sql.NullString
 		if err := rows.Scan(&record.ID, &record.Exchange, &record.RoutingKey,
-			&record.Body, &record.ContentType, &headers, &record.CreatedAt); err != nil {
+			&record.Body, &record.ContentType, &headers, &record.CreatedAt,
+			&record.Attempts, &lastError); err != nil {
 			return nil, fmt.Errorf("acemq: cannot read an outbox row: %w", err)
 		}
+		record.LastError = lastError.String
 		if headers != "" {
 			if err := json.Unmarshal([]byte(headers), &record.Headers); err != nil {
 				return nil, fmt.Errorf(
@@ -343,6 +409,30 @@ func (s *SQLOutboxStore) Pending(ctx context.Context, limit int) ([]OutboxRecord
 		return nil, fmt.Errorf("acemq: cannot read the outbox: %w", err)
 	}
 	return out, nil
+}
+
+// RecordFailure counts a failed publish against a record, and says why.
+//
+// The record is kept. Once its attempts reach the store's maximum it stops being
+// offered by Pending, which is what lets the relay past it, and
+// [SQLOutboxStore.Retired] is how it is found afterwards.
+func (s *SQLOutboxStore) RecordFailure(ctx context.Context, id, cause string) error {
+	args := s.dialect.args(2)
+	query := fmt.Sprintf(
+		"UPDATE %s SET attempts = attempts + 1, last_error = %s WHERE id = %s",
+		s.table, args[0], args[1])
+
+	// Bounded, because the column is a TEXT a driver has to carry and a wrapped
+	// error chain can be long. A thousand characters is more than enough for a
+	// broker's reason and short enough not to matter.
+	if len(cause) > 1000 {
+		cause = cause[:1000]
+	}
+	if _, err := s.db.ExecContext(ctx, query, cause, id); err != nil {
+		return fmt.Errorf(
+			"acemq: cannot count a failed publish against outbox record %s: %w", id, err)
+	}
+	return nil
 }
 
 // MarkPublished removes a record once the broker has confirmed it.

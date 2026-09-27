@@ -157,6 +157,55 @@ The relay publishes the bytes that were recorded rather than re-encoding, becaus
 a record outlives the process that wrote it and the Go type may not survive a
 deployment.
 
+### A record the broker will never take
+
+A sweep stops at the first record that fails and leaves it in the outbox. That is
+right — the writer chose the order, and skipping ahead would deliver a later
+message before an earlier one — but it means a record that can *never* be
+published holds up everything behind it on every tick, for ever. An exchange
+somebody deleted, or a payload a policy will always refuse: one row, and the
+outbox stops.
+
+So a failure is counted against the record. Both stores keep an `Attempts` and a
+`LastError` on it, and once `Attempts` reaches the store's maximum — ten by
+default, the same ten Python and Ruby use — `Pending` stops offering the record
+and the queue behind it moves again.
+
+```go
+store.SetMaxAttempts(10)          // the default; shorten it in a test
+...
+stuck, _ := store.Retired(ctx)    // the in-memory store's takes no ctx
+for _, record := range stuck {
+	log.Printf("nobody could publish %s: %s", record.ID, record.LastError)
+}
+```
+
+The record is **kept, not deleted**. One nothing could publish is evidence:
+somebody has to read it, fix whatever refuses it, and release it by putting its
+`attempts` back to zero. Deleting it would be the silent loss this pattern exists
+to prevent, reached from another direction. Nothing but `Retired` shows these
+rows, because `Pending` exists to skip them — so graph
+`acemq.outbox.total{outcome=failed}` and read `Retired` when it climbs.
+
+`RecordFailure` is deliberately **not** part of the `OutboxStore` interface:
+adding a method would stop every custom store compiling. The relay type-asserts
+for it, so a store without one keeps the behaviour it has — blocking at a
+permanently failing record. A custom store should add
+`RecordFailure(ctx, id, cause string) error` and leave records at the limit out of
+`Pending`.
+
+**The SQL table gained two columns in 0.9.0.** A table created before it needs the
+migration, and `Pending` fails on the missing column until it has run. Both are
+additive with a default, so the old code is unaffected by them and the migration
+can — and should — go out before the deployment does:
+
+```sql
+ALTER TABLE acemq_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE acemq_outbox ADD COLUMN last_error TEXT;
+```
+
+### What a relay reports
+
 Every sweep counts what it did through the connection's `acemq.Observer`:
 `acemq.outbox.total` tagged `published` or `failed`, and `acemq.outbox.lag` — how
 long a record waited between being committed and being published, measured from

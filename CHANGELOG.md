@@ -8,6 +8,57 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-27
+
+### Fixed
+
+- **One record the broker will never take no longer stops the whole outbox.** The
+  relay publishes in the order records were written and stops at the first failure,
+  which is right — the writer chose that order, and skipping ahead would deliver a
+  later message before an earlier one. Nothing bounded how long it would keep
+  stopping at the same record. An exchange somebody deleted, or a payload a policy
+  will always refuse, held up every message written after it indefinitely: a queue
+  that goes quiet for good, with a failure counter as the only sign.
+
+  A failed publish is now counted against the record. `OutboxRecord` carries
+  `Attempts` and `LastError`; once `Attempts` reaches the store's maximum — ten by
+  default, which is what Python and Ruby use, so a record that is stuck is stuck
+  after the same number of tries in all three — `Pending` stops offering that record
+  and everything behind it goes out.
+
+  The record is **kept, not deleted**. One nothing could publish is evidence:
+  somebody has to read it, fix whatever refuses it, and release it by putting its
+  attempts back to zero. Deleting it would be a silent loss by another route.
+  `Retired` lists them, on both stores, because `Pending` exists to skip them and
+  nothing else would surface them.
+
+### Added
+
+- `OutboxRecord.Attempts` and `OutboxRecord.LastError`.
+- `SetMaxAttempts`, `RecordFailure` and `Retired` on `InMemoryOutboxStore` and
+  `SQLOutboxStore`, and `DefaultOutboxMaxAttempts`.
+
+### Changed
+
+- **The outbox table has two new columns.** `SQLOutboxStore.Schema` includes them.
+  A table created before this version needs a migration, and `Pending` fails on the
+  missing column until it has run:
+
+  ```sql
+  ALTER TABLE acemq_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE acemq_outbox ADD COLUMN last_error TEXT;
+  ```
+
+  Both are additive with a default, so the old code is unaffected by them: run the
+  migration before deploying this version.
+
+- `RecordFailure` is deliberately **not** a method on the `OutboxStore` interface.
+  Adding one would stop every custom store compiling, and the cost of that is higher
+  than the cost of a store without it keeping the behaviour it already has. The relay
+  type-asserts for it; a custom store should add
+  `RecordFailure(ctx, id, cause string) error` and leave records at the limit out of
+  `Pending`.
+
 ## [0.8.0] - 2026-09-27
 
 ### Fixed

@@ -242,6 +242,108 @@ func TestRecordingTwiceInTheDatabaseStillSendsOnce(t *testing.T) {
 	}
 }
 
+// TestARecordThatKeepsFailingStopsBeingOffered is the bound on how long the
+// relay stops at one record.
+//
+// The relay publishes in written order and stops at the first failure, so
+// without this a record the broker will never take is retried on every sweep and
+// holds up everything written after it for ever.
+func TestARecordThatKeepsFailingStopsBeingOffered(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	mq := memoryBroker(t)
+
+	store := patterns.NewSQLOutboxStore(db, patterns.SQLiteDialect)
+	store.SetMaxAttempts(2)
+	apply(t, db, store.Schema())
+
+	poison, err := patterns.Record(mq, "", "always-refused", OrderPlaced{OrderID: "o-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	behind, err := patterns.Record(mq, "", "orders", OrderPlaced{OrderID: "o-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []patterns.OutboxRecord{poison, behind} {
+		if err := store.Add(ctx, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for attempt := range 2 {
+		pending, err := store.Pending(ctx, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) != 2 {
+			t.Fatalf("sweep %d had %d records to publish, want 2", attempt+1, len(pending))
+		}
+		if pending[0].ID != poison.ID {
+			t.Fatal("the oldest record is not first, so order is not being kept")
+		}
+		if err := store.RecordFailure(ctx, poison.ID, "the broker refused it"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pending, err := store.Pending(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].ID != behind.ID {
+		t.Fatalf("after two failures the relay is offered %d records: one record the "+
+			"broker will never take is blocking everything behind it", len(pending))
+	}
+}
+
+// TestARetiredRecordIsStillInTheTable — left alone, not thrown away.
+//
+// A record nothing could publish is evidence: somebody has to read it, fix
+// whatever refuses it, and release it by putting its attempts back to zero.
+// Deleting it would be the silent loss this pattern exists to prevent, arrived at
+// from another direction.
+func TestARetiredRecordIsStillInTheTable(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	mq := memoryBroker(t)
+
+	store := patterns.NewSQLOutboxStore(db, patterns.SQLiteDialect)
+	store.SetMaxAttempts(1)
+	apply(t, db, store.Schema())
+
+	record, err := patterns.Record(mq, "", "always-refused", OrderPlaced{OrderID: "o-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordFailure(ctx, record.ID, "the broker refused it"); err != nil {
+		t.Fatal(err)
+	}
+
+	retired, err := store.Retired(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retired) != 1 {
+		t.Fatalf("%d records retired, want 1: the record the broker refused is gone", len(retired))
+	}
+	if retired[0].Attempts != 1 {
+		t.Errorf("the record says it has been tried %d times, want 1", retired[0].Attempts)
+	}
+	if retired[0].LastError != "the broker refused it" {
+		t.Errorf("the reason on the record is %q", retired[0].LastError)
+	}
+	// And the body and envelope have to survive, or what is kept is not something
+	// anybody can release.
+	if string(retired[0].Body) != string(record.Body) ||
+		retired[0].Headers[acemq.HeaderID] == nil {
+		t.Error("the retired record lost its body or its envelope")
+	}
+}
+
 // TestTheRecordCommitsWithTheWork is the whole reason the pattern exists.
 func TestTheRecordCommitsWithTheWork(t *testing.T) {
 	ctx := context.Background()
