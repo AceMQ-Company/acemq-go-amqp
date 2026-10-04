@@ -8,7 +8,41 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **`Close` is bounded: `DrainTimeout`, twenty seconds by default.**
+  `Consumer.Close`, `ConsumerGroup.Close` and `Conn.Close` waited for running
+  handlers with no bound at all, so one stuck handler held a shutdown until the
+  orchestrator killed the process. Each consumer now waits for up to
+  `DrainTimeout` (a `ConsumeOption`; 20s, the same as Java, .NET and Ruby). At
+  the bound it cancels the handlers' context, gives them half a second to settle
+  on the channel their delivery arrived on, releases the channel and returns a
+  `*DrainTimeoutError` — matched by `errors.Is(err, acemq.ErrDrainTimeout)`,
+  with `Stranded` counting the handlers still running. Their deliveries are
+  unacknowledged and go back to the broker when the channel closes: redelivered,
+  never lost, never dead-lettered because shutdown cut them off. A handler that
+  gives up after the cancellation still dead-letters with its reason, as fixed
+  below. `DrainTimeout(0)` waits without a bound, the old behaviour.
+  `Conn.Close` and `ConsumerGroup.Close` now close their consumers side by side,
+  so the whole shutdown takes one bound rather than one per consumer.
+
+### Changed
+
+- **Prefetched messages are no longer run during `Close`.** Close stops delivery
+  (`basic.cancel`) first, and a delivery that had arrived but not reached a
+  handler is now nacked with requeue instead of being handled. With
+  `Prefetch(5)` and one running handler, Close used to run all five; it now
+  runs the one and returns four to the queue, flagged redelivered, for whichever
+  consumer is still running or the restarted service. This is what Java, .NET
+  and Ruby already did, and it makes the drain proportional to `Concurrency`
+  rather than `Prefetch`.
+
 ### Fixed
+
+- **`acemq.consume.in.flight` no longer drops back before the handler runs.** The
+  decrement was a deferred call whose argument was evaluated at the `defer`, so
+  the gauge went to 1 and straight back to 0 while the handler was still
+  running.
 
 - **A message given up on during shutdown is no longer lost.** A handler that
   returned `Retry` on its last attempt — every attempt, under `NoRetry()` — or

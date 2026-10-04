@@ -160,9 +160,13 @@ other message with it.
 sub.Close()
 ```
 
-Stops delivery and waits for handlers already running. A message being worked on
-when `Close` is called is finished and acknowledged rather than abandoned for
-the broker to hand to somebody else. Closing twice is not an error.
+Stops delivery and waits for handlers already running, for up to
+`DrainTimeout` — twenty seconds by default. A message being worked on when
+`Close` is called is finished and acknowledged rather than abandoned for the
+broker to hand to somebody else. One still running at the bound has its context
+cancelled, and `Close` returns an error matching `acemq.ErrDrainTimeout`; its
+message goes back to the broker and is redelivered. Closing twice is not an
+error.
 
 `mq.Close()` closes every consumer on the connection the same way, so a
 deferred `mq.Close()` is usually all a program needs:
@@ -175,9 +179,10 @@ if err != nil {
 defer mq.Close()
 ```
 
-What `Close` waits for is more than the handler it is easy to picture: every
-delivery the transport had already handed over is run through a handler too, so
-the work a shutdown has to get through is bounded by `Prefetch` rather than by
-`Concurrency`. A retry waiting out a short backoff is inside that wait as well.
+What `Close` waits for is only the handlers already running. A delivery the
+transport had already handed over but no handler had started is returned to the
+broker, requeued, rather than run — so the work a shutdown has to get through is
+bounded by `Concurrency`, not by `Prefetch`. A retry waiting out a short backoff
+is inside that wait.
 See [the lifecycle of a service](lifecycle.md) for the whole shape, including a
 deadline.

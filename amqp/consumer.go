@@ -16,6 +16,7 @@ package acemq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,13 @@ type Consumer struct {
 	closeOnce sync.Once
 	closeErr  error
 
+	// stopping is closed when Close begins. From then on a delivery that has
+	// not reached a handler goes back to the broker instead of being run.
+	stopping chan struct{}
+	// cancel cancels the handlers' context, at the drain bound.
+	cancel context.CancelFunc
+	drain  time.Duration
+
 	flight int64
 }
 
@@ -74,6 +82,7 @@ type consumeConfig struct {
 	concurrency int
 	tag         string
 	args        map[string]any
+	drain       time.Duration
 }
 
 // ConsumeOption configures a consumer.
@@ -116,6 +125,27 @@ func ConsumeArg(name string, value any) ConsumeOption {
 	}
 }
 
+// DrainTimeout bounds how long [Consumer.Close] waits for handlers already
+// running. Twenty seconds by default, the same as the other AceMQ libraries.
+//
+// At the bound Close cancels the handlers' context, gives them a moment to
+// settle what they hold, and returns a [*DrainTimeoutError]. A handler that is
+// still running after that has its delivery returned to the broker when the
+// channel closes, so the message is redelivered rather than lost. Zero or less
+// waits without a bound, which is how Close behaved before 0.9.2.
+func DrainTimeout(d time.Duration) ConsumeOption {
+	return func(cfg *consumeConfig) { cfg.drain = d }
+}
+
+// DefaultDrainTimeout is how long Close waits for running handlers unless
+// [DrainTimeout] says otherwise.
+const DefaultDrainTimeout = 20 * time.Second
+
+// drainGrace is how long Close waits after cancelling the handlers' context at
+// the bound, so a handler that honours the cancellation can still settle on the
+// channel its delivery arrived on.
+const drainGrace = 500 * time.Millisecond
+
 // ConsumerTag names this consumer to the broker, which is what shows up in the
 // management interface when somebody is working out who is holding a message.
 func ConsumerTag(tag string) ConsumeOption {
@@ -148,6 +178,7 @@ func Consume[T any](
 		retry:       conn.retry,
 		prefetch:    conn.prefetch,
 		concurrency: 1,
+		drain:       DefaultDrainTimeout,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -157,12 +188,16 @@ func Consume[T any](
 	}
 
 	c := &Consumer{
-		conn:   conn,
-		queue:  queue,
-		retry:  cfg.retry,
-		ladder: LadderFor(queue, cfg.retry),
-		work:   make(chan Delivery, cfg.concurrency),
+		conn:     conn,
+		queue:    queue,
+		retry:    cfg.retry,
+		ladder:   LadderFor(queue, cfg.retry),
+		work:     make(chan Delivery, cfg.concurrency),
+		stopping: make(chan struct{}),
+		drain:    cfg.drain,
 	}
+	handlerCtx, cancel := context.WithCancel(ctx)
+	c.cancel = cancel
 
 	// The consumer's half of the topology, before the first delivery can arrive.
 	//
@@ -180,10 +215,12 @@ func Consume[T any](
 	// consumer that started anyway would be running against a topology it does
 	// not understand.
 	if err := c.ladder.Declare(ctx, conn); err != nil {
+		cancel()
 		return nil, err
 	}
 
 	if err := conn.track(c); err != nil {
+		cancel()
 		return nil, err
 	}
 
@@ -198,9 +235,14 @@ func Consume[T any](
 			// message path allocates for it, and a consumer nobody has
 			// instrumented never calls through it. See [OnSettled].
 			hook := &settlementHook{}
-			hookCtx := withSettlementHook(ctx, hook)
+			hookCtx := withSettlementHook(handlerCtx, hook)
 
 			for d := range c.work {
+				if c.isStopping() {
+					// Prefetched but not started: back to the broker, not run.
+					c.nack(d, true)
+					continue
+				}
 				hook.reset()
 				handleDelivery(c, hookCtx, d, handler, cfg, hook)
 			}
@@ -212,11 +254,20 @@ func Consume[T any](
 		Tag:      cfg.tag,
 		Args:     cfg.args,
 	}, func(d Delivery) {
-		c.work <- d
+		if c.isStopping() {
+			c.nack(d, true)
+			return
+		}
+		select {
+		case c.work <- d:
+		case <-c.stopping:
+			c.nack(d, true)
+		}
 	})
 	if err != nil {
 		close(c.work)
 		c.wg.Wait()
+		cancel()
 		conn.untrack(c)
 		return nil, fmt.Errorf("acemq: cannot consume from %q: %w", queue, err)
 	}
@@ -251,7 +302,9 @@ func handleDelivery[T any](
 	observer := c.conn.observer
 	labels := map[string]string{TagQueue: c.queue}
 	observer.Gauge(MetricConsumeInFlight, c.inFlight(1), labels)
-	defer observer.Gauge(MetricConsumeInFlight, c.inFlight(-1), labels)
+	// In a closure: a deferred call's arguments are evaluated at once, which
+	// would take the count back down before the handler had even started.
+	defer func() { observer.Gauge(MetricConsumeInFlight, c.inFlight(-1), labels) }()
 
 	if len(c.conn.onConsume) > 0 {
 		cc := &ConsumeContext{
@@ -667,10 +720,17 @@ func (c *Consumer) nack(d Delivery, requeue bool) {
 	}
 }
 
-// Close stops the consumer and waits for handlers already running.
+// Close stops the consumer and waits, up to the drain bound, for handlers
+// already running.
 //
-// A message being worked on when Close is called is finished and settled, rather
-// than abandoned for the broker to hand to somebody else.
+// Delivery stops first. A message the transport had already handed over but no
+// handler had started is returned to the broker unacknowledged — requeued for
+// whoever consumes next — rather than run during shutdown. A handler already
+// running is finished and settled, for up to [DrainTimeout] (twenty seconds by
+// default). At the bound its context is cancelled and Close returns a
+// [*DrainTimeoutError] counting the handlers it cut off; their deliveries go
+// back to the broker when the channel closes, so they are redelivered rather
+// than lost.
 //
 // The subscription is released last, after everything has been settled, because
 // a settlement travels on the channel its delivery arrived on. Releasing it
@@ -680,6 +740,8 @@ func (c *Consumer) nack(d Delivery, requeue bool) {
 // republished for its next attempt is now on the queue twice. See [Stopper].
 func (c *Consumer) Close() error {
 	c.closeOnce.Do(func() {
+		close(c.stopping)
+
 		stopper, canStop := c.transport.(Stopper)
 		if c.transport != nil && canStop {
 			// No further deliveries once this returns, which is what makes
@@ -691,7 +753,10 @@ func (c *Consumer) Close() error {
 		}
 
 		close(c.work)
-		c.wg.Wait()
+		if err := c.awaitHandlers(); err != nil {
+			c.closeErr = errors.Join(c.closeErr, err)
+		}
+		c.cancel()
 
 		if c.transport != nil && canStop {
 			if err := c.transport.Close(); err != nil && c.closeErr == nil {
@@ -701,4 +766,44 @@ func (c *Consumer) Close() error {
 		c.conn.untrack(c)
 	})
 	return c.closeErr
+}
+
+// awaitHandlers waits for the workers to finish, for up to the drain bound.
+func (c *Consumer) awaitHandlers() error {
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+	if c.drain <= 0 {
+		<-done
+		return nil
+	}
+
+	bound := time.NewTimer(c.drain)
+	defer bound.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-bound.C:
+	}
+
+	stranded := c.inFlight(0)
+	c.cancel()
+	grace := time.NewTimer(drainGrace)
+	defer grace.Stop()
+	select {
+	case <-done:
+	case <-grace.C:
+	}
+	return &DrainTimeoutError{Queue: c.queue, Stranded: int(stranded), After: c.drain}
+}
+
+func (c *Consumer) isStopping() bool {
+	select {
+	case <-c.stopping:
+		return true
+	default:
+		return false
+	}
 }

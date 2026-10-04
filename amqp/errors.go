@@ -17,6 +17,7 @@ package acemq
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // FatalError marks a failure that will happen again on every attempt.
@@ -221,3 +222,27 @@ func IsBlocked(err error) bool {
 	var paused *PublishingPausedError
 	return errors.As(err, &blocked) || errors.As(err, &paused)
 }
+
+// ErrDrainTimeout is what a [*DrainTimeoutError] matches with [errors.Is].
+var ErrDrainTimeout = errors.New("acemq: the drain bound expired with handlers still running")
+
+// DrainTimeoutError is Close reporting that it stopped waiting for handlers at
+// the drain bound. Their context was cancelled and their deliveries are
+// returned to the broker, so the messages are redelivered rather than lost; the
+// work they were doing may be done twice. See [DrainTimeout].
+type DrainTimeoutError struct {
+	// Queue is the queue the consumer was reading.
+	Queue string
+	// Stranded is how many handlers were still running at the bound.
+	Stranded int
+	// After is the bound that expired.
+	After time.Duration
+}
+
+func (e *DrainTimeoutError) Error() string {
+	return fmt.Sprintf("acemq: %d handler(s) on %q still running after the %s drain bound; "+
+		"their deliveries go back to the broker", e.Stranded, e.Queue, e.After)
+}
+
+// Is makes errors.Is(err, ErrDrainTimeout) true.
+func (e *DrainTimeoutError) Is(target error) bool { return target == ErrDrainTimeout }

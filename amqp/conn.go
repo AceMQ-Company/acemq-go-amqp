@@ -322,9 +322,11 @@ func ExchangeArg(name string, value any) ExchangeOption {
 
 // Close stops every consumer on this connection and releases it.
 //
-// Consumers are closed first and their handlers allowed to finish, so a message
-// being worked on when Close is called is acknowledged rather than returned to
-// the queue for somebody else to redo.
+// Consumers are closed first, side by side, and their running handlers allowed
+// to finish within each consumer's [DrainTimeout], so a message being worked on
+// when Close is called is acknowledged rather than returned to the queue for
+// somebody else to redo. A bound that expired shows as an [ErrDrainTimeout] in
+// the joined error.
 func (c *Conn) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -336,12 +338,7 @@ func (c *Conn) Close() error {
 	c.subs = nil
 	c.mu.Unlock()
 
-	var errs []error
-	for _, sub := range subs {
-		if err := sub.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
+	errs := closeAll(subs)
 	if err := c.transport.Close(); err != nil {
 		errs = append(errs, err)
 	}
@@ -382,4 +379,20 @@ func (c *Conn) PublishRaw(
 	ctx context.Context, exchange, routingKey string, msg Outbound,
 ) (PublishResult, error) {
 	return c.transport.Publish(ctx, exchange, routingKey, msg)
+}
+
+// closeAll closes consumers side by side, so a shutdown takes one drain bound
+// rather than one per consumer, and returns what each reported.
+func closeAll(subs []*Consumer) []error {
+	errs := make([]error, len(subs))
+	var wg sync.WaitGroup
+	for i, sub := range subs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = sub.Close()
+		}()
+	}
+	wg.Wait()
+	return errs
 }

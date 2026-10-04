@@ -86,9 +86,10 @@ rejected message reaches `orders.dlq`; with it cancelled a fraction of a second
 earlier, the same rejection is a `basic.nack` with no requeue, and where that
 message ends up is the queue's `x-dead-letter-exchange` or nowhere.
 
-Cancelling that context is still useful — it is the only lever that shortens a
-drain — so it gets cancelled, deliberately, once `Close` has returned or the
-deadline has gone. That is what `releaseHandlers` is for below.
+Cancelling it is still the lever that ends a drain early, and `Close` pulls it
+itself: the handlers run on a child of this context, which `Close` cancels at the
+drain bound — see [bounding it](#bounding-it). `releaseHandlers` is only there to
+release the context once everything has stopped.
 
 Handlers see this context too, which is the other half of why it should outlive
 the signal. During a graceful drain you want the handler in flight to *finish*,
@@ -122,7 +123,7 @@ g.Go(func() error {
 	// signal kills the process instead of being swallowed by the handler
 	// that is still installed. Somebody pressing Ctrl-C twice means it.
 	stop()
-	return drain(sub, mq, releaseHandlers, 20*time.Second)
+	return mq.Close() // bounded: see "Bounding it"
 })
 
 return g.Wait()
@@ -145,23 +146,27 @@ different kind of thing and can afford a dependency the library cannot.
 
 ## What `Close` finishes, precisely
 
-`sub.Close()` does three things in a fixed order: it stops delivery, it waits,
-and only then does it let go of the channel the settlements travel on. That last
-ordering is not cosmetic — releasing the channel first leaves every message in
-flight acknowledged into a channel that has gone, so the broker hears nothing,
-hands the message to another consumer, and a retry that had already been
-republished is now on the queue twice.
+`sub.Close()` does four things in a fixed order: it stops delivery, it hands back
+whatever arrived but was never started, it waits — for a bounded time — for the
+handlers already running, and only then does it let go of the channel the
+settlements travel on. That last ordering is not cosmetic — releasing the channel
+first leaves every message in flight acknowledged into a channel that has gone,
+so the broker hears nothing, hands the message to another consumer, and a retry
+that had already been republished is now on the queue twice.
 
-`mq.Close()` closes every consumer the same way and then releases the connection.
+`mq.Close()` closes every consumer the same way, all of them at once, and then
+releases the connection. `ConsumerGroup.Close()` does the same for its members.
+Closing them side by side is what makes the bound a bound: ten consumers drain
+within one `DrainTimeout`, not ten of them end to end.
 
 What that means in the four situations that actually turn up at shutdown:
 
 | at the moment of `Close` | what happens |
 |---|---|
-| a handler is running | it runs to completion, and its decision is carried out |
-| a delivery has arrived but no handler has it yet | it is handled too, in full |
+| a handler is running | it runs to completion within the drain bound, and its decision is carried out |
+| a delivery has arrived but no handler has it yet | it is not run; it goes back to the broker, requeued |
 | a publish is waiting for its confirm | nothing waits for it; it is cut off |
-| a retry is waiting out a backoff in this process | `Close` waits with it, for the whole delay |
+| a retry is waiting out a backoff in this process | `Close` waits with it, up to the drain bound |
 
 ### The handler in flight
 
@@ -170,28 +175,23 @@ sleeping for 300 milliseconds when `Close` is called makes `Close` take 300
 milliseconds, and the message is accepted and acknowledged rather than abandoned
 for the broker to give to somebody else.
 
-That is the guarantee worth having, and it is also the whole reason a shutdown
-needs a deadline: the library will wait indefinitely for a handler that never
-returns.
+Up to a point: the drain bound, twenty seconds by default, the same as the Java,
+.NET and Ruby libraries. A handler still running when it expires has its context
+cancelled, and `Close` reports it — see [bounding it](#bounding-it).
 
 ### The delivery that never reached a handler
 
-This one is usually a surprise. `Close` does not just finish the message in the
-handler; it finishes everything the transport had already handed over. The
-subscription cancels the consumer, waits for the delivery channel to close, and
-the loop reading that channel passes on every delivery still sitting in it. Each
-of those goes through a handler exactly like any other message.
+`Close` does not run it. The transport may have pushed a whole prefetch window
+onto this consumer's channel, and until 0.9.2 every one of those was run through
+a handler during shutdown — with `Prefetch(100)` and a 200-millisecond handler,
+twenty seconds of work in hand before the drain had started.
 
-So the work a drain has to get through is bounded by **`Prefetch`**, not by
-`Concurrency`. With `Prefetch(100)`, `Concurrency(1)` and a handler that takes
-200 milliseconds, a shutdown can have twenty seconds of work in hand before it
-starts. That is a good reason to keep prefetch proportionate to what a handler
-costs, and it is a better reason than the usual one about fairness between
-consumers.
-
-This is the right behaviour — those messages are the consumer's responsibility
-and it settles them — but it is a cost that is invisible until a deployment
-starts timing out.
+Now delivery stops first (`basic.cancel`), and anything that arrived but no
+handler had started is returned to the broker unacknowledged with a requeue. It
+goes to whichever consumer is still running, or back to this service after the
+restart, flagged as redelivered and at the attempt number it already had. The
+work a drain has to get through is bounded by `Concurrency` — the handlers
+actually running — not by `Prefetch`.
 
 ### The publish waiting for a confirm
 
@@ -236,12 +236,12 @@ on a rung queue in the broker, holding nothing. Which is which is
 [retries and redelivery](reliability.md).
 
 At shutdown the difference stops being about prefetch slots and becomes about
-whether the drain finishes at all, because **`Close` waits out an in-process
-backoff in full**. A consumer two seconds into a two-second wait makes `Close`
-take the rest of it. A consumer that fell back to waiting here because its rung
-queue was missing, on a five-minute schedule, makes `Close` take five minutes —
-which is to say it makes the drain fail, because nothing grants a pod five
-minutes.
+whether the drain finishes in time, because **`Close` waits out an in-process
+backoff with the handler**. A consumer two seconds into a two-second wait makes
+`Close` take the rest of it. A consumer that fell back to waiting here because
+its rung queue was missing, on a five-minute schedule, runs into the drain bound:
+the wait is aborted, the delivery goes back to the broker with a requeue, and
+`Close` reports a drain timeout.
 
 So the rung queues are a shutdown concern and not only a reliability one. A wait
 that lives on the broker is a wait a restart does not have to survive and a drain
@@ -264,12 +264,13 @@ counts `acemq.MetricRungMissing` every time it does. That counter is worth an
 alert on its own merits; it is also the early warning that the next deployment's
 drain is going to be slow.
 
-The lever for a drain that has to end now is the consumers' context. Cancelling
-it aborts an in-process wait immediately — measured at microseconds rather than
-the ten seconds the policy asked for — and the delivery goes back to the broker
-with a requeue, not lost. It comes round again after the restart at the same
-attempt number, because a requeue hands back the bytes the broker was given and
-the attempt counter rides on those bytes. One extra attempt, no lost message.
+Cancelling the handlers' context is what ends a drain early, and `Close` does it
+itself at the bound. It aborts an in-process wait immediately — measured at
+microseconds rather than the ten seconds the policy asked for — and the delivery
+goes back to the broker with a requeue, not lost. It comes round again after the
+restart at the same attempt number, because a requeue hands back the bytes the
+broker was given and the attempt counter rides on those bytes. One extra
+attempt, no lost message.
 
 A handler that gives up during that window — rejects, or returns `Retry` on its
 last attempt, which under `NoRetry()` is every attempt — still has its message
@@ -281,8 +282,8 @@ each one. On a queue with no dead-letter exchange a reject would have been the
 end of the message.
 
 **Which is why the cancellation comes last, and never first.** Cancelling the
-consumers' context is not a way to hurry a drain along. It is the thing you do
-when the drain has already failed, to get the deliveries back to the broker
+consumers' context is not a way to hurry a drain along. It is what happens when
+the drain has already run out of time, to get the deliveries back to the broker
 rather than leave them unsettled.
 
 ## Bounding it
@@ -292,45 +293,31 @@ worst of all the outcomes on this page: no handler completes, nothing is
 settled, and every delivery the consumer was holding comes back to whoever
 replaces it.
 
+`Close` is bounded on its own. Each consumer waits for its running handlers for
+up to `DrainTimeout` — twenty seconds unless you say otherwise — and then stops
+waiting:
+
 ```go
-// drain stops the consumer, waits for what it is already holding, and gives up
-// when it runs out of time.
-func drain(sub *acemq.Consumer, mq *acemq.Conn, releaseHandlers func(), within time.Duration) error {
-	closed := make(chan error, 1)
-	go func() { closed <- sub.Close() }()
+sub, err := acemq.Consume(handlers, mq, "orders", handle,
+	acemq.DrainTimeout(15*time.Second))
 
-	select {
-	case err := <-closed:
-		releaseHandlers()
-		return errors.Join(err, mq.Close())
+// ...
 
-	case <-time.After(within):
-		// Out of time. Cancelling the handlers' context is the only lever that
-		// shortens a drain: it aborts a backoff being waited out in this process
-		// and hands that delivery back to the broker. Close itself takes no
-		// context and cannot be abandoned, so what this bounds is how long the
-		// process waits, not how long Close takes.
-		releaseHandlers()
-
-		select {
-		case err := <-closed:
-			return errors.Join(err, mq.Close())
-		case <-time.After(2 * time.Second):
-			return errors.New("the drain did not finish; some deliveries were left unsettled")
-		}
-	}
+if err := mq.Close(); errors.Is(err, acemq.ErrDrainTimeout) {
+	var timeout *acemq.DrainTimeoutError
+	errors.As(err, &timeout)
+	log.Printf("acemq: %d handler(s) on %s cut off at shutdown; their messages will be redelivered",
+		timeout.Stranded, timeout.Queue)
 }
 ```
 
-`Close` takes no context and cannot be abandoned. That is worth saying plainly,
-because the shape above looks like a timeout on `Close` and is not one: the
-goroutine holding `sub.Close()` is still in there when the second `select`
-expires, and `mq.Close()` would block behind it. What the deadline bounds is how
-long *the process* waits before deciding the drain has failed and returning, at
-which point `main` ends and the runtime takes the goroutine with it.
+At the bound `Close` cancels the handlers' context, gives them half a second to
+settle what they hold on the channel it arrived on, then releases the channel
+and returns a `*DrainTimeoutError` — `Stranded` is how many handlers were still
+running at the bound. `DrainTimeout(0)` waits without a bound, which is how
+`Close` behaved before 0.9.2.
 
-The consequence is that the deadline has to be comfortably shorter than whatever
-will kill the process:
+The bound has to be comfortably shorter than whatever will kill the process:
 
 | | |
 |---|---|
@@ -340,25 +327,24 @@ will kill the process:
 
 Twenty seconds inside a thirty-second grace period leaves ten for the HTTP
 server, for whatever else is in the group, and for the process to actually exit.
-Setting the two equal means the orchestrator wins the race sometimes, and a
-shutdown that is correct on most deployments is one nobody debugs until it is
-not.
+Under Docker's ten-second default, set `DrainTimeout` lower. Setting the two
+equal means the orchestrator wins the race sometimes, and a shutdown that is
+correct on most deployments is one nobody debugs until it is not.
 
-**What is lost when the deadline expires** is worth being exact about, because
+**What is lost when the bound expires** is worth being exact about, because
 "the drain timed out" sounds worse than it is:
 
 - Messages whose handlers had not finished are **not acknowledged**, so the
-  broker redelivers them. The work may be done twice. This is the ordinary
-  at-least-once case that handlers should already be idempotent against — see
-  [duplicates](reliability.md#duplicates).
-- Messages that were mid-settlement are back with the broker, one attempt
-  behind where they would have been.
-- Messages that needed dead-lettering in that window went to the broker's
-  dead-letter exchange without the reason attached, or nowhere.
+  broker redelivers them once the channel closes. The work may be done twice.
+  This is the ordinary at-least-once case that handlers should already be
+  idempotent against — see [duplicates](reliability.md#duplicates).
+- A handler that noticed the cancellation and gave up inside the half-second
+  grace still has its message filed in `{queue}.dlq` with the reason. One that
+  gave up later may find its dead-letter publish landed but its acknowledgement
+  refused by the closed channel, in which case the message is both in
+  `{queue}.dlq` and redelivered — a duplicate, not a loss.
 
-Nothing is silently dropped. What is lost is the *reasons* — which is exactly the
-thing an operator draining `{queue}.dlq` a week later needs and cannot
-reconstruct.
+Nothing is dropped and nothing is dead-lettered because shutdown cut it off.
 
 ## Health and readiness
 
@@ -653,8 +639,8 @@ generator and wants a provider function it can call — which is what `NewConn`
 is.
 
 What a Go service author actually needs is not a container. It is to know that
-`Close` waits for handlers but not for publishers, that an in-process backoff is
-inside the drain, that the consumers' context should outlive the signal, and how
+`Close` waits for handlers but not for publishers and not for what was only
+prefetched, that an in-process backoff is inside the drain, that the consumers' context should outlive the signal, and how
 long the whole thing may take. None of that is something a container could have
 told you, and all of it is on this page.
 

@@ -93,9 +93,13 @@ func (g *ConsumerGroup) Size() int {
 // Queue is what they are reading.
 func (g *ConsumerGroup) Queue() string { return g.queue }
 
-// Close stops every consumer and waits for handlers already running.
+// Close stops every consumer and waits, up to the drain bound, for handlers
+// already running.
 //
-// All of them are closed even if one fails, because leaving the rest running
+// They are closed side by side, so the group drains within one
+// [acemq.DrainTimeout] rather than one per consumer; a bound that expired shows
+// as an [acemq.ErrDrainTimeout] in the joined error. All of them are closed even
+// if one fails, because leaving the rest running
 // after a failed shutdown is worse than the failure. The errors are joined.
 func (g *ConsumerGroup) Close() error {
 	g.closeOnce.Do(func() {
@@ -105,12 +109,16 @@ func (g *ConsumerGroup) Close() error {
 		g.consumers = nil
 		g.mu.Unlock()
 
-		var errs []error
-		for _, consumer := range consumers {
-			if err := consumer.Close(); err != nil {
-				errs = append(errs, err)
-			}
+		errs := make([]error, len(consumers))
+		var wg sync.WaitGroup
+		for i, consumer := range consumers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs[i] = consumer.Close()
+			}()
 		}
+		wg.Wait()
 		g.closeErr = errors.Join(errs...)
 	})
 	return g.closeErr

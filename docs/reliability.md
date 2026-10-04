@@ -402,8 +402,10 @@ process that then crashes before doing the work.
 defer mq.Close()
 ```
 
-Closes every consumer, waits for handlers already running, and then releases the
-connection. A message being worked on is finished and acknowledged rather than
+Closes every consumer, waits for handlers already running — up to each
+consumer's `DrainTimeout`, twenty seconds by default — and then releases the
+connection. Deliveries that arrived but never reached a handler go back to the
+broker rather than being run. A message being worked on is finished and acknowledged rather than
 abandoned for the broker to hand to somebody else — which would mean the work
 happened twice.
 
@@ -416,8 +418,9 @@ signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 mq.Close()
 ```
 
-Give the process long enough to drain. A container killed nine seconds into a
-ten-second handler leaves that message to be redone by somebody else.
+Give the process longer than the drain bound. A container killed nine seconds
+into a ten-second handler leaves that message to be redone by somebody else;
+under Docker's ten-second stop timeout, set `acemq.DrainTimeout` below it.
 
 That is the whole of it for a program with one consumer and nothing else running.
 A service with several consumers, an HTTP server and a deadline it has to respect
