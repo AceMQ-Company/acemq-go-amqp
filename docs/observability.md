@@ -166,14 +166,15 @@ It is the same word the tracing adapter puts on that delivery's span as
 filtered to dead letters and a trace search for them return the same set. There
 is a test that asserts exactly that.
 
-`acemq.publish.total` carries the same tag, with four words of its own:
+`acemq.publish.total` carries the same tag, with five words of its own:
 
 | `outcome` | |
 |---|---|
 | `confirmed` | the broker took responsibility for it |
 | `published` | it went out with nothing promised, which is what a publisher without confirms gets |
 | `unroutable` | it was mandatory and reached no queue at all |
-| `failed` | the publish errored |
+| `refused` | the library declined it before writing anything, because the broker had blocked the connection (`PublishingPausedError`); nothing was sent, so a retry cannot duplicate it |
+| `failed` | the publish errored any other way — a nack, a confirm that never came, a broken socket, the outstanding-publish permit wait running out — so treat it as possibly lost |
 
 `unroutable` is deliberately not `failed`. Nothing went wrong — nothing was
 listening — and a single failure counter cannot tell a broken publisher from an
@@ -312,7 +313,9 @@ writes the same set.
 
 ### Which outcomes are errors
 
-`unroutable`, `failed` and `dead_lettered` set the span status to `ERROR`.
+`unroutable`, `failed` and `dead_lettered` set the span status to `ERROR`. A
+`refused` publish span is an error too, because the publish returned one, but
+its outcome stays `refused`.
 
 `acked`, `retried`, `rejected`, `parked`, `confirmed`, `published`, `answered`
 and `timed_out` do not. A retry is the system working — the message will be tried

@@ -17,6 +17,7 @@ package acemq
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -909,5 +910,61 @@ func TestConnHealthGivesUpBeforeTheAggregateDoes(t *testing.T) {
 	}
 	if strings.Contains(report.Detail, "the check did not answer") {
 		t.Error("the aggregate gave up on a check that had an answer ready")
+	}
+}
+
+// answeringTransport is a broker whose every publish answers with err. It is
+// how a test reaches a refusal the in-memory broker cannot produce: a blocked
+// connection, or a nack.
+type answeringTransport struct {
+	Transport
+	err error
+}
+
+func (a answeringTransport) Publish(context.Context, string, string, Outbound) (PublishResult, error) {
+	return PublishResult{}, a.err
+}
+
+func (a answeringTransport) Close() error { return nil }
+
+// TestARefusedPublishIsCountedApartFromAFailedOne is the line between refused
+// and failed. A publish the library declined before writing a byte — the broker
+// had blocked the connection — cannot have arrived, so retrying it cannot
+// duplicate anything. A failed one may have arrived. Counting both as failed
+// made a drill's failure count meaningless whenever the broker pushed back.
+func TestARefusedPublishIsCountedApartFromAFailedOne(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"paused", &PublishingPausedError{Reason: "low on memory"}, OutcomeRefused},
+		{"paused, wrapped", fmt.Errorf("sending: %w", &PublishingPausedError{Reason: "disk"}), OutcomeRefused},
+		{"nacked", &PublishFailedError{MessageID: "m", Err: errors.New("the broker refused it")}, OutcomeFailed},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			metrics := NewMetrics()
+			mq, err := NewConn(answeringTransport{err: c.err}, WithObserver(metrics))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := NewPublisher[OrderPlaced](mq, "", "orders").
+				Send(context.Background(), OrderPlaced{OrderID: "o-1"}); err == nil {
+				t.Fatal("the publish succeeded")
+			}
+
+			counts := metrics.Counts()
+			for _, outcome := range []string{OutcomeRefused, OutcomeFailed} {
+				labels := map[string]string{TagExchange: "", TagRoutingKey: "orders", TagOutcome: outcome}
+				want := int64(0)
+				if outcome == c.want {
+					want = 1
+				}
+				if got := counts[metricKey(MetricPublishTotal, labels)]; got != want {
+					t.Errorf("%s{outcome=%s} = %d, want %d", MetricPublishTotal, outcome, got, want)
+				}
+			}
+		})
 	}
 }

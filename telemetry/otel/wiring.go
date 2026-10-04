@@ -143,6 +143,10 @@ func finishPublish(span *Span, result acemq.PublishResult, err error) {
 				span.Span().SetAttributes(
 					attribute.String(AttrReason, failed.Err.Error()))
 			}
+		} else if paused := (*acemq.PublishingPausedError)(nil); errors.As(err, &paused) {
+			// Declined before a byte was written: nothing to lose, nothing to
+			// duplicate on a retry. Still an error span, because the caller got one.
+			span.Outcome(OutcomeRefused)
 		} else {
 			span.Outcome(OutcomeFailed)
 		}

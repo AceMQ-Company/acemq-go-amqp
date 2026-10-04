@@ -166,6 +166,10 @@ const (
 	// problem.
 	OutcomeUnroutable = acemq.OutcomeUnroutable
 
+	// OutcomeRefused is a publish the library declined before writing anything,
+	// because the broker had blocked the connection. Nothing was sent.
+	OutcomeRefused = acemq.OutcomeRefused
+
 	// OutcomeFailed is a publish or a handler that returned an error or panicked.
 	OutcomeFailed = acemq.OutcomeFailed
 

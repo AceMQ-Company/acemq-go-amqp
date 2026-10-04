@@ -1357,3 +1357,32 @@ func TestAParkedDeliveryUnderTheEngineReportsParkedOnBothSides(t *testing.T) {
 			acemq.MetricConsumeTotal, acemq.OutcomeParked, parked)
 	}
 }
+
+// pausedTransport is a broker that has blocked the connection: every publish is
+// refused before anything is written.
+type pausedTransport struct{ acemq.Transport }
+
+func (pausedTransport) Publish(context.Context, string, string, acemq.Outbound) (acemq.PublishResult, error) {
+	return acemq.PublishResult{}, &acemq.PublishingPausedError{Reason: "low on memory"}
+}
+
+func (pausedTransport) Close() error { return nil }
+
+// TestARefusedPublishSaysRefusedOnItsSpan keeps the span and the counter on the
+// same word for a publish declined because the broker blocked the connection.
+func TestARefusedPublishSaysRefusedOnItsSpan(t *testing.T) {
+	r := record(t)
+	mq, err := acemq.NewConn(pausedTransport{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tracing.NewPublisher[OrderPlaced](r.tracing, mq, "", "orders").
+		Send(context.Background(), OrderPlaced{OrderID: "1"}); err == nil {
+		t.Fatal("a publish on a blocked connection succeeded")
+	}
+
+	span := r.named(t, "orders publish")
+	if got := attr(t, span, tracing.AttrOutcome).AsString(); got != tracing.OutcomeRefused {
+		t.Errorf("%s = %q, want %q", tracing.AttrOutcome, got, tracing.OutcomeRefused)
+	}
+}

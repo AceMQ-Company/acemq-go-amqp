@@ -54,7 +54,7 @@ const (
 	MetricPublishDuration = "acemq.publish.duration"
 
 	// MetricPublishTotal counts messages handed to the broker, tagged with the
-	// outcome: confirmed, published, unroutable or failed.
+	// outcome: confirmed, published, unroutable, refused or failed.
 	//
 	// confirmed means the broker took responsibility. published means it went
 	// out with nothing promised, which is what a publisher without confirms
@@ -238,8 +238,16 @@ const (
 	// The broker handed it back rather than dropping it.
 	OutcomeUnroutable = "unroutable"
 
-	// OutcomeFailed is a publish that errored, or an outbox record the relay
-	// could not get out.
+	// OutcomeRefused is a publish the library declined before writing anything
+	// to the broker — today, one made while the broker has blocked the
+	// connection ([PublishingPausedError]). Nothing was sent, so it cannot have
+	// arrived and retrying it cannot duplicate it.
+	OutcomeRefused = "refused"
+
+	// OutcomeFailed is any other publish that errored: a nack, a confirm that
+	// never came, a broken socket, or the wait for an outstanding-publish permit
+	// running out (counted here, as every AceMQ library does). Treat it as
+	// possibly lost. Also an outbox record the relay could not get out.
 	OutcomeFailed = "failed"
 
 	// OutcomeAnswered and OutcomeTimedOut are a request/reply round trip's,

@@ -106,7 +106,9 @@ acemq_consume_in_flight{queue="orders.placed"} 0
 Twenty published, sixteen handled, four given up on. The `outcome` label is what
 makes that readable, and it is worth alerting on the difference between
 `unroutable` and `failed`: one is a binding that was never declared and the other
-is the broker or the network.
+is the broker or the network. `refused` is a third, quieter word: the broker
+blocked the connection (a memory or disk alarm) and the library declined the
+publish before writing anything, so nothing is lost and a retry is safe.
 
 The labels differ between the two sides on purpose: a publish is tagged by where
 it went, `exchange` and `routing.key`, and a consume by where it came from,
@@ -248,6 +250,7 @@ what somebody searching a trace backend for dead letters fails to find.
 | What you see | What it usually means |
 |---|---|
 | `acemq_publish_total{outcome="unroutable"}` climbing | a binding was never declared, or a routing key has a typo |
+| `acemq_publish_total{outcome="refused"}` above zero | the broker has blocked the connection on a memory or disk alarm; nothing was sent, back off and retry |
 | `acemq_publish_total{outcome="published"}` rather than `confirmed` | confirms are off; nothing has been promised about those messages |
 | `acemq_messages_retried_total` climbing steadily | a dependency is flapping; the retry reasons are on the spans |
 | `acemq_messages_dead_lettered_total` climbing | a retry policy is running out — usually something that is down |

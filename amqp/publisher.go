@@ -250,7 +250,7 @@ func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (Pu
 	})
 	took := time.Since(started)
 	if err != nil {
-		observePublish(p.conn.observer, exchange, routingKey, OutcomeFailed, took)
+		observePublish(p.conn.observer, exchange, routingKey, publishErrorOutcome(err), took)
 		return result, err
 	}
 
@@ -281,6 +281,17 @@ func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (Pu
 	}
 	observePublish(p.conn.observer, exchange, routingKey, outcome, took)
 	return result, nil
+}
+
+// publishErrorOutcome is refused for a publish declined before anything was
+// written, which cannot have arrived, and failed for everything else, which may
+// have.
+func publishErrorOutcome(err error) string {
+	var paused *PublishingPausedError
+	if errors.As(err, &paused) {
+		return OutcomeRefused
+	}
+	return OutcomeFailed
 }
 
 func (p *Publisher[T]) envelope(opts []EnvelopeOption) (Envelope, error) {

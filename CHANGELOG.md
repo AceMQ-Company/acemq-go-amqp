@@ -8,6 +8,20 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **`refused`: a new value of the publish `outcome` tag.** A publish the library
+  declined before writing anything to the broker — today, one made while the
+  broker has blocked the connection, which returns `PublishingPausedError` — is
+  now counted as `acemq.publish.total{outcome="refused"}` (and timed under
+  `acemq.publish.duration` with the same tag), and the tracing adapter writes
+  `messaging.acemq.outcome = refused` on its span. It used to be `failed`.
+  `failed` keeps meaning possibly lost: a nack, a confirm that never came, a
+  broken socket, the outstanding-publish permit wait running out. Constants
+  `acemq.OutcomeRefused` and `otel.OutcomeRefused`. Additive, but a dashboard or
+  alert that sums `failed` to mean "every publish that errored" should add
+  `refused`. The same value lands in all five AceMQ libraries.
+
 ## [0.9.2] - 2026-10-03
 
 ### Added
