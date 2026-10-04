@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-04
+
 ### Added
 
 - **`refused`: a new value of the publish `outcome` tag.** A publish the library
