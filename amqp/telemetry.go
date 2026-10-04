@@ -112,14 +112,14 @@ const (
 	// MetricSetAsideFailed counts messages that could not be moved to a
 	// dead-letter or parking queue, usually because it has not been declared.
 	//
-	// The message is rejected to the broker instead, which is the last thing
-	// between it and nothing.
+	// The message is requeued instead, so it comes round again rather than
+	// being rejected into a queue's dead-lettering that is usually not there.
 	//
 	// The counter that separates two failures which look identical from anywhere
 	// else. A message dead-lettered normally leaves the source queue and appears
 	// in the dead-letter queue; a message whose dead-letter queue was never
-	// declared leaves the source queue and appears nowhere. Queue depths show one
-	// queue going down in both cases, and only this number says which happened.
+	// declared stays on the source queue and comes round again. Queue depths do
+	// not say why it keeps coming back; this number does.
 	MetricSetAsideFailed = "acemq.messages.set.aside.failed"
 
 	// MetricRungMissing counts long retries that had to wait in the consumer

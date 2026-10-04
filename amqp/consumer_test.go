@@ -1055,3 +1055,82 @@ func TestThePublishCounterIsTaggedRoutingKey(t *testing.T) {
 		t.Errorf("no counter keyed %q; got %v", want, metrics.Counts())
 	}
 }
+
+// A handler that gives up after its context has been cancelled — which is what a
+// shutdown looks like from inside one — is still giving up, and the message
+// still goes to {queue}.dlq. Under NoRetry every attempt is the last, so this is
+// the path every such consumer takes during Close. It used to inherit the
+// cancellation, have the republish refused, and reject the original without
+// requeue: on a queue with no dead-letter exchange, the message was gone.
+func TestGivingUpAfterTheContextIsCancelledStillDeadLetters(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mq := brokerFor(t, WithRetry(NoRetry()))
+	declare(t, mq, "orders")
+
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			cancel()
+			return Retry(errors.New("shutting down"))
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(context.Background(), OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the message to reach the dead-letter queue", func() bool {
+		n, err := mq.MessageCount(context.Background(), "orders.dlq")
+		return err == nil && n == 1
+	})
+	if n, err := mq.MessageCount(context.Background(), "orders"); err != nil || n != 0 {
+		t.Errorf("the source queue holds %d messages (%v), want none", n, err)
+	}
+}
+
+// A dead-letter publish that does not land leaves the message with nobody but
+// the broker, so it goes back to the queue rather than being rejected into
+// whatever — usually nothing — the queue's own dead-lettering points at.
+func TestADeadLetterThatDoesNotLandGoesBackToTheQueue(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t, WithRetry(NoRetry()))
+	declare(t, mq, "orders")
+
+	var mu sync.Mutex
+	calls := 0
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			mu.Lock()
+			defer mu.Unlock()
+			calls++
+			if calls == 1 {
+				return Reject(errors.New("not today"))
+			}
+			return Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	// Consume declared orders.dlq; take it away so the dead-letter publish
+	// comes back unroutable.
+	if err := mq.DeleteQueue(ctx, "orders.dlq"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the message to come round again", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls >= 2
+	})
+}

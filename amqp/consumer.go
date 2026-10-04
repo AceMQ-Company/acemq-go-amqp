@@ -569,20 +569,36 @@ func (c *Consumer) setAside(ctx context.Context, d Delivery, env Envelope, targe
 	failed := env
 	failed.Error = reason
 
+	// Detached from the handler's cancellation. A handler that gives up during
+	// shutdown has still given up — under NoRetry every Retry does — and a
+	// set-aside refused because the consume context was cancelled used to leave
+	// the message with nowhere to go. Bounded instead, so a broker that never
+	// confirms cannot hold Close for ever. A retry hop keeps the cancellation:
+	// refused, it requeues, which loses nothing.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), setAsideTimeout)
+	defer cancel()
+
 	routed, err := c.republish(ctx, d, target, failed)
 	if err != nil || !routed {
-		// Rejected rather than acknowledged: without a queue to put it in, the
-		// broker's own dead-lettering is the last thing left between this message
-		// and nothing.
+		// Requeued rather than rejected. A reject without requeue hands the
+		// message to the queue's own dead-lettering, and on a queue that has
+		// none — the common case — that is nowhere: the message was lost
+		// whenever the set-aside did not land, most often during shutdown. Back
+		// on the queue it is at worst seen again; rejected it is gone.
 		c.conn.observer.Count(MetricSetAsideFailed, 1, map[string]string{
 			TagQueue: c.queue, TagTarget: target})
-		c.nack(d, false)
+		c.nack(d, true)
 		return
 	}
 	if d.Ack != nil {
 		_ = d.Ack()
 	}
 }
+
+// setAsideTimeout bounds one set-aside republish, including its confirm, once
+// it no longer answers to the handler's context. The same thirty seconds the
+// transport allows a dial.
+const setAsideTimeout = 30 * time.Second
 
 // republish sends the original bytes to a queue by name, and says whether they
 // arrived.

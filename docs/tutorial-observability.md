@@ -254,7 +254,7 @@ what somebody searching a trace backend for dead letters fails to find.
 | `acemq_consume_total{outcome="parked"}` climbing | messages nothing could read — a schema change or a bad deploy; look in `{queue}.parked` |
 | `acemq_retry_rung_missing` above zero | a rung queue was never declared; the `rung` label names the one to declare |
 | `acemq_consume_in_flight` at the prefetch and flat | handlers are stuck, not slow |
-| `acemq_messages_set_aside_failed` above zero | a dead letter could not be republished. **This is the one that loses messages** |
+| `acemq_messages_set_aside_failed` above zero | a dead letter could not be republished, so it was requeued and will come round again; the `target` label names the queue to declare |
 | `acemq_outbox_lag` growing | the relay has stopped; nothing errors and the database fills |
 | `/acemq-health` 503 | the connection is down |
 

@@ -8,6 +8,20 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A message given up on during shutdown is no longer lost.** A handler that
+  returned `Retry` on its last attempt — every attempt, under `NoRetry()` — or
+  `Reject` after its context had been cancelled, as it is during `Consumer.Close`,
+  had its publish to `{queue}.dlq` refused on that cancelled context, and the
+  delivery was then rejected without requeue. On a queue with no
+  `x-dead-letter-exchange` the message ended up in neither the queue nor the
+  dead-letter queue. The set-aside publish (to `{queue}.dlq` or `{queue}.parked`)
+  is now detached from the handler's cancellation and bounded at thirty seconds,
+  and a set-aside that does not land is nacked with requeue rather than rejected.
+  `acemq.MetricSetAsideFailed` still counts each one. Retry hops were not
+  affected: a refused hop already requeued.
+
 ## [0.9.1] - 2026-09-27
 
 ### Added

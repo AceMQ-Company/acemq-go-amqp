@@ -1909,3 +1909,44 @@ func TestTheSchedulerTopologyIsTheOneJavaDeclares(t *testing.T) {
 		_ = ch.Close()
 	}
 }
+
+// TestGivingUpDuringShutdownDeadLettersAgainstARealBroker is the shutdown case
+// the in-memory broker cannot fully stand in for, because only a real transport
+// refuses a publish on a cancelled context. The queue has no dead-letter
+// exchange, so a reject without requeue would leave the message nowhere.
+func TestGivingUpDuringShutdownDeadLettersAgainstARealBroker(t *testing.T) {
+	mq := connect(t, acemq.WithRetry(acemq.NoRetry()))
+	queue := queueName(t)
+	dlq := acemq.DeadLetterQueue(queue)
+	removeAtEnd(t, []string{queue}, nil)
+
+	bg := context.Background()
+	if err := mq.DeclareQueue(bg, queue); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	sub, err := acemq.Consume(ctx, mq, queue,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
+			cancel()
+			return acemq.Retry(errors.New("shutting down"))
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := acemq.NewPublisher[OrderPlaced](mq, "", queue).
+		Send(bg, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the message to reach "+dlq, func() bool {
+		d, _ := mq.MessageCount(bg, dlq)
+		return d == 1
+	})
+	_ = sub.Close()
+	if n, err := mq.MessageCount(bg, queue); err != nil || n != 0 {
+		t.Errorf("the source queue holds %d messages (%v), want none", n, err)
+	}
+}

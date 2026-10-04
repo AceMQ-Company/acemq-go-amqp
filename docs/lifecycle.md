@@ -271,11 +271,14 @@ with a requeue, not lost. It comes round again after the restart at the same
 attempt number, because a requeue hands back the bytes the broker was given and
 the attempt counter rides on those bytes. One extra attempt, no lost message.
 
-The price is the one named earlier: with that context cancelled, nothing else can
-be republished either. A handler that rejects a message during that window
-cannot file it in `{queue}.dlq`; the delivery is nacked without requeue and the
-broker's own dead-lettering, if the queue has any, is what catches it.
-`acemq.MetricSetAsideFailed` counts each one.
+A handler that gives up during that window — rejects, or returns `Retry` on its
+last attempt, which under `NoRetry()` is every attempt — still has its message
+filed in `{queue}.dlq` (or `{queue}.parked`). That publish is detached from the
+cancelled context and bounded at thirty seconds of its own. If it still does not
+land — the broker is gone, or the queue was never declared — the delivery is
+nacked *with* requeue, never rejected, and `acemq.MetricSetAsideFailed` counts
+each one. On a queue with no dead-letter exchange a reject would have been the
+end of the message.
 
 **Which is why the cancellation comes last, and never first.** Cancelling the
 consumers' context is not a way to hurry a drain along. It is the thing you do
