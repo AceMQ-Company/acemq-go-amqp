@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-04
+
 ### Added
 
 - **`Close` is bounded: `DrainTimeout`, twenty seconds by default.**
