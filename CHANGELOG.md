@@ -8,6 +8,17 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`SQLIdempotencyStore.Claim` no longer reads an unknown reclaim outcome as
+  "already claimed".** When the update that takes over an abandoned claim could
+  not report its row count, `Claim` returned `false, nil`, so `Idempotent` acked
+  the redelivery as a duplicate and the work a killed process never finished was
+  dropped. It now returns the error, and the message is retried. The claim
+  insert itself was already correct: it uses `ON CONFLICT DO NOTHING` and
+  propagates every error, which new tests pin down (an insert trigger raising
+  `database is locked`, and a closed database, both requeue the message).
+
 ## [0.9.3] - 2026-10-04
 
 ### Added

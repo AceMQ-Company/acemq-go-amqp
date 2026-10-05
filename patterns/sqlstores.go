@@ -199,9 +199,10 @@ func (s *SQLIdempotencyStore) Claim(ctx context.Context, key string) (bool, erro
 	}
 	affected, err := stolen.RowsAffected()
 	if err != nil {
-		// Cannot tell whether the stale claim was taken. Not claiming is the safe
-		// answer here: the alternative is two consumers believing they own it.
-		return false, nil
+		// Cannot tell whether the stale claim was taken, so say so. "Not claimed"
+		// would ack the redelivery as a duplicate and drop work a killed process
+		// never finished; "claimed" risks two owners. An error requeues it.
+		return false, fmt.Errorf("acemq: cannot tell whether idempotency key %q was reclaimed: %w", key, err)
 	}
 	return affected > 0, nil
 }

@@ -605,3 +605,80 @@ func TestALiveClaimIsNotStolen(t *testing.T) {
 		t.Error("a claim inside its window was taken by a second caller")
 	}
 }
+
+// An insert that fails for any reason but a duplicate key must surface as an
+// error, never as "already claimed": the consumer acks a duplicate, so reading a
+// lock timeout as one acks a message nothing handled. .NET shipped exactly that.
+func TestAFailedClaimInsertIsAnErrorNotADuplicate(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	store := patterns.NewSQLIdempotencyStore(db, patterns.SQLiteDialect)
+	apply(t, db, store.Schema())
+	// Not through apply, which splits on the semicolon inside the trigger body.
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER locked BEFORE INSERT ON acemq_idempotency
+BEGIN SELECT RAISE(ABORT, 'database is locked'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	if claimed, err := store.Claim(ctx, "m-1"); err == nil {
+		t.Fatalf("a failed insert was read as an answer (claimed=%v) instead of an error", claimed)
+	}
+
+	handled := false
+	handler := patterns.Idempotent(store,
+		func(context.Context, acemq.Message[OrderPlaced]) acemq.Ack {
+			handled = true
+			return acemq.Accept()
+		})
+	ack := handler(ctx, acemq.Message[OrderPlaced]{Envelope: acemq.Envelope{ID: "m-1"}})
+	if ack.String() != "retry" || handled {
+		t.Fatalf("a store failure must requeue the message, got %s (handled=%v)", ack, handled)
+	}
+}
+
+func TestAClaimOnAClosedDatabaseIsAnError(t *testing.T) {
+	db := openDB(t)
+	store := patterns.NewSQLIdempotencyStore(db, patterns.SQLiteDialect)
+	apply(t, db, store.Schema())
+	_ = db.Close()
+
+	if claimed, err := store.Claim(context.Background(), "m-1"); err == nil {
+		t.Fatalf("a closed database was read as an answer (claimed=%v)", claimed)
+	}
+}
+
+// updateWithoutRowCount is a database whose UPDATE cannot say how many rows it
+// changed, which is the one error Claim used to swallow.
+type updateWithoutRowCount struct{ *sql.DB }
+
+type noRowCount struct{ sql.Result }
+
+func (noRowCount) RowsAffected() (int64, error) { return 0, errors.New("row count unavailable") }
+
+func (d updateWithoutRowCount) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	result, err := d.DB.ExecContext(ctx, q, args...)
+	if err == nil && strings.HasPrefix(q, "UPDATE") {
+		return noRowCount{result}, nil
+	}
+	return result, err
+}
+
+// Not knowing whether an abandoned claim was taken is not knowing, and must not
+// come back as "somebody else has it": that acks the redelivery and the work a
+// killed process never finished is dropped.
+func TestAnUnknownReclaimOutcomeIsAnErrorNotADuplicate(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	store := patterns.NewSQLIdempotencyStore(updateWithoutRowCount{db}, patterns.SQLiteDialect)
+	apply(t, db, store.Schema())
+	store.SetClaimTimeout(time.Millisecond)
+
+	if _, err := store.Claim(ctx, "m-1"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	if claimed, err := store.Claim(ctx, "m-1"); err == nil {
+		t.Fatalf("an unknown reclaim outcome was read as an answer (claimed=%v)", claimed)
+	}
+}
