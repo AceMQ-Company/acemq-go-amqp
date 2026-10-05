@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-10-04
+
 ### Fixed
 
 - **`SQLIdempotencyStore.Claim` no longer reads an unknown reclaim outcome as
