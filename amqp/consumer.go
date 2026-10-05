@@ -335,6 +335,14 @@ func handleDelivery[T any](
 
 	var payload T
 	if err := decodeWith(cfg.codec, d.ContentType, d.Body, &payload); err != nil {
+		var retryable *RetryableError
+		if errors.As(err, &retryable) && !IsFatal(err) {
+			// The codec said the failure was not the body's: a claim-check store
+			// that timed out may answer next time. It goes round the retry
+			// policy like a handler's retry, with no handler time to report.
+			c.settle(ctx, d, env, Retry(err), func(s Settlement) { c.settled(hook, s) })
+			return
+		}
 		// A body that will not decode decodes no better next time, so it does not
 		// go round the retry schedule until it ages out.
 		//
@@ -372,17 +380,29 @@ func handleDelivery[T any](
 	// which would make every retrying consumer look slow.
 	took := time.Since(started)
 
+	c.settle(ctx, d, env, ack, func(s Settlement) { c.settledAfterHandler(hook, s, took) })
+}
+
+// settle carries out what was decided about a delivery — by its handler, or by
+// the engine for a body whose decoding failed in a way worth retrying — and
+// reports it through report.
+//
+// One function for both, so a decode retry goes through exactly the retry
+// policy, the attempt counter and the dead-lettering a handler's retry does.
+func (c *Consumer) settle(
+	ctx context.Context, d Delivery, env Envelope, ack Ack, report func(Settlement),
+) {
 	switch ack.action {
 	case ackAccept:
 		if d.Ack != nil {
 			_ = d.Ack()
 		}
-		c.settledAfterHandler(hook, Settlement{
+		report(Settlement{
 			Queue:    c.queue,
 			Action:   SettledAccepted,
 			Outcome:  OutcomeAcked,
 			Envelope: env,
-		}, took)
+		})
 
 	case ackReject:
 		// Dead-lettered, but counted and traced as rejected. Both end in the
@@ -391,13 +411,13 @@ func handleDelivery[T any](
 		// running out of room to try again.
 		reason := "the handler rejected it: " + describe(ack.err)
 		c.deadLetter(ctx, d, env, reason)
-		c.settledAfterHandler(hook, Settlement{
+		report(Settlement{
 			Queue:    c.queue,
 			Action:   SettledDeadLettered,
 			Outcome:  OutcomeRejected,
 			Envelope: env,
 			Reason:   reason,
-		}, took)
+		})
 
 	case ackPark:
 		// The handler read far enough to know the message is unreadable. The
@@ -406,13 +426,13 @@ func handleDelivery[T any](
 		// either way, and which layer noticed is not their question.
 		reason := "the handler parked it: " + describe(ack.err)
 		c.park(ctx, d, env, reason)
-		c.settledAfterHandler(hook, Settlement{
+		report(Settlement{
 			Queue:    c.queue,
 			Action:   SettledParked,
 			Outcome:  OutcomeParked,
 			Envelope: env,
 			Reason:   reason,
-		}, took)
+		})
 
 	case ackRetry:
 		if IsFatal(ack.err) {
@@ -421,13 +441,13 @@ func handleDelivery[T any](
 			// the point of having it.
 			reason := "the handler reported an unprocessable message: " + describe(ack.err)
 			c.deadLetter(ctx, d, env, reason)
-			c.settledAfterHandler(hook, Settlement{
+			report(Settlement{
 				Queue:    c.queue,
 				Action:   SettledDeadLettered,
 				Outcome:  OutcomeDeadLettered,
 				Envelope: env,
 				Reason:   reason,
-			}, took)
+			})
 			return
 		}
 
@@ -445,26 +465,26 @@ func handleDelivery[T any](
 			// that stops at the handler reports the first and never the second.
 			reason := c.exhausted(env) + ": " + describe(ack.err)
 			c.deadLetter(ctx, d, env, reason)
-			c.settledAfterHandler(hook, Settlement{
+			report(Settlement{
 				Queue:    c.queue,
 				Action:   SettledDeadLettered,
 				Outcome:  OutcomeDeadLettered,
 				Envelope: env,
 				Reason:   reason,
-			}, took)
+			})
 			return
 		}
 
 		// Said before the retry rather than after it, so the delay reported is
 		// the one just chosen and not one already spent — and so a span covering
 		// the handler is not held open across a wait the handler is not doing.
-		c.settledAfterHandler(hook, Settlement{
+		report(Settlement{
 			Queue:    c.queue,
 			Action:   SettledRetried,
 			Outcome:  OutcomeRetried,
 			Envelope: env.NextAttempt(),
 			Delay:    wait.Delay,
-		}, took)
+		})
 
 		if wait.InBroker && c.retryInBroker(ctx, d, env, wait.Delay) {
 			return
@@ -487,13 +507,13 @@ func handleDelivery[T any](
 		// Somebody else holds the message. Not a failure of this one, so the
 		// retry policy is not asked: it could neither spend an attempt on it nor
 		// run out and dead-letter a message nobody has failed to handle.
-		c.settledAfterHandler(hook, Settlement{
+		report(Settlement{
 			Queue:    c.queue,
 			Action:   SettledInProgress,
 			Outcome:  OutcomeInProgress,
 			Envelope: env,
 			Delay:    ack.delay,
-		}, took)
+		})
 		if ack.delay > 0 {
 			select {
 			case <-time.After(ack.delay):

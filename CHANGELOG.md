@@ -52,6 +52,15 @@ While the version is `0.x` the public API may change in any release.
   with an expired lease is retaken and run. A custom store without `TryClaim`
   behaves as before.
 
+- **A claim-check store that times out no longer parks the message.**
+  `ClaimCheckCodec` already called a store failure retryable, unlike a missing
+  key, but the consumer parked every decode error. The store failure is now
+  wrapped in `acemq.Retryable`, and the consumer sends a decode error carrying
+  that mark (`*acemq.RetryableError`, not fatal) through the retry policy, as
+  if the handler had returned `acemq.Retry`. An unreadable body, or any
+  unmarked decode error, is still parked. A custom codec can opt in the same
+  way.
+
 - **`SQLIdempotencyStore` works on MySQL.** Every claim used to fail there: the
   schema's `key` column is a reserved word in MySQL (the `CREATE TABLE` did not
   even parse), and `MySQLDialect`'s `ON DUPLICATE KEY UPDATE id = id` named a

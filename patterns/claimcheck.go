@@ -279,7 +279,9 @@ func (c *ClaimCheckCodec) decode(body []byte, dst any, delegate func([]byte, any
 	if err != nil {
 		// The store failed rather than answered. Retryable, unlike a key it does
 		// not hold: an object store that timed out may well answer next time.
-		return fmt.Errorf("acemq: cannot read the claim check %q from the store: %w", key, err)
+		// Marked, because the consumer parks every other decode error.
+		return acemq.Retryable(
+			fmt.Errorf("acemq: cannot read the claim check %q from the store: %w", key, err))
 	}
 	if !found {
 		// Fatal rather than retryable, and said at length because the cause is

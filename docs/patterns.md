@@ -636,7 +636,9 @@ Nothing in it knows about messaging.
 `Get` tells **not found** from **failed**, and the codec treats them differently:
 a store that timed out may well answer next time, so that is retryable; a key the
 store does not hold never will be, so that is fatal and the message stops rather
-than circling.
+than circling. The store failure comes back wrapped in `acemq.Retryable`, and the
+consumer retries such a decode error through the retry policy. Until 0.9.5 every
+decode error was parked, the retryable one included.
 
 Two are supplied. `patterns.NewInMemoryClaimCheckStore()` is for tests — the
 payloads are in the publisher's own memory, so a consumer in another process

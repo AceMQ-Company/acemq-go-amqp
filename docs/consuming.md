@@ -68,7 +68,10 @@ queue of *messages nobody could read*, and somebody drains it looking for the
 producer that sent them. Mixing the two makes both drains guesswork.
 
 The engine parks a body the codec would not decode by itself, before any handler
-runs. `acemq.Park` is the same destination and the same reporting — `parked` on
+runs. The exception is a decode error the codec marks with `acemq.Retryable`. That
+mark means the failure was not the body's: a claim-check store that timed out,
+for example. Such a message goes through the retry policy like a handler's
+`acemq.Retry`, attempt counter and dead-lettering included. `acemq.Park` is the same destination and the same reporting — `parked` on
 the counter and on the span — for a handler that decoded the message fine and
 only then found it unreadable:
 
