@@ -139,11 +139,18 @@ if err != nil {
 mq, err := acemq.Connect(ctx, url, acemq.WithCodec(codec))
 ```
 
-`json` is registered by the package itself. An unknown name lists what is
-available, because somebody who typoed one cannot see the registry:
+`json`, `bytes`, and `text` (also registered as `string`) come with the
+package. `text` and `string` are the same `StringCodec` — UTF-8 text written
+as `text/plain; charset=utf-8` — under both names the AceMQ libraries use for it:
+Java and Python call it `text`, .NET and Ruby `string`, so one configuration
+value works across all five. A body that is not valid UTF-8 is refused as fatal
+rather than decoded into replacement characters, so it is parked.
+
+An unknown name lists what is available, because somebody who typoed one
+cannot see the registry:
 
 ```
-acemq: no codec named "jsn" is registered; known: [csv json]
+acemq: no codec named "jsn" is registered; known: [bytes csv json string text]
 ```
 
 ## The other formats

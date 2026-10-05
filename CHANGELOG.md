@@ -8,6 +8,20 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **A `text` codec name.** `acemq.CodecByName("text")` now returns the UTF-8
+  `StringCodec`, which was registered only as `string`. Java and Python call it
+  `text` and .NET and Ruby `string`; Go now answers to both, so a codec name in
+  shared configuration works in all five libraries.
+
+### Changed
+
+- **`StringCodec` refuses a body that is not valid UTF-8** when decoding into a
+  `string`, with a fatal error, so the message is parked rather than handed to
+  the handler full of replacement characters. Decoding into `[]byte` is
+  unchanged. Python's text codec already did this.
+
 ## [0.9.4] - 2026-10-04
 
 ### Fixed

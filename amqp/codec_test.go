@@ -133,3 +133,43 @@ type simpleError string
 func (e simpleError) Error() string { return string(e) }
 
 func errFor(s string) error { return simpleError(s) }
+
+// TestTheTextCodecIsRegisteredUnderBothFamilyNames pins the names a
+// configuration from any AceMQ library may use for it: Java and Python call it
+// "text", .NET and Ruby "string".
+func TestTheTextCodecIsRegisteredUnderBothFamilyNames(t *testing.T) {
+	for _, name := range []string{"text", "string"} {
+		codec, err := CodecByName(name)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if codec.ContentType() != TextContentType {
+			t.Errorf("%s writes %q, want %q", name, codec.ContentType(), TextContentType)
+		}
+		body, err := codec.Encode("héllo, wörld ✓")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		var got string
+		if err := codec.Decode(body, &got); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got != "héllo, wörld ✓" {
+			t.Errorf("%s round-tripped %q", name, got)
+		}
+		if !codec.CanDecode("text/plain") || codec.CanDecode("application/json") {
+			t.Errorf("%s chooses content types wrongly", name)
+		}
+	}
+}
+
+// A body that is not UTF-8 is not text, and decoding it into a string would
+// hand the handler replacement characters instead of refusing. Fatal, so it is
+// parked rather than retried, as in Python.
+func TestTheTextCodecRefusesABodyThatIsNotUTF8(t *testing.T) {
+	var got string
+	err := StringCodec{}.Decode([]byte{0xff, 0xfe, 'x'}, &got)
+	if err == nil || !IsFatal(err) {
+		t.Fatalf("invalid UTF-8 decoded into %q with err %v; want a fatal error", got, err)
+	}
+}

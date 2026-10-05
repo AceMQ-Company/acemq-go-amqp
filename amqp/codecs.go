@@ -17,6 +17,7 @@ package acemq
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // BytesContentType is what the bytes codec writes when nothing else is known.
@@ -79,7 +80,11 @@ func (BytesCodec) CanDecode(string) bool { return true }
 // TextContentType is what the string codec writes.
 const TextContentType = "text/plain; charset=utf-8"
 
-// StringCodec reads and writes text.
+// StringCodec reads and writes UTF-8 text.
+//
+// Registered as both "text" and "string", the two names the AceMQ libraries use
+// for it (Java and Python say text, .NET and Ruby string), so a configuration
+// written for any of them finds it here.
 //
 // For messages that really are text — a line of a log, a command somebody typed
 // — rather than a structure that happens to be readable. Prefer [JSONCodec]
@@ -105,9 +110,16 @@ func (StringCodec) Encode(payload any) ([]byte, error) {
 }
 
 // Decode copies the body into dst, which must be *string or *[]byte.
+//
+// Into a string the body must be UTF-8, and one that is not is a fatal error:
+// a body that is not text decodes no better next time, and converting it
+// anyway would hand the handler replacement characters instead of a refusal.
 func (StringCodec) Decode(body []byte, dst any) error {
 	switch v := dst.(type) {
 	case *string:
+		if !utf8.Valid(body) {
+			return Fatalf("acemq: this message is not UTF-8 text")
+		}
 		*v = string(body)
 		return nil
 	case *[]byte:
@@ -129,6 +141,7 @@ func (StringCodec) CanDecode(contentType string) bool {
 func init() {
 	RegisterCodec("bytes", func() Codec { return BytesCodec{} })
 	RegisterCodec("string", func() Codec { return StringCodec{} })
+	RegisterCodec("text", func() Codec { return StringCodec{} })
 }
 
 // CompositeCodec picks a codec by the message's content type.
