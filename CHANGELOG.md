@@ -41,6 +41,21 @@ While the version is `0.x` the public API may change in any release.
 
 ### Fixed
 
+- **`SQLOutboxStore` and `SQLSchemaRegistry` work on MySQL.** Neither had ever
+  run there. The outbox schema used `CREATE INDEX IF NOT EXISTS` and the
+  registry's `AUTOINCREMENT`, both rejected by MySQL, so the documented DDL could
+  not create either table; and every outbox and registry read scanned its
+  timestamp straight into `time.Time`, which fails on go-sql-driver/mysql's
+  default DSN (no `parseTime=true`). With `MySQLDialect`, `Schema()` now returns
+  MySQL DDL (`AUTO_INCREMENT`, the index declared inline, `DATETIME(6)` so the
+  outbox keeps sub-second order, `LONGBLOB` bodies), and timestamps are read
+  whether the driver returns them as time or text. The SQLite and PostgreSQL
+  DDL and statements are unchanged byte for byte, so no migration is needed.
+  The MySQL test module now runs the outbox (add, duplicate add, pending in
+  order, limit, failure, retire, mark published) and the registry (register,
+  re-register, new version, by ID, latest, versions, not found) against a real
+  MySQL 8.4.
+
 - **A redelivery that finds a live but unconfirmed idempotency claim is put back,
   not acknowledged.** `Idempotent` used to read every refused claim as a
   duplicate. If the first handler failed and its `Release` also failed, for example

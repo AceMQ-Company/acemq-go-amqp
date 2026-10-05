@@ -17,6 +17,7 @@ package sqltest
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -124,4 +125,142 @@ func TestOnlyTheMySQLSchemaQuotesTheKeyColumn(t *testing.T) {
 	if schema := patterns.NewSQLIdempotencyStore(nil, patterns.MySQLDialect).Schema(); !strings.Contains(schema, "`key`") {
 		t.Errorf("the MySQL schema does not quote the reserved column:\n%s", schema)
 	}
+}
+
+// TestTheMySQLOutboxAddsListsFailsAndPublishes is every outbox statement against
+// a real MySQL. Its schema used CREATE INDEX IF NOT EXISTS, which MySQL does not
+// have, so the table could not be created there from the documented DDL.
+func TestTheMySQLOutboxAddsListsFailsAndPublishes(t *testing.T) {
+	ctx := context.Background()
+	db, table := openMySQL(t)
+	store := patterns.NewSQLOutboxStore(db, patterns.MySQLDialect, table)
+	store.SetMaxAttempts(2)
+	apply(t, db, store.Schema())
+
+	base := time.Now().UTC().Truncate(time.Second)
+	for i, id := range []string{"o-1", "o-2", "o-3"} {
+		record := patterns.OutboxRecord{
+			ID: id, Exchange: "orders", RoutingKey: "order.placed",
+			Body: []byte(`{"n":` + fmt.Sprint(i) + `}`), ContentType: "application/json",
+			Headers: map[string]any{"tenant": "t-1"},
+			// Inside one second: the order survives only if the column keeps
+			// the fraction.
+			CreatedAt: base.Add(time.Duration(i) * time.Millisecond),
+		}
+		if err := store.Add(ctx, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A retried transaction adds the same record again; it must stay one.
+	if err := store.Add(ctx, patterns.OutboxRecord{ID: "o-1", Exchange: "orders", Body: []byte("x")}); err != nil {
+		t.Fatalf("adding a record twice failed: %v", err)
+	}
+
+	pending, err := store.Pending(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ids(pending); got != "o-1,o-2,o-3" {
+		t.Fatalf("pending = %s, want o-1,o-2,o-3 in order", got)
+	}
+	first := pending[0]
+	if string(first.Body) != `{"n":0}` || first.ContentType != "application/json" ||
+		first.Headers["tenant"] != "t-1" || !first.CreatedAt.Equal(base) {
+		t.Errorf("the record did not round-trip: %+v", first)
+	}
+	if limited, err := store.Pending(ctx, 1); err != nil || len(limited) != 1 {
+		t.Fatalf("the limit was not applied (%d, %v)", len(limited), err)
+	}
+
+	for range 2 {
+		if err := store.RecordFailure(ctx, "o-2", "NOT_FOUND - no exchange"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if pending, err = store.Pending(ctx, 10); err != nil || ids(pending) != "o-1,o-3" {
+		t.Fatalf("a retired record is still offered (%s, %v)", ids(pending), err)
+	}
+	retired, err := store.Retired(ctx)
+	if err != nil || len(retired) != 1 || retired[0].LastError != "NOT_FOUND - no exchange" {
+		t.Fatalf("the retired record was not kept with its reason (%+v, %v)", retired, err)
+	}
+
+	for _, id := range []string{"o-1", "o-3"} {
+		if err := store.MarkPublished(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if pending, err = store.Pending(ctx, 10); err != nil || len(pending) != 0 {
+		t.Fatalf("published records are still pending (%s, %v)", ids(pending), err)
+	}
+}
+
+// TestTheMySQLSchemaRegistryRegistersAndLooksUp is every registry statement
+// against a real MySQL. Its schema said AUTOINCREMENT, which is SQLite's
+// spelling; MySQL's is AUTO_INCREMENT, so the table could not be created there.
+func TestTheMySQLSchemaRegistryRegistersAndLooksUp(t *testing.T) {
+	ctx := context.Background()
+	db, table := openMySQL(t)
+	registry := patterns.NewSQLSchemaRegistry(db, patterns.MySQLDialect, table)
+	apply(t, db, registry.Schema())
+
+	v1, err := registry.Register(ctx, "order.placed", "json-schema", `{"type":"object"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1.Version != 1 || v1.ID == 0 || v1.RegisteredAt.IsZero() {
+		t.Fatalf("first registration = %+v", v1)
+	}
+	again, err := registry.Register(ctx, "order.placed", "json-schema", `{"type":"object"}`)
+	if err != nil || again.ID != v1.ID || again.Version != 1 {
+		t.Fatalf("re-registering the same definition added a version (%+v, %v)", again, err)
+	}
+	v2, err := registry.Register(ctx, "order.placed", "json-schema", `{"type":"object","required":["id"]}`)
+	if err != nil || v2.Version != 2 || v2.ID == v1.ID {
+		t.Fatalf("second definition = %+v, %v", v2, err)
+	}
+
+	if byID, err := registry.ByID(ctx, v1.ID); err != nil || byID.Definition != `{"type":"object"}` {
+		t.Fatalf("ByID = %+v, %v", byID, err)
+	}
+	if latest, err := registry.Latest(ctx, "order.placed"); err != nil || latest.ID != v2.ID {
+		t.Fatalf("Latest = %+v, %v", latest, err)
+	}
+	versions, err := registry.Versions(ctx, "order.placed")
+	if err != nil || len(versions) != 2 || versions[0].Version != 1 || versions[1].Version != 2 {
+		t.Fatalf("Versions = %+v, %v", versions, err)
+	}
+	if _, err := registry.Latest(ctx, "nobody"); !errors.Is(err, patterns.ErrSchemaNotFound) {
+		t.Fatalf("an unknown subject = %v, want ErrSchemaNotFound", err)
+	}
+}
+
+// The SQLite and Postgres DDL is in people's migrations already and must not
+// change; only MySQL gets its own.
+func TestOnlyTheMySQLSchemasDiffer(t *testing.T) {
+	for _, d := range []patterns.Dialect{patterns.PostgresDialect, patterns.SQLiteDialect} {
+		if s := patterns.NewSQLOutboxStore(nil, d).Schema(); !strings.Contains(s, "CREATE INDEX IF NOT EXISTS") {
+			t.Errorf("%s outbox schema changed:\n%s", d.Name, s)
+		}
+		if s := patterns.NewSQLSchemaRegistry(nil, d).Schema(); !strings.Contains(s, "AUTOINCREMENT") {
+			t.Errorf("%s registry schema changed:\n%s", d.Name, s)
+		}
+	}
+	for _, s := range []string{
+		patterns.NewSQLOutboxStore(nil, patterns.MySQLDialect).Schema(),
+		patterns.NewSQLSchemaRegistry(nil, patterns.MySQLDialect).Schema(),
+	} {
+		if strings.Contains(s, "CREATE INDEX") ||
+			strings.Contains(s, "AUTOINCREMENT") {
+			t.Errorf("the MySQL schema has syntax MySQL rejects:\n%s", s)
+		}
+	}
+}
+
+func ids(records []patterns.OutboxRecord) string {
+	out := make([]string, len(records))
+	for i, r := range records {
+		out[i] = r.ID
+	}
+	return strings.Join(out, ",")
 }

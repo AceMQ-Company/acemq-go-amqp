@@ -368,6 +368,24 @@ func (s *SQLOutboxStore) SetMaxAttempts(n int) {
 //	ALTER TABLE acemq_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
 //	ALTER TABLE acemq_outbox ADD COLUMN last_error TEXT;
 func (s *SQLOutboxStore) Schema() string {
+	if s.dialect.Name == MySQLDialect.Name {
+		// MySQL has no CREATE INDEX IF NOT EXISTS, so the index is declared with
+		// the table, and DATETIME(6) keeps the sub-second part of created_at that
+		// a TIMESTAMP rounds away, which Pending orders by. No existing MySQL
+		// table can be affected: the old schema did not parse there.
+		return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n"+
+			"  id            VARCHAR(255) PRIMARY KEY,\n"+
+			"  exchange      VARCHAR(255) NOT NULL,\n"+
+			"  routing_key   VARCHAR(255) NOT NULL,\n"+
+			"  body          LONGBLOB     NOT NULL,\n"+
+			"  content_type  VARCHAR(255) NOT NULL,\n"+
+			"  headers       TEXT         NOT NULL,\n"+
+			"  created_at    DATETIME(6)  NOT NULL,\n"+
+			"  attempts      INTEGER      NOT NULL DEFAULT 0,\n"+
+			"  last_error    TEXT,\n"+
+			"  INDEX %s_created_at (created_at)\n"+
+			");", s.table, s.table)
+	}
 	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
   id            VARCHAR(255) PRIMARY KEY,
   exchange      VARCHAR(255) NOT NULL,
@@ -474,7 +492,7 @@ func (s *SQLOutboxStore) records(rows *sql.Rows) ([]OutboxRecord, error) {
 		// what a NULL string scans into.
 		var lastError sql.NullString
 		if err := rows.Scan(&record.ID, &record.Exchange, &record.RoutingKey,
-			&record.Body, &record.ContentType, &headers, &record.CreatedAt,
+			&record.Body, &record.ContentType, &headers, (*sqlTime)(&record.CreatedAt),
 			&record.Attempts, &lastError); err != nil {
 			return nil, fmt.Errorf("acemq: cannot read an outbox row: %w", err)
 		}
@@ -545,6 +563,21 @@ func NewSQLSchemaRegistry(db DB, dialect Dialect, table ...string) *SQLSchemaReg
 
 // Schema is the table this registry needs. Put it in a migration.
 func (r *SQLSchemaRegistry) Schema() string {
+	if r.dialect.Name == MySQLDialect.Name {
+		// AUTOINCREMENT is SQLite's spelling; MySQL's is AUTO_INCREMENT, and
+		// DATETIME(6) keeps the sub-second part a TIMESTAMP rounds away. No
+		// existing MySQL table can be affected: the old schema did not parse there.
+		return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n"+
+			"  id            INTEGER      PRIMARY KEY AUTO_INCREMENT,\n"+
+			"  subject       VARCHAR(255) NOT NULL,\n"+
+			"  version       INTEGER      NOT NULL,\n"+
+			"  format        VARCHAR(64)  NOT NULL,\n"+
+			"  definition    TEXT         NOT NULL,\n"+
+			"  fingerprint   VARCHAR(64)  NOT NULL,\n"+
+			"  registered_at DATETIME(6)  NOT NULL,\n"+
+			"  UNIQUE (subject, fingerprint)\n"+
+			");", r.table)
+	}
 	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
   id            INTEGER      PRIMARY KEY AUTOINCREMENT,
   subject       VARCHAR(255) NOT NULL,
@@ -656,7 +689,7 @@ func (r *SQLSchemaRegistry) Versions(ctx context.Context, subject string) ([]Sch
 	for rows.Next() {
 		var s SchemaDefinition
 		if err := rows.Scan(&s.ID, &s.Subject, &s.Version, &s.Format,
-			&s.Definition, &s.Fingerprint, &s.RegisteredAt); err != nil {
+			&s.Definition, &s.Fingerprint, (*sqlTime)(&s.RegisteredAt)); err != nil {
 			return nil, fmt.Errorf("acemq: cannot read a schema row: %w", err)
 		}
 		out = append(out, s)
@@ -667,7 +700,7 @@ func (r *SQLSchemaRegistry) Versions(ctx context.Context, subject string) ([]Sch
 func (r *SQLSchemaRegistry) scanOne(row *sql.Row) (SchemaDefinition, error) {
 	var s SchemaDefinition
 	err := row.Scan(&s.ID, &s.Subject, &s.Version, &s.Format,
-		&s.Definition, &s.Fingerprint, &s.RegisteredAt)
+		&s.Definition, &s.Fingerprint, (*sqlTime)(&s.RegisteredAt))
 	if errors.Is(err, sql.ErrNoRows) {
 		return SchemaDefinition{}, ErrSchemaNotFound
 	}
@@ -675,4 +708,35 @@ func (r *SQLSchemaRegistry) scanOne(row *sql.Row) (SchemaDefinition, error) {
 		return SchemaDefinition{}, fmt.Errorf("acemq: cannot read a schema: %w", err)
 	}
 	return s, nil
+}
+
+// sqlTime scans a timestamp column whatever the driver hands back for it.
+//
+// go-sql-driver/mysql returns DATETIME as text unless the DSN says
+// parseTime=true, and a plain *time.Time refuses text, so on a default MySQL
+// DSN every outbox and schema read failed. Values are written in UTC, so text
+// without a zone is read as UTC.
+type sqlTime time.Time
+
+func (t *sqlTime) Scan(value any) error {
+	switch v := value.(type) {
+	case time.Time:
+		*t = sqlTime(v)
+		return nil
+	case []byte:
+		return t.parse(string(v))
+	case string:
+		return t.parse(v)
+	}
+	return fmt.Errorf("acemq: cannot read %T as a time", value)
+}
+
+func (t *sqlTime) parse(text string) error {
+	for _, layout := range []string{"2006-01-02 15:04:05.999999999", time.RFC3339Nano} {
+		if parsed, err := time.ParseInLocation(layout, text, time.UTC); err == nil {
+			*t = sqlTime(parsed)
+			return nil
+		}
+	}
+	return fmt.Errorf("acemq: cannot read %q as a time", text)
 }

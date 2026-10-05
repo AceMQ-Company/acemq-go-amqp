@@ -109,7 +109,9 @@ jobs:
           ACEMQ_TEST_MYSQL_DSN: root:acemq@tcp(127.0.0.1:3306)/acemq
         run: |
           cd patterns/sqltest
-          go test -race -count=1 ./...
+          # -v so the log shows the MySQL tests ran rather than skipped.
+          go test -race -count=1 -v ./... | grep -E '^(--- |FAIL|ok|PASS)'
+          test "${PIPESTATUS[0]}" -eq 0
 
   integration:
     # One broker, both listeners, the whole transport suite.
