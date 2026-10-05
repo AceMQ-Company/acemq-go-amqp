@@ -22,6 +22,20 @@ While the version is `0.x` the public API may change in any release.
   the handler full of replacement characters. Decoding into `[]byte` is
   unchanged. Python's text codec already did this.
 
+### Fixed
+
+- **`SQLIdempotencyStore` works on MySQL.** Every claim used to fail there: the
+  schema's `key` column is a reserved word in MySQL (the `CREATE TABLE` did not
+  even parse), and `MySQLDialect`'s `ON DUPLICATE KEY UPDATE id = id` named a
+  column the idempotency table does not have. `Dialect` gains two optional
+  fields, `Quote` (identifier quoting; backticks for MySQL) and
+  `InsertIgnoreOn` (an upsert suffix that names the conflicting column), and
+  the store uses them for `key`. The MySQL `Schema()` also declares its index
+  inline and uses `DATETIME(6)`. The Postgres and SQLite schemas and statements
+  are byte-for-byte unchanged, and `InsertIgnoreSuffix` keeps its value for the
+  outbox, which does have an `id`. Tested against a real MySQL 8.4
+  (`ACEMQ_TEST_MYSQL_DSN` in `patterns/sqltest`, a service container in CI).
+
 ## [0.9.4] - 2026-10-04
 
 ### Fixed

@@ -66,6 +66,19 @@ jobs:
     # release either. Failing here means something the newest toolchain
     # disallows, not something the oldest cannot do.
     runs-on: ubuntu-latest
+    services:
+      # For the database-backed stores' MySQL dialect, which no test ran
+      # against until every MySQL claim was found to fail.
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: acemq
+          MYSQL_DATABASE: acemq
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -pacemq"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v4
 
@@ -92,6 +105,8 @@ jobs:
         # SQLite driver needs a newer Go than the library targets, and raising
         # the library's floor to test three files would cost every user of it
         # the thing that floor is there for.
+        env:
+          ACEMQ_TEST_MYSQL_DSN: root:acemq@tcp(127.0.0.1:3306)/acemq
         run: |
           cd patterns/sqltest
           go test -race -count=1 ./...

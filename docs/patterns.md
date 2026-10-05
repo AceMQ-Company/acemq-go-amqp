@@ -755,6 +755,13 @@ Dialects cover Postgres, MySQL and SQLite: placeholder syntax and the spelling
 of "insert unless it is already there" genuinely differ, and getting either
 wrong fails at runtime on one database and not another.
 
+MySQL also reserves `key`, the idempotency table's column, so `MySQLDialect`
+quotes it with backticks (`Dialect.Quote`) and its no-op upsert names that
+column (`Dialect.InsertIgnoreOn`). Its `Schema()` declares the index inside the
+table and uses `DATETIME(6)`. The Postgres and SQLite schemas are unchanged, so
+no migration is needed there; on MySQL the store did not work before 0.9.5,
+so there is no older table to migrate.
+
 ## Streams
 
 A stream keeps its messages after they are read, so several consumers can each

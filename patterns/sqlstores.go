@@ -59,6 +59,17 @@ type Dialect struct {
 	// InsertIgnoreSuffix is appended to an INSERT to make a duplicate key a
 	// no-op rather than an error.
 	InsertIgnoreSuffix string
+
+	// Quote renders an identifier that may be a reserved word, such as the
+	// idempotency table's key column. Nil leaves identifiers as they are, which
+	// is right for PostgreSQL and SQLite, where key is not reserved.
+	Quote func(ident string) string
+
+	// InsertIgnoreOn, when set, is used instead of [Dialect.InsertIgnoreSuffix]
+	// for a table whose conflicting column is known, and is given that column
+	// already quoted. MySQL needs it: its no-op upsert has to name a column the
+	// table actually has, and the idempotency table has no id.
+	InsertIgnoreOn func(column string) string
 }
 
 // PostgresDialect uses $1 placeholders and ON CONFLICT DO NOTHING.
@@ -68,11 +79,21 @@ var PostgresDialect = Dialect{
 	InsertIgnoreSuffix: " ON CONFLICT DO NOTHING",
 }
 
-// MySQLDialect uses ? placeholders and INSERT IGNORE semantics.
+// MySQLDialect uses ? placeholders, backtick quoting, and a no-op
+// ON DUPLICATE KEY UPDATE.
+//
+// Until 0.9.5 the idempotency store could not run on MySQL at all: its key
+// column is a reserved word there, and the upsert named an id column that table
+// does not have. InsertIgnoreSuffix still names id, for the outbox table, which
+// has one.
 var MySQLDialect = Dialect{
 	Name:               "mysql",
 	Placeholder:        func(int) string { return "?" },
 	InsertIgnoreSuffix: " ON DUPLICATE KEY UPDATE id = id",
+	Quote:              func(ident string) string { return "`" + ident + "`" },
+	InsertIgnoreOn: func(column string) string {
+		return " ON DUPLICATE KEY UPDATE " + column + " = " + column
+	},
 }
 
 // SQLiteDialect uses ? placeholders and ON CONFLICT DO NOTHING.
@@ -80,6 +101,23 @@ var SQLiteDialect = Dialect{
 	Name:               "sqlite",
 	Placeholder:        func(int) string { return "?" },
 	InsertIgnoreSuffix: " ON CONFLICT DO NOTHING",
+}
+
+// quote renders an identifier through [Dialect.Quote], if there is one.
+func (d Dialect) quote(ident string) string {
+	if d.Quote == nil {
+		return ident
+	}
+	return d.Quote(ident)
+}
+
+// insertIgnoreOn is the suffix that makes a duplicate of an already-quoted
+// column a no-op.
+func (d Dialect) insertIgnoreOn(column string) string {
+	if d.InsertIgnoreOn == nil {
+		return d.InsertIgnoreSuffix
+	}
+	return d.InsertIgnoreOn(column)
 }
 
 func (d Dialect) args(n int) []string {
@@ -150,6 +188,19 @@ func (s *SQLIdempotencyStore) Schema() string {
 	// DEFAULT TRUE rather than FALSE on purpose: existing rows were written by the
 	// old code, which only ever wrote a row it treated as handled. Calling them
 	// confirmed keeps their suppression, which is the behaviour that was intended.
+	if s.dialect.Name == MySQLDialect.Name {
+		// MySQL reserves key, so it is quoted; it has no CREATE INDEX IF NOT
+		// EXISTS, so the index is declared with the table; and DATETIME(6) keeps
+		// the sub-second precision a TIMESTAMP rounds away, which a short claim
+		// timeout depends on. No existing MySQL table can be affected: the old
+		// schema did not parse there.
+		return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n"+
+			"  `key`       VARCHAR(255) PRIMARY KEY,\n"+
+			"  handled_at  DATETIME(6)  NOT NULL,\n"+
+			"  confirmed   BOOLEAN      NOT NULL DEFAULT FALSE,\n"+
+			"  INDEX %s_handled_at (handled_at)\n"+
+			");", s.table, s.table)
+	}
 	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
   key         VARCHAR(255) PRIMARY KEY,
   handled_at  TIMESTAMP    NOT NULL,
@@ -171,8 +222,9 @@ func (s *SQLIdempotencyStore) Claim(ctx context.Context, key string) (bool, erro
 	now := time.Now().UTC()
 
 	args := s.dialect.args(3)
-	insert := fmt.Sprintf("INSERT INTO %s (key, handled_at, confirmed) VALUES (%s, %s, %s)%s",
-		s.table, args[0], args[1], args[2], s.dialect.InsertIgnoreSuffix)
+	keyCol := s.dialect.quote("key")
+	insert := fmt.Sprintf("INSERT INTO %s (%s, handled_at, confirmed) VALUES (%s, %s, %s)%s",
+		s.table, keyCol, args[0], args[1], args[2], s.dialect.insertIgnoreOn(keyCol))
 
 	result, err := s.db.ExecContext(ctx, insert, key, now, false)
 	if err != nil {
@@ -190,8 +242,8 @@ func (s *SQLIdempotencyStore) Claim(ctx context.Context, key string) (bool, erro
 	// The key is already there. Take it only if it was claimed and abandoned.
 	steal := s.dialect.args(3)
 	update := fmt.Sprintf(
-		"UPDATE %s SET handled_at = %s WHERE key = %s AND confirmed = FALSE AND handled_at < %s",
-		s.table, steal[0], steal[1], steal[2])
+		"UPDATE %s SET handled_at = %s WHERE %s = %s AND confirmed = FALSE AND handled_at < %s",
+		s.table, steal[0], keyCol, steal[1], steal[2])
 
 	stolen, err := s.db.ExecContext(ctx, update, now, key, now.Add(-s.claimTimeout))
 	if err != nil {
@@ -210,8 +262,8 @@ func (s *SQLIdempotencyStore) Claim(ctx context.Context, key string) (bool, erro
 // Confirm records that the work for a key is done.
 func (s *SQLIdempotencyStore) Confirm(ctx context.Context, key string) error {
 	args := s.dialect.args(2)
-	query := fmt.Sprintf("UPDATE %s SET confirmed = TRUE, handled_at = %s WHERE key = %s",
-		s.table, args[0], args[1])
+	query := fmt.Sprintf("UPDATE %s SET confirmed = TRUE, handled_at = %s WHERE %s = %s",
+		s.table, args[0], s.dialect.quote("key"), args[1])
 	if _, err := s.db.ExecContext(ctx, query, time.Now().UTC(), key); err != nil {
 		return fmt.Errorf("acemq: cannot confirm idempotency key %q: %w", key, err)
 	}
@@ -220,7 +272,8 @@ func (s *SQLIdempotencyStore) Confirm(ctx context.Context, key string) error {
 
 // Release gives up a claim so a failed message can be tried again.
 func (s *SQLIdempotencyStore) Release(ctx context.Context, key string) error {
-	query := fmt.Sprintf("DELETE FROM %s WHERE key = %s", s.table, s.dialect.Placeholder(1))
+	query := fmt.Sprintf("DELETE FROM %s WHERE %s = %s",
+		s.table, s.dialect.quote("key"), s.dialect.Placeholder(1))
 	if _, err := s.db.ExecContext(ctx, query, key); err != nil {
 		return fmt.Errorf("acemq: cannot release idempotency key %q: %w", key, err)
 	}
