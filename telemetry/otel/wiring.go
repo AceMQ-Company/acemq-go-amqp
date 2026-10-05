@@ -242,6 +242,8 @@ func Handle[T any](t *Tracing, queue string, next acemq.Handler[T]) acemq.Handle
 				// producer's problem, and the span says so by its outcome
 				// rather than by a red row in a trace view.
 				span.Outcome(OutcomeParked).Note(ack.Err())
+			case "in_progress":
+				span.Outcome(OutcomeInProgress)
 			default:
 				span.Outcome(OutcomeAcked)
 			}

@@ -14,6 +14,8 @@
 
 package acemq
 
+import "time"
+
 type ackAction int
 
 const (
@@ -21,6 +23,7 @@ const (
 	ackRetry
 	ackReject
 	ackPark
+	ackInProgress
 )
 
 // Ack is what a handler says about a message: it worked, it should be tried
@@ -34,6 +37,7 @@ const (
 type Ack struct {
 	action ackAction
 	err    error
+	delay  time.Duration
 }
 
 // Accept confirms the message. It will not be delivered again.
@@ -72,6 +76,30 @@ func Reject(err error) Ack { return Ack{action: ackReject, err: err} }
 // reached by a handler that got further before it found out.
 func Park(err error) Ack { return Ack{action: ackPark, err: err} }
 
+// DefaultInProgressDelay is how long a message found in progress waits before it
+// is put back, when nothing says otherwise. The same five seconds every AceMQ
+// library uses.
+const DefaultInProgressDelay = 5 * time.Second
+
+// InProgress says somebody else holds this message: neither run it nor accept
+// it, but put it back and look again after delay.
+//
+// patterns.Idempotent answers with it when a redelivery finds a claim that is
+// live and unconfirmed — a handler still running, or one that died and could
+// not release its claim. Accepting that redelivery as a duplicate loses the
+// message if the claim never becomes a completion.
+//
+// The engine waits delay, republishes the message to its own queue with the
+// attempt unchanged, and acknowledges the original (or returns it to the broker
+// if the republish is not routed). The retry policy is not consulted: holding a
+// message elsewhere is not a failure of this one, so it spends no attempt and is
+// never dead-lettered for it. Counted as outcome in_progress. A stream consumer
+// refuses it as it refuses [Retry], because putting it back would append a second
+// copy to the log. A negative delay is zero.
+func InProgress(delay time.Duration) Ack {
+	return Ack{action: ackInProgress, delay: max(delay, 0)}
+}
+
 // Err is the reason the handler gave, if it gave one.
 func (a Ack) Err() error { return a.err }
 
@@ -89,6 +117,10 @@ func (a Ack) Err() error { return a.err }
 // that badly.
 func (a Ack) IsRetry() bool { return a.action == ackRetry }
 
+// IsInProgress reports whether a handler answered [InProgress], for the same one
+// caller and reason as [Ack.IsRetry]: a stream has to refuse it.
+func (a Ack) IsInProgress() bool { return a.action == ackInProgress }
+
 // String makes an Ack readable in a log line.
 func (a Ack) String() string {
 	switch a.action {
@@ -100,6 +132,8 @@ func (a Ack) String() string {
 		return "reject"
 	case ackPark:
 		return "park"
+	case ackInProgress:
+		return "in_progress"
 	default:
 		return "unknown"
 	}

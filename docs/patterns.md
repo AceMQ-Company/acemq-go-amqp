@@ -108,6 +108,42 @@ When the handler fails the key is forgotten, so the retry actually runs.
 Remembering a message that then failed would mean the retry silently does
 nothing and the message is dropped after appearing to succeed.
 
+### Claimed, duplicate, or in progress
+
+A redelivery finds the key in one of three states, and each gets a different
+answer. This is the same rule in all five AceMQ libraries:
+
+| The store says | Meaning | What happens |
+|---|---|---|
+| `Claimed` | nobody had it, or the last claim's lease expired | the handler runs |
+| `Duplicate` | the work was done and confirmed | accepted, handler not run |
+| `InProgress` | a live claim nobody has confirmed | **put back**, handler not run, not accepted |
+
+In progress is a handler still running elsewhere, or one that failed and could
+not release its claim because the store was unreachable. Until 0.9.5 Go treated
+it as a duplicate and acknowledged it, and in the second case the message was
+lost: the claim outlived the failure, and the retry was accepted as a duplicate
+of work that never happened.
+
+Now `Idempotent` answers `acemq.InProgress(delay)`. The consumer waits `delay`
+(five seconds by default), republishes the original body and envelope to the
+same queue, and acknowledges the original. If the republish is not routed, the
+original is nacked and requeued instead. The attempt is **not** incremented and
+the retry policy is not consulted, so a message is never dead-lettered for being
+in progress. Once the lease ends, the next look claims it and runs the handler.
+It is counted as `acemq.consume.total{outcome="in_progress"}`, not as retried or
+dead-lettered. A stream consumer refuses it as it refuses a retry.
+
+```go
+patterns.Idempotent(store, handle, patterns.InProgressDelay(2*time.Second))
+```
+
+Keep the delay well under the store's claim timeout. `store.TryClaim(ctx, key)`
+returns the three-way `patterns.ClaimResult`. Both shipped stores implement it
+through the `patterns.ClaimReporter` interface, and `Claim` keeps its `bool`. A
+custom store that implements only `IdempotencyStore` behaves as before: a refused
+claim is read as a duplicate.
+
 **This is a guard against duplicates, not a guarantee of exactly-once.** Between
 the handler finishing and the acknowledgement reaching the broker, a crash still
 leaves a message that will be delivered again. Only a store written in the same

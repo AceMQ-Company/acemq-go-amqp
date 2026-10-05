@@ -192,6 +192,10 @@ const (
 	// to open one.
 	OutcomeParked = acemq.OutcomeParked
 
+	// OutcomeInProgress is a message somebody else holds, put back after a
+	// delay without spending an attempt. Neither a retry nor a dead letter.
+	OutcomeInProgress = acemq.OutcomeInProgress
+
 	// OutcomeAnswered is a request that got its reply.
 	OutcomeAnswered = acemq.OutcomeAnswered
 

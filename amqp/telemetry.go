@@ -225,6 +225,11 @@ const (
 	// OutcomeParked is a message nothing could decode.
 	OutcomeParked = "parked"
 
+	// OutcomeInProgress is a message somebody else holds, put back after a
+	// delay without spending an attempt (see [InProgress]). Counted on
+	// acemq.consume.total only: it is neither a retry nor a dead letter.
+	OutcomeInProgress = "in_progress"
+
 	// OutcomeConfirmed is the broker taking responsibility for a published
 	// message, which is what a publisher with confirms gets.
 	OutcomeConfirmed = "confirmed"

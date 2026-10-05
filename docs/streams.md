@@ -254,6 +254,7 @@ more here than anywhere else in the docs.
 |---|---|
 | `acemq.Accept()` removes the message | removes nothing; the log moves on and every other consumer still sees it |
 | `acemq.Retry(err)` republishes onto the same queue | **refused** — it would append a new copy to the log. See below |
+| `acemq.InProgress(d)` puts it back on the same queue | **refused**, the same as a retry, and for the same reason |
 | `acemq.Reject(err)` republishes to `{queue}.dlq` | republishes to `{stream}.dlq` and works, but the original also stays in the stream |
 | `acemq.Park(err)` republishes to `{queue}.parked` | the same, with the same caveat |
 | the broker's own dead-lettering | **none** — a stream has no `x-dead-letter-exchange` |

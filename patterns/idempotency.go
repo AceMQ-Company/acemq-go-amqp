@@ -59,6 +59,60 @@ type IdempotencyStore interface {
 	Release(ctx context.Context, key string) error
 }
 
+// ClaimResult is what a store found when it was asked to claim a key.
+type ClaimResult int
+
+const (
+	// Claimed: nobody had the key, or the last holder's lease had run out. It is
+	// this caller's to run.
+	Claimed ClaimResult = iota
+	// Duplicate: the work was done and confirmed. Accept it without running
+	// anything.
+	Duplicate
+	// InProgress: somebody holds a live claim and has not confirmed. Neither run
+	// it nor accept it — put it back and look again later.
+	InProgress
+)
+
+// String is the name every AceMQ library uses for it.
+func (r ClaimResult) String() string {
+	switch r {
+	case Claimed:
+		return "claimed"
+	case Duplicate:
+		return "duplicate"
+	case InProgress:
+		return "in_progress"
+	default:
+		return "unknown"
+	}
+}
+
+// ClaimReporter is an [IdempotencyStore] that can say why a claim was refused.
+//
+// [IdempotencyStore.Claim]'s false cannot tell work that is done from work that
+// is still being done, and treating both as done loses a message whose handler
+// failed and could not release its claim: the redelivery is accepted as a
+// duplicate of work that never happened. [Idempotent] asks a store that
+// implements this for the three-way answer and puts an in-progress message back
+// instead. Both stores in this package implement it; a store that does not is
+// treated as before, with a refused claim read as a duplicate.
+type ClaimReporter interface {
+	TryClaim(ctx context.Context, key string) (ClaimResult, error)
+}
+
+// claim asks a store for the three-way answer, from one that can give it.
+func claim(ctx context.Context, store IdempotencyStore, key string) (ClaimResult, error) {
+	if reporter, ok := store.(ClaimReporter); ok {
+		return reporter.TryClaim(ctx, key)
+	}
+	first, err := store.Claim(ctx, key)
+	if err != nil || first {
+		return Claimed, err
+	}
+	return Duplicate, nil
+}
+
 // InMemoryIdempotencyStore remembers keys in this process.
 //
 // Right for a single consumer, and wrong the moment there are two: each has its
@@ -124,7 +178,15 @@ func (s *InMemoryIdempotencyStore) SetClaimTimeout(d time.Duration) {
 
 // Claim takes a key, unless it is confirmed or claimed by somebody still inside
 // the claim window.
-func (s *InMemoryIdempotencyStore) Claim(_ context.Context, key string) (bool, error) {
+func (s *InMemoryIdempotencyStore) Claim(ctx context.Context, key string) (bool, error) {
+	result, err := s.TryClaim(ctx, key)
+	return result == Claimed, err
+}
+
+// TryClaim is [InMemoryIdempotencyStore.Claim] saying why a claim was refused:
+// the key is confirmed ([Duplicate]) or held inside the claim window
+// ([InProgress]).
+func (s *InMemoryIdempotencyStore) TryClaim(_ context.Context, key string) (ClaimResult, error) {
 	now := time.Now()
 
 	s.mu.Lock()
@@ -141,17 +203,17 @@ func (s *InMemoryIdempotencyStore) Claim(_ context.Context, key string) (bool, e
 	if e, present := s.seen[key]; present {
 		// Confirmed is done, and stays done for the retention window.
 		if e.confirmed {
-			return false, nil
+			return Duplicate, nil
 		}
 		// An unconfirmed claim inside its window belongs to whoever took it.
 		if now.Sub(e.at) <= s.claimTimeout {
-			return false, nil
+			return InProgress, nil
 		}
 		// Outside the window: whoever held it is not coming back, and the work
 		// still has to happen.
 	}
 	s.seen[key] = entry{at: now}
-	return true, nil
+	return Claimed, nil
 }
 
 // Confirm records that the work is done.
@@ -190,6 +252,14 @@ func (s *InMemoryIdempotencyStore) Len() int {
 // message has been handled, and dead-lettering it would raise an alarm about
 // something that went right.
 //
+// A redelivery that finds the message in progress — claimed and not confirmed,
+// by a handler still running or by one that failed and could not release its
+// claim — is neither run nor accepted. It is answered with [acemq.InProgress],
+// which puts it back after [InProgressDelay] (five seconds by default) without
+// spending a retry attempt. Accepting it would lose the message if that claim
+// never became a completion. This needs a store that implements
+// [ClaimReporter]; both in this package do.
+//
 // When the handler fails, the key is forgotten so the retry can run. That is
 // the honest ordering — remembering a message that then failed would mean a
 // retry silently does nothing — and it is why this is a guard against
@@ -198,34 +268,64 @@ func (s *InMemoryIdempotencyStore) Len() int {
 // message that will be delivered again. Only a store written in the same
 // transaction as the work closes that gap.
 func Idempotent[T any](
-	store IdempotencyStore, handler acemq.Handler[T],
+	store IdempotencyStore, handler acemq.Handler[T], opts ...IdempotencyOption,
 ) acemq.Handler[T] {
+	delay := inProgressDelay(opts)
 	return func(ctx context.Context, m acemq.Message[T]) acemq.Ack {
-		key := m.Envelope.ID
-
-		first, err := store.Claim(ctx, key)
-		if err != nil {
-			// The store is the thing that is broken, not the message. Retrying
-			// is right; carrying on and risking a duplicate is not.
-			return acemq.Retry(err)
-		}
-		if !first {
-			return acemq.Accept()
-		}
-
-		ack := handler(ctx, m)
-		if ack.String() == "accept" {
-			// Done, and recorded as done rather than merely claimed -- which is
-			// what lets a claim left behind by a crash expire without this one
-			// expiring with it.
-			_ = store.Confirm(ctx, key)
-		} else {
-			// It did not work, so it has not been handled. Releasing lets the
-			// retry actually run.
-			_ = store.Release(ctx, key)
-		}
-		return ack
+		return guard(ctx, store, m.Envelope.ID, delay, handler, m)
 	}
+}
+
+// IdempotencyOption tunes [Idempotent], [IdempotentBy] and [WithIdempotency].
+type IdempotencyOption func(*time.Duration)
+
+// InProgressDelay is how long a message found in progress waits before it is
+// put back and looked at again. Keep it well under the store's claim timeout.
+// The default is [acemq.DefaultInProgressDelay].
+func InProgressDelay(d time.Duration) IdempotencyOption {
+	return func(delay *time.Duration) { *delay = d }
+}
+
+func inProgressDelay(opts []IdempotencyOption) time.Duration {
+	delay := acemq.DefaultInProgressDelay
+	for _, opt := range opts {
+		opt(&delay)
+	}
+	return delay
+}
+
+// guard is the claim, run, confirm-or-release sequence both wrappers share.
+func guard[T any](
+	ctx context.Context, store IdempotencyStore, key string, delay time.Duration,
+	handler acemq.Handler[T], m acemq.Message[T],
+) acemq.Ack {
+	result, err := claim(ctx, store, key)
+	if err != nil {
+		// The store is the thing that is broken, not the message. Retrying
+		// is right; carrying on and risking a duplicate is not.
+		return acemq.Retry(err)
+	}
+	switch result {
+	case Duplicate:
+		return acemq.Accept()
+	case InProgress:
+		return acemq.InProgress(delay)
+	}
+
+	ack := handler(ctx, m)
+	if ack.String() == "accept" {
+		// Done, and recorded as done rather than merely claimed -- which is
+		// what lets a claim left behind by a crash expire without this one
+		// expiring with it.
+		_ = store.Confirm(ctx, key)
+	} else {
+		// It did not work, so it has not been handled. Releasing lets the
+		// retry actually run. If the release fails, the claim stays until its
+		// lease runs out, and every redelivery until then is put back as in
+		// progress rather than run or accepted.
+		_ = store.Release(ctx, key)
+	}
+	return ack
 }
 
 // IdempotentBy is [Idempotent] with a key of your own.
@@ -235,28 +335,15 @@ func Idempotent[T any](
 // either one twice is the thing to prevent.
 func IdempotentBy[T any](
 	store IdempotencyStore, key func(acemq.Message[T]) string, handler acemq.Handler[T],
+	opts ...IdempotencyOption,
 ) acemq.Handler[T] {
+	delay := inProgressDelay(opts)
 	return func(ctx context.Context, m acemq.Message[T]) acemq.Ack {
 		k := key(m)
 		if k == "" {
 			return acemq.Reject(acemq.Fatalf(
 				"acemq: message %s produced an empty idempotency key", m.Envelope.ID))
 		}
-
-		first, err := store.Claim(ctx, k)
-		if err != nil {
-			return acemq.Retry(err)
-		}
-		if !first {
-			return acemq.Accept()
-		}
-
-		ack := handler(ctx, m)
-		if ack.String() == "accept" {
-			_ = store.Confirm(ctx, k)
-		} else {
-			_ = store.Release(ctx, k)
-		}
-		return ack
+		return guard(ctx, store, k, delay, handler, m)
 	}
 }

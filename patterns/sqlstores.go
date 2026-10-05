@@ -219,6 +219,15 @@ CREATE INDEX IF NOT EXISTS %s_handled_at ON %s (handled_at);`, s.table, s.table,
 // behind, and it is conditional on both so it cannot steal a live claim or reopen
 // finished work.
 func (s *SQLIdempotencyStore) Claim(ctx context.Context, key string) (bool, error) {
+	result, err := s.TryClaim(ctx, key)
+	return err == nil && result == Claimed, err
+}
+
+// TryClaim is [SQLIdempotencyStore.Claim] saying why a claim was refused: the
+// row is confirmed ([Duplicate]) or claimed inside the claim window
+// ([InProgress]). Telling them apart costs one SELECT, and only on the refused
+// path.
+func (s *SQLIdempotencyStore) TryClaim(ctx context.Context, key string) (ClaimResult, error) {
 	now := time.Now().UTC()
 
 	args := s.dialect.args(3)
@@ -228,15 +237,15 @@ func (s *SQLIdempotencyStore) Claim(ctx context.Context, key string) (bool, erro
 
 	result, err := s.db.ExecContext(ctx, insert, key, now, false)
 	if err != nil {
-		return false, fmt.Errorf("acemq: cannot claim idempotency key %q: %w", key, err)
+		return Claimed, fmt.Errorf("acemq: cannot claim idempotency key %q: %w", key, err)
 	}
 	if affected, err := result.RowsAffected(); err != nil {
 		// Some drivers do not report it. Saying "not claimed" would drop the
 		// message; saying "claimed" risks a duplicate, which is the recoverable
 		// half of the choice.
-		return true, nil
+		return Claimed, nil
 	} else if affected > 0 {
-		return true, nil
+		return Claimed, nil
 	}
 
 	// The key is already there. Take it only if it was claimed and abandoned.
@@ -247,16 +256,35 @@ func (s *SQLIdempotencyStore) Claim(ctx context.Context, key string) (bool, erro
 
 	stolen, err := s.db.ExecContext(ctx, update, now, key, now.Add(-s.claimTimeout))
 	if err != nil {
-		return false, fmt.Errorf("acemq: cannot reclaim idempotency key %q: %w", key, err)
+		return Claimed, fmt.Errorf("acemq: cannot reclaim idempotency key %q: %w", key, err)
 	}
 	affected, err := stolen.RowsAffected()
 	if err != nil {
 		// Cannot tell whether the stale claim was taken, so say so. "Not claimed"
 		// would ack the redelivery as a duplicate and drop work a killed process
 		// never finished; "claimed" risks two owners. An error requeues it.
-		return false, fmt.Errorf("acemq: cannot tell whether idempotency key %q was reclaimed: %w", key, err)
+		return Claimed, fmt.Errorf("acemq: cannot tell whether idempotency key %q was reclaimed: %w", key, err)
 	}
-	return affected > 0, nil
+	if affected > 0 {
+		return Claimed, nil
+	}
+
+	// Held by somebody: finished, or still being worked on.
+	var confirmed bool
+	query := fmt.Sprintf("SELECT confirmed FROM %s WHERE %s = %s",
+		s.table, keyCol, s.dialect.Placeholder(1))
+	switch err := s.db.QueryRowContext(ctx, query, key).Scan(&confirmed); {
+	case errors.Is(err, sql.ErrNoRows):
+		// Released between the update and this read. In progress is the safe
+		// answer: the message is put back and claimed on the next look.
+		return InProgress, nil
+	case err != nil:
+		return Claimed, fmt.Errorf("acemq: cannot read idempotency key %q: %w", key, err)
+	case confirmed:
+		return Duplicate, nil
+	default:
+		return InProgress, nil
+	}
 }
 
 // Confirm records that the work for a key is done.

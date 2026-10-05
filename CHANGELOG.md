@@ -15,6 +15,23 @@ While the version is `0.x` the public API may change in any release.
   `text` and .NET and Ruby `string`; Go now answers to both, so a codec name in
   shared configuration works in all five libraries.
 
+- **`acemq.InProgress(delay)`, `acemq.DefaultInProgressDelay` (5s),
+  `acemq.OutcomeInProgress` / `otel.OutcomeInProgress` (`"in_progress"`),
+  `acemq.SettledInProgress`, `Ack.IsInProgress`.** A handler answer that means
+  "somebody else holds this message": the consumer waits `delay`, republishes
+  the original body and envelope to the same queue with the attempt
+  **unchanged**, and acks the original. If the republish is not routed, it
+  nack-requeues instead. The retry policy is not consulted, so the message is never
+  dead-lettered for it. It is counted as `acemq.consume.total{outcome="in_progress"}`
+  and is not counted as retried or dead-lettered. Stream consumers refuse it,
+  as they refuse a retry.
+- **`patterns.ClaimResult` (`Claimed`, `Duplicate`, `InProgress`),
+  `patterns.ClaimReporter`, and `TryClaim` on `InMemoryIdempotencyStore` and
+  `SQLIdempotencyStore`.** The three-way answer to a claim. `Claim` keeps its
+  `bool` and its meaning.
+- **`patterns.InProgressDelay(d)`**, an option for `Idempotent`, `IdempotentBy`
+  and `WithIdempotency`, which are now variadic and remain source-compatible.
+
 ### Changed
 
 - **`StringCodec` refuses a body that is not valid UTF-8** when decoding into a
@@ -23,6 +40,17 @@ While the version is `0.x` the public API may change in any release.
   unchanged. Python's text codec already did this.
 
 ### Fixed
+
+- **A redelivery that finds a live but unconfirmed idempotency claim is put back,
+  not acknowledged.** `Idempotent` used to read every refused claim as a
+  duplicate. If the first handler failed and its `Release` also failed, for example
+  because the store was unreachable, the claim outlived the failure, the
+  retry was acked, and the message was lost with the work never done. The
+  contract shared by all five libraries is now: confirmed means duplicate (ack,
+  handler not run); claimed with a live lease means in progress (put back with
+  `acemq.InProgress`, handler not run, not acked, no attempt spent); claimed
+  with an expired lease is retaken and run. A custom store without `TryClaim`
+  behaves as before.
 
 - **`SQLIdempotencyStore` works on MySQL.** Every claim used to fail there: the
   schema's `key` column is a reserved word in MySQL (the `CREATE TABLE` did not

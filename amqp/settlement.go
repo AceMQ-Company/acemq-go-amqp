@@ -47,6 +47,10 @@ const (
 	// could decode it. A different problem from a dead letter with a different
 	// answer, which is why it goes to a different queue.
 	SettledParked SettlementAction = "parked"
+
+	// SettledInProgress is a message somebody else holds being put back on its
+	// own queue after [Settlement.Delay], attempt unchanged. See [InProgress].
+	SettledInProgress SettlementAction = "in_progress"
 )
 
 // Settlement is what the engine did with a delivery once the handler had
@@ -66,7 +70,7 @@ type Settlement struct {
 
 	// Outcome is the word for it, from the vocabulary every AceMQ library
 	// shares: [OutcomeAcked], [OutcomeRetried], [OutcomeRejected],
-	// [OutcomeDeadLettered] or [OutcomeParked].
+	// [OutcomeDeadLettered], [OutcomeParked] or [OutcomeInProgress].
 	//
 	// The engine writes it here and tags [MetricConsumeTotal] with the same string,
 	// so an adapter that puts it on the span cannot disagree with the counter
@@ -80,8 +84,8 @@ type Settlement struct {
 	// attempt the next delivery will report.
 	Envelope Envelope
 
-	// Delay is how long before the next attempt, for [SettledRetried] and zero
-	// otherwise. The delay the engine actually chose, after the retry policy
+	// Delay is how long before the next attempt, for [SettledRetried], or before
+	// the message is put back, for [SettledInProgress]; zero otherwise. The delay the engine actually chose, after the retry policy
 	// has jittered it and decided whether the waiting happens on a rung queue
 	// or in this process.
 	Delay time.Duration

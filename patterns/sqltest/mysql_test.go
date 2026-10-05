@@ -105,6 +105,13 @@ func TestTheMySQLDialectClaimsConfirmsAndReleases(t *testing.T) {
 	}
 }
 
+func TestTheMySQLStoreTellsAClaimFromADuplicateFromWorkInProgress(t *testing.T) {
+	db, table := openMySQL(t)
+	store := patterns.NewSQLIdempotencyStore(db, patterns.MySQLDialect, table)
+	apply(t, db, store.Schema())
+	claimsThreeWays(t, store)
+}
+
 // The quoting is MySQL's alone: the SQLite and Postgres schemas, which people
 // already have in migrations, must not change.
 func TestOnlyTheMySQLSchemaQuotesTheKeyColumn(t *testing.T) {

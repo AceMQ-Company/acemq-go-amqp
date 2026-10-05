@@ -284,3 +284,18 @@ func TestMaxAgeUsesTheLargestExactUnit(t *testing.T) {
 		}
 	}
 }
+
+// TestAnInProgressAnswerIsRefusedOnAStreamLikeARetry: putting the message back
+// would append a second copy to the log, exactly as a retry would.
+func TestAnInProgressAnswerIsRefusedOnAStreamLikeARetry(t *testing.T) {
+	wrapped := refuseRetry("orders.log", func(_ context.Context, _ acemq.Message[streamed]) acemq.Ack {
+		return acemq.InProgress(time.Second)
+	})
+
+	ack := wrapped(context.Background(), streamDelivery("order-4", int64(7)))
+
+	var refused *RetryOnStreamError
+	if ack.String() != "park" || !errors.As(ack.Err(), &refused) {
+		t.Fatalf("in_progress on a stream came back as %v (%v), want a park with a *RetryOnStreamError", ack, ack.Err())
+	}
+}

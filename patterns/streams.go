@@ -16,6 +16,7 @@ package patterns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -305,15 +306,21 @@ func (e *RetryOnStreamError) Unwrap() error { return e.Err }
 func refuseRetry[T any](stream string, handler acemq.Handler[T]) acemq.Handler[T] {
 	return func(ctx context.Context, m acemq.Message[T]) acemq.Ack {
 		ack := handler(ctx, m)
-		if !ack.IsRetry() {
+		if !ack.IsRetry() && !ack.IsInProgress() {
 			return ack
+		}
+		reason := ack.Err()
+		if reason == nil && ack.IsInProgress() {
+			// Putting a message back on a stream appends a second copy, the
+			// same as a retry, so in progress is refused the same way.
+			reason = errors.New("acemq: the message is in progress elsewhere")
 		}
 		offset, _ := StreamOffsetOf(m.Envelope)
 		return acemq.Park(&RetryOnStreamError{
 			Stream:    stream,
 			Offset:    offset,
 			MessageID: m.Envelope.ID,
-			Err:       ack.Err(),
+			Err:       reason,
 		})
 	}
 }

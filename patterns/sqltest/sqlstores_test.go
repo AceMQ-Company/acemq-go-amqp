@@ -682,3 +682,37 @@ func TestAnUnknownReclaimOutcomeIsAnErrorNotADuplicate(t *testing.T) {
 		t.Fatalf("an unknown reclaim outcome was read as an answer (claimed=%v)", claimed)
 	}
 }
+
+// TestTheSQLStoreTellsAClaimFromADuplicateFromWorkInProgress pins the
+// three-way answer: a live unconfirmed claim is in progress, not a duplicate,
+// because accepting it as one loses the message if the claim never becomes a
+// completion.
+func TestTheSQLStoreTellsAClaimFromADuplicateFromWorkInProgress(t *testing.T) {
+	db := openDB(t)
+	store := patterns.NewSQLIdempotencyStore(db, patterns.SQLiteDialect)
+	apply(t, db, store.Schema())
+	claimsThreeWays(t, store)
+}
+
+func claimsThreeWays(t *testing.T, store *patterns.SQLIdempotencyStore) {
+	t.Helper()
+	ctx := context.Background()
+	expect := func(key string, want patterns.ClaimResult) {
+		t.Helper()
+		got, err := store.TryClaim(ctx, key)
+		if err != nil || got != want {
+			t.Fatalf("TryClaim(%q) = %v, %v; want %v", key, got, err, want)
+		}
+	}
+	expect("k", patterns.Claimed)
+	expect("k", patterns.InProgress)
+	if err := store.Confirm(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	expect("k", patterns.Duplicate)
+
+	store.SetClaimTimeout(time.Millisecond)
+	expect("abandoned", patterns.Claimed)
+	time.Sleep(20 * time.Millisecond)
+	expect("abandoned", patterns.Claimed)
+}

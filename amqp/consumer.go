@@ -481,7 +481,26 @@ func handleDelivery[T any](
 			case <-ctx.Done():
 			}
 		}
-		c.retryAgain(ctx, d, env)
+		c.putBack(ctx, d, env.NextAttempt())
+
+	case ackInProgress:
+		// Somebody else holds the message. Not a failure of this one, so the
+		// retry policy is not asked: it could neither spend an attempt on it nor
+		// run out and dead-letter a message nobody has failed to handle.
+		c.settledAfterHandler(hook, Settlement{
+			Queue:    c.queue,
+			Action:   SettledInProgress,
+			Outcome:  OutcomeInProgress,
+			Envelope: env,
+			Delay:    ack.delay,
+		}, took)
+		if ack.delay > 0 {
+			select {
+			case <-time.After(ack.delay):
+			case <-ctx.Done():
+			}
+		}
+		c.putBack(ctx, d, env)
 	}
 }
 
@@ -566,7 +585,8 @@ func (c *Consumer) retryInBroker(
 	return true
 }
 
-// retryAgain puts the message back on its own queue, one attempt further on.
+// putBack puts the message back on its own queue as env: one attempt further on
+// for a retry, unchanged for a message found in progress.
 //
 // Republished rather than requeued, because a requeue returns the bytes the
 // broker was given: the attempt header would still read what the publisher wrote
@@ -577,8 +597,8 @@ func (c *Consumer) retryInBroker(
 // The cost is that the message goes to the back of the queue rather than the
 // front, so a retry is no longer in order with its neighbours. For a message
 // that has already failed once, that is the better trade.
-func (c *Consumer) retryAgain(ctx context.Context, d Delivery, env Envelope) {
-	routed, err := c.republish(ctx, d, c.queue, env.NextAttempt())
+func (c *Consumer) putBack(ctx context.Context, d Delivery, env Envelope) {
+	routed, err := c.republish(ctx, d, c.queue, env)
 	if err != nil || !routed {
 		// The queue this consumer reads has gone, or the connection has. Returned
 		// to the broker rather than acknowledged, because dropping it here would

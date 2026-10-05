@@ -245,9 +245,9 @@ func WithRecovery[T any]() Middleware[T] {
 }
 
 // WithIdempotency is [Idempotent] as middleware, so it can sit in a [Chain].
-func WithIdempotency[T any](store IdempotencyStore) Middleware[T] {
+func WithIdempotency[T any](store IdempotencyStore, opts ...IdempotencyOption) Middleware[T] {
 	return func(next acemq.Handler[T]) acemq.Handler[T] {
-		return Idempotent(store, next)
+		return Idempotent(store, next, opts...)
 	}
 }
 

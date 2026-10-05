@@ -151,7 +151,7 @@ an application writing its own tags should not invent a second one.
 Every delivery increments `acemq.consume.total` exactly once, and the `outcome`
 tag partitions those deliveries — the tags do not overlap, so grouping by
 `outcome` and adding the groups back up gives the total again. The tag takes one
-of five words:
+of six words:
 
 | `outcome` | |
 |---|---|
@@ -160,6 +160,7 @@ of five words:
 | `rejected` | the handler gave up on it by name |
 | `dead_lettered` | the attempts ran out, the message aged out, the failure was marked unprocessable, or an interceptor refused it |
 | `parked` | nothing could read it: the codec refused the body, or the handler returned `acemq.Park` |
+| `in_progress` | somebody else holds its idempotency claim; put back after a delay, attempt unchanged (`acemq.InProgress`). Not counted as retried or dead-lettered |
 
 It is the same word the tracing adapter puts on that delivery's span as
 `messaging.acemq.outcome`, taken from the same `acemq.Settlement`, so a dashboard
@@ -317,7 +318,7 @@ writes the same set.
 `refused` publish span is an error too, because the publish returned one, but
 its outcome stays `refused`.
 
-`acked`, `retried`, `rejected`, `parked`, `confirmed`, `published`, `answered`
+`acked`, `retried`, `rejected`, `parked`, `in_progress`, `confirmed`, `published`, `answered`
 and `timed_out` do not. A retry is the system working — the message will be tried
 again and very often succeeds — and a message the handler refused on purpose is a
 decision rather than a fault. Marking either as an error is how a trace view
