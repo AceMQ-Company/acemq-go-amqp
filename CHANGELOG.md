@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-10-05
+
 ### Added
 
 - **A `text` codec name.** `acemq.CodecByName("text")` now returns the UTF-8

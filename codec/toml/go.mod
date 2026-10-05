@@ -4,7 +4,7 @@ module github.com/AceMQ-Company/acemq-go-amqp/codec/toml
 go 1.23
 
 require (
-	github.com/AceMQ-Company/acemq-go-amqp v0.9.4
+	github.com/AceMQ-Company/acemq-go-amqp v0.9.5
 	github.com/BurntSushi/toml v1.5.0
 )
 
