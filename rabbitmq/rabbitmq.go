@@ -855,6 +855,7 @@ func (t *Transport) Consume(
 		deliver: deliver,
 		channel: ch,
 		tag:     tag,
+		offsets: streamPosition{settled: -1},
 	}
 	sub.wg.Add(1)
 	go sub.run(deliveries, deliver)
@@ -911,6 +912,114 @@ type subscription struct {
 	closeOnce sync.Once
 	closeErr  error
 	closed    bool
+
+	// Where a stream subscription carries on from after a reconnection. Only
+	// used when the subscription names an x-stream-offset; see resumeArgs.
+	offsets streamPosition
+}
+
+// streamPosition is how far a stream subscription has got.
+//
+// A queue forgets what it delivered, so consuming it again after a recovery
+// takes whatever is left. A stream forgets nothing, and consuming it again
+// starts wherever x-stream-offset says. Saying the same thing the second time as
+// the first replayed a reader that began at "first" from the beginning -- every
+// entry handled twice -- and moved one that began at "next" past everything
+// published while it was away. A reattached stream subscription therefore
+// starts at the oldest entry it was given and never settled, or just after the
+// newest it settled: what a queue would redeliver, and nothing it would not.
+type streamPosition struct {
+	mu      sync.Mutex
+	pending map[int64]int // offset -> deliveries not yet settled
+	settled int64         // the newest offset settled; -1 for none
+}
+
+func (p *streamPosition) delivered(offset int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pending == nil {
+		p.pending = map[int64]int{}
+	}
+	p.pending[offset]++
+}
+
+func (p *streamPosition) settle(offset int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pending[offset]--; p.pending[offset] <= 0 {
+		delete(p.pending, offset)
+	}
+	if offset > p.settled {
+		p.settled = offset
+	}
+}
+
+// resume is the offset a reattached subscription starts at, and whether there
+// is one. Nothing settled and nothing pending means nothing was delivered, and
+// the subscription's own starting point still stands.
+//
+// The pending deliveries belong to the channel that has gone. They are forgotten
+// here because the new subscription delivers them again; a handler still
+// finishing one of the old copies settles an offset this no longer tracks, which
+// is harmless.
+func (p *streamPosition) resume() (int64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	defer func() { p.pending = nil }()
+	if len(p.pending) > 0 {
+		oldest := int64(-1)
+		for offset := range p.pending {
+			if oldest < 0 || offset < oldest {
+				oldest = offset
+			}
+		}
+		return oldest, true
+	}
+	if p.settled >= 0 {
+		return p.settled + 1, true
+	}
+	return 0, false
+}
+
+// streamOffsetOf reads the x-stream-offset RabbitMQ stamps on every stream
+// delivery.
+func streamOffsetOf(headers amqp.Table) (int64, bool) {
+	switch v := headers[streamOffsetArg].(type) {
+	case int64:
+		return v, v >= 0
+	case int32:
+		return int64(v), v >= 0
+	case int:
+		return int64(v), v >= 0
+	default:
+		return 0, false
+	}
+}
+
+const streamOffsetArg = "x-stream-offset"
+
+// readsAStream is whether a subscription named a position in a stream.
+func (s *subscription) readsAStream() bool {
+	_, ok := s.spec.Args[streamOffsetArg]
+	return ok
+}
+
+// resumeArgs is the consumer arguments for a reattach: the original ones, with
+// a stream's starting point moved to where this subscription got to.
+func (s *subscription) resumeArgs(args map[string]any) map[string]any {
+	if !s.readsAStream() {
+		return args
+	}
+	offset, ok := s.offsets.resume()
+	if !ok {
+		return args
+	}
+	moved := make(map[string]any, len(args))
+	for name, value := range args {
+		moved[name] = value
+	}
+	moved[streamOffsetArg] = offset
+	return moved
 }
 
 // reattach consumes again on a freshly reconnected transport.
@@ -941,7 +1050,7 @@ func (s *subscription) reattach(_ context.Context, t *Transport) error {
 		return fmt.Errorf("acemq: cannot set prefetch on %q after reconnecting: %w", queue, err)
 	}
 
-	deliveries, err := ch.Consume(queue, tag, false, false, false, false, amqp.Table(spec.Args))
+	deliveries, err := ch.Consume(queue, tag, false, false, false, false, amqp.Table(s.resumeArgs(spec.Args)))
 	if err != nil {
 		_ = ch.Close()
 		return fmt.Errorf("acemq: cannot consume from %q after reconnecting: %w", queue, err)
@@ -959,8 +1068,16 @@ func (s *subscription) reattach(_ context.Context, t *Transport) error {
 func (s *subscription) run(deliveries <-chan amqp.Delivery, deliver func(acemq.Delivery)) {
 	defer s.wg.Done()
 
+	stream := s.readsAStream()
 	for d := range deliveries {
 		msg := d
+		// Recorded before the handler sees it and settled before the broker is
+		// told, so a reconnection at any point finds it either pending or done.
+		settle := func() {}
+		if offset, ok := streamOffsetOf(msg.Headers); stream && ok {
+			s.offsets.delivered(offset)
+			settle = func() { s.offsets.settle(offset) }
+		}
 		deliver(acemq.Delivery{
 			Body:        msg.Body,
 			ContentType: msg.ContentType,
@@ -970,9 +1087,11 @@ func (s *subscription) run(deliveries <-chan amqp.Delivery, deliver func(acemq.D
 			Headers:     map[string]any(msg.Headers),
 			Redelivered: msg.Redelivered,
 			Ack: func() error {
+				settle()
 				return msg.Ack(false)
 			},
 			Nack: func(requeue bool) error {
+				settle()
 				return msg.Nack(false, requeue)
 			},
 		})

@@ -8,6 +8,17 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A stream reader carries on where it was after a reconnection.** The
+  transport reattached every consumer with the arguments it started with, so a
+  stream subscription asked for its original `x-stream-offset` again: a reader
+  that began at `first` was handed the whole stream a second time, and one that
+  began at `next` skipped everything appended while it was disconnected. A
+  reattached stream subscription now starts at the oldest offset it was given
+  and had not settled, or just after the newest it had. Queue consumers are
+  unchanged. Found by apps/03-ledger in the examples repository.
+
 ## [0.9.5] - 2026-10-05
 
 ### Added

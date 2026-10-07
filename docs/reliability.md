@@ -290,6 +290,14 @@ Anything unacknowledged when the connection went is redelivered by the broker,
 marked as a redelivery — so the attempt counter keeps counting and a message
 that was already failing does not get a fresh set of attempts.
 
+A stream is the exception, because a stream does not redeliver: it delivers
+from wherever the consumer says to start. A reattached stream reader therefore
+starts at the oldest entry it had been given and not yet settled, or just after
+the newest it had — what a queue would redeliver, and nothing it would not.
+Restarting from its original offset would hand a reader that began at `first`
+the whole stream again, and move one that began at `next` past everything
+appended while it was away.
+
 ## When the broker runs out of room
 
 RabbitMQ sends `connection.blocked` when it is low on memory or disk, and every
