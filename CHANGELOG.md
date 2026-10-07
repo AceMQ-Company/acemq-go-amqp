@@ -10,6 +10,15 @@ While the version is `0.x` the public API may change in any release.
 
 ### Fixed
 
+- **`patterns.Then` no longer accepts its input when the next message reaches
+  no queue.** It published with the publisher it was given, so one built without
+  `acemq.Mandatory` let the broker drop an unroutable hop while the input was
+  accepted and the result lost. The hop is now always published mandatory, as a
+  declared pipeline's and `FollowSlip`'s hops are and as the other four
+  libraries' pipeline hop is: an unroutable hop is a failed publish, and the
+  input is retried and then dead-lettered to `{queue}.dlq`. The publisher you
+  pass is not changed; your own `Send` calls on it keep their setting.
+
 - **The outbox relay no longer loses a record nothing is bound to receive.** It
   published without mandatory, so the broker dropped such a record silently and
   the relay marked it published and counted it under `outcome=published`. It now
@@ -29,9 +38,8 @@ While the version is `0.x` the public API may change in any release.
   (and `At`/`In` for a moment already past returns the error), and `Replay`
   returns the message to its queue and stops with an unroutable
   `*PublishFailedError`. The scheduler's `Delivered` and `Hops` now count only
-  publishes that arrived. `patterns.Then` uses the publisher you give it and is
-  unchanged; its documentation now says to make that publisher mandatory. The
-  default for an ordinary `Publisher` is unchanged.
+  publishes that arrived. The default for an ordinary `Publisher` is
+  unchanged.
 - **On a connection without publisher confirms, the library's own publishes
   no longer lose a message that reaches no queue.** With `WithoutConfirms` a
   return can never be ruled out — the broker sends `basic.return` before

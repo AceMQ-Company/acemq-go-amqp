@@ -36,3 +36,18 @@ func Marked(ctx context.Context) bool {
 	marked, _ := ctx.Value(key{}).(bool)
 	return marked
 }
+
+type mandatoryKey struct{}
+
+// MarkMandatory marks ctx as [Mark] does, and also makes the publish mandatory
+// whatever the publisher was built with: for a hop that is given the user's
+// publisher, such as patterns.Then, and settles its input on the answer.
+func MarkMandatory(ctx context.Context) context.Context {
+	return context.WithValue(Mark(ctx), mandatoryKey{}, true)
+}
+
+// Mandatory reports whether ctx was marked with [MarkMandatory].
+func Mandatory(ctx context.Context) bool {
+	mandatory, _ := ctx.Value(mandatoryKey{}).(bool)
+	return mandatory
+}

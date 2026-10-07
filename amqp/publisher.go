@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/AceMQ-Company/acemq-go-amqp/internal/onbehalf"
 )
 
 // Publisher sends messages of one type to one destination.
@@ -211,6 +213,9 @@ func (p *Publisher[T]) SendEnvelope(ctx context.Context, payload T, env Envelope
 
 func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (PublishResult, error) {
 	exchange, routingKey := p.exchange, p.routingKey
+	// A hop the library makes with a publisher it was handed is mandatory
+	// whatever that publisher was built with: it settles its input on the answer.
+	mandatory := p.mandatory || onbehalf.Mandatory(ctx)
 
 	// Before encoding, so an interceptor can change the payload as well as the
 	// envelope, and can stop the publish entirely.
@@ -246,7 +251,7 @@ func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (Pu
 		Headers:     env.ToWire(),
 		ReplyTo:     env.ReplyTo,
 		Persistent:  p.persistent,
-		Mandatory:   p.mandatory,
+		Mandatory:   mandatory,
 	})
 	took := time.Since(started)
 	if err != nil {
@@ -257,7 +262,7 @@ func (p *Publisher[T]) publish(ctx context.Context, payload T, env Envelope) (Pu
 	// Reported as an error rather than left in the result, because a caller
 	// using Send never sees the result and would otherwise carry on believing
 	// the message went somewhere.
-	if p.mandatory && !result.Routed {
+	if mandatory && !result.Routed {
 		observePublish(p.conn.observer, exchange, routingKey, OutcomeUnroutable, took)
 		reason := result.ReturnReason
 		if reason == "" {

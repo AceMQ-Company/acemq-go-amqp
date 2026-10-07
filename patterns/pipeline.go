@@ -281,10 +281,11 @@ func WithOrdering[T any](key PartitionKey[T]) Middleware[T] {
 // fails the input is retried, so the work runs again — which is why a step that
 // changes anything should be idempotent.
 //
-// Give it a publisher built with [acemq.Mandatory]. Without it a next message
-// nothing is bound to receive is dropped by the broker and the input accepted
-// anyway; with it that is a failed publish, and the input is retried. Then uses
-// the publisher as given rather than forcing it, because it is yours.
+// The hop is published mandatory whatever the publisher was built with, as every
+// other pipeline hop the library makes is: a next message nothing is bound to
+// receive is a failed publish, and the input is retried and then dead-lettered
+// rather than accepted with its result lost. The publisher itself is not
+// changed; your own Send calls on it keep the mandatory setting you gave it.
 //
 // Name the step with [InPipeline] and [AtStep] and a run stopped here is
 // reported as ended_early. This is the only place that outcome can be seen: a
@@ -309,7 +310,7 @@ func Then[In, Out any](
 			return acemq.Accept()
 		}
 
-		err = publisher.Send(onbehalf.Mark(ctx), out,
+		err = publisher.Send(onbehalf.MarkMandatory(ctx), out,
 			acemq.CorrelationID(m.Envelope.CorrelationID),
 			acemq.CausationID(m.Envelope.ID))
 		if err != nil {

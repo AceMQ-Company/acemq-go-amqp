@@ -45,6 +45,7 @@ func TestOnBehalfHopsWithoutConfirms(t *testing.T) {
 	for name, test := range map[string]func(*testing.T){
 		"slip":           TestASlipHopNothingIsBoundToIsNotAccepted,
 		"pipeline":       TestADeclaredPipelineHopNothingIsBoundToIsNotAccepted,
+		"then":           TestAThenHopNothingIsBoundToIsNotAccepted,
 		"replay":         TestReplayKeepsAMessageItHasNowhereToPut,
 		"scheduler-due":  TestTheSchedulerKeepsADueMessageNothingIsBoundTo,
 		"scheduler-rung": TestTheSchedulerKeepsAMessageWhoseRungIsGone,
@@ -106,6 +107,35 @@ func TestASlipHopNothingIsBoundToIsNotAccepted(t *testing.T) {
 	}
 
 	setAsideFor(t, mq, acemq.DeadLetterQueue("validate"))
+}
+
+func TestAThenHopNothingIsBoundToIsNotAccepted(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t, acemq.WithRetry(acemq.NoRetry()))
+
+	if err := mq.DeclareQueue(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	// "shipping" is never declared, and the publisher is not built mandatory:
+	// Then has to make the hop mandatory itself, or the input is accepted and
+	// the result lost.
+	step := patterns.Then(
+		acemq.NewPublisher[OrderPlaced](mq, "", "shipping"),
+		func(_ context.Context, m acemq.Message[OrderPlaced]) (OrderPlaced, bool, error) {
+			return m.Payload, true, nil
+		})
+	sub, err := acemq.Consume(ctx, mq, "orders", step)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := acemq.NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	setAsideFor(t, mq, acemq.DeadLetterQueue("orders"))
 }
 
 func TestADeclaredPipelineHopNothingIsBoundToIsNotAccepted(t *testing.T) {

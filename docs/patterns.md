@@ -393,12 +393,11 @@ The input is accepted only once the output is published. If publishing fails the
 input is retried and the work runs again, so a step that changes anything should
 be idempotent.
 
-`Then` publishes with the publisher you give it, so **give it a mandatory one**
-(`acemq.Mandatory[Shipment]()`). A publisher without it cannot tell a message
-that reached no queue from one that arrived, and the input is accepted either
-way. A declared pipeline and `FollowSlip` build their own publisher for each hop
-and always publish mandatory: a next step nothing is bound to is a failed hop,
-retried and then dead-lettered, never accepted.
+`Then`'s hop is **always published mandatory**, whatever the publisher you give
+it was built with, as are a declared pipeline's and `FollowSlip`'s hops: a next
+step nothing is bound to is a failed hop, retried and then dead-lettered, never
+accepted. The publisher itself is not changed; your own `Send` calls on it keep
+the mandatory setting you gave it.
 
 Every hop the library makes for you — `Then`'s included — is also published with
 publisher confirms, even on a connection dialled `WithoutConfirms`, because a
