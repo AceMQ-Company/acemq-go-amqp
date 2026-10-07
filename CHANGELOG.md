@@ -10,6 +10,12 @@ While the version is `0.x` the public API may change in any release.
 
 ### Fixed
 
+- **The outbox relay no longer loses a record nothing is bound to receive.** It
+  published without mandatory, so the broker dropped such a record silently and
+  the relay marked it published and counted it under `outcome=published`. It now
+  publishes mandatory, as Java's relay does: an unroutable record is a failed
+  publish, counted under `outcome=failed` against the record's attempts, and
+  stays in the outbox until something is bound to receive it.
 - **A stream reader carries on where it was after a reconnection.** The
   transport reattached every consumer with the arguments it started with, so a
   stream subscription asked for its original `x-stream-offset` again: a reader

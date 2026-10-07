@@ -373,7 +373,19 @@ func (r *OutboxRelay) Sweep(ctx context.Context) (int, error) {
 			MessageID:   record.ID,
 			Headers:     record.Headers,
 			Persistent:  true,
+			// Mandatory, as Java's relay is. Without it a record nothing is bound
+			// to receive is dropped by the broker without a word, and marked
+			// published here: the one message the outbox exists to keep, gone,
+			// and counted as sent. A binding that does not exist yet is an
+			// ordinary moment in a deployment, not a reason to lose the event.
+			Mandatory: true,
 		})
+		if err == nil && !result.Routed {
+			// Failed, not unroutable, in the metric: the outcome Java's relay
+			// counts it under.
+			err = fmt.Errorf("acemq: nothing is bound to exchange %q for routing key %q (%s)",
+				record.Exchange, record.RoutingKey, result.ReturnReason)
+		}
 		if err != nil {
 			// Left in the outbox. Stopping rather than continuing keeps the
 			// order records were written in, which is usually what the writer
@@ -396,7 +408,6 @@ func (r *OutboxRelay) Sweep(ctx context.Context) (int, error) {
 			return published, fmt.Errorf(
 				"acemq: cannot publish outbox record %s: %w", record.ID, err)
 		}
-		_ = result
 
 		// Measured from when the record was written rather than from when this
 		// sweep claimed it. What a lag answers is how long somebody has been

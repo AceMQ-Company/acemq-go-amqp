@@ -828,9 +828,10 @@ func TestARecordStaysInTheOutboxWhenPublishingFails(t *testing.T) {
 	mq := brokerFor(t)
 
 	store := patterns.NewInMemoryOutboxStore()
-	// An exchange nothing has declared, so publishing cannot route... but the
-	// in-memory transport drops rather than failing, so this asserts the record
-	// is only removed after a successful publish, which it is.
+	// A queue nothing has declared, so the publish reaches nothing. This test
+	// used to assert the opposite -- that the record was swept and marked,
+	// because the relay published without mandatory and the drop went unseen --
+	// which is the loss this test is named against.
 	record, err := patterns.Record(mq, "", "never-declared", OrderPlaced{OrderID: "o-1"})
 	if err != nil {
 		t.Fatal(err)
@@ -840,14 +841,11 @@ func TestARecordStaysInTheOutboxWhenPublishingFails(t *testing.T) {
 	}
 
 	relay := patterns.NewOutboxRelay(mq, store)
-	if _, err := relay.Sweep(ctx); err != nil {
-		t.Fatal(err)
+	if published, err := relay.Sweep(ctx); err == nil || published != 0 {
+		t.Errorf("a record that reached nothing was swept with %d published and error %v", published, err)
 	}
-
-	// It published (to nowhere) and was marked. The point being recorded here
-	// is that MarkPublished happens after Publish and not before.
-	if store.Len() != 0 {
-		t.Errorf("%d records left", store.Len())
+	if store.Len() != 1 {
+		t.Errorf("the outbox holds %d records; the one nothing received should still be there", store.Len())
 	}
 }
 

@@ -193,6 +193,11 @@ The relay publishes the bytes that were recorded rather than re-encoding, becaus
 a record outlives the process that wrote it and the Go type may not survive a
 deployment.
 
+It publishes them **mandatory**, as Java's relay does. A record nothing is bound
+to receive — the service that wants the event has not declared its queue yet —
+is a failed publish and stays in the outbox, rather than being dropped by the
+broker and marked as sent. Up to 0.9.5 it was the second, and the event was gone.
+
 ### A record the broker will never take
 
 A sweep stops at the first record that fails and leaves it in the outbox. That is
