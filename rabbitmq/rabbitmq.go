@@ -43,6 +43,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+	"github.com/AceMQ-Company/acemq-go-amqp/internal/onbehalf"
 	"github.com/AceMQ-Company/acemq-go-amqp/security"
 )
 
@@ -151,6 +152,12 @@ type Config struct {
 	// makes a successful publish mean nothing more than "the bytes left this
 	// process", so it is worth doing only where losing a message costs less
 	// than the round trip.
+	//
+	// It covers your publishes only. What the library publishes on your
+	// behalf — retry and set-aside hops, the outbox relay, slip, pipeline and
+	// scheduler hops, Replay — is confirmed on a channel of its own regardless,
+	// because each of those settles its input on whether the message reached a
+	// queue, and without a confirm a return can never be ruled out.
 	WithoutConfirms bool
 
 	// MaxOutstandingPublishes bounds how many publishes may be waiting for a
@@ -229,6 +236,17 @@ type Transport struct {
 	// through a snapshot taken under it.
 	mu      sync.Mutex
 	channel *amqp.Channel
+
+	// hops carries the library's own publishes — retry hops, set-asides, the
+	// outbox relay, slip, pipeline and scheduler hops, replay — on a connection
+	// dialled WithoutConfirms. Each of those settles something on whether the
+	// message reached a queue, and that is only known with a confirm: the
+	// broker sends basic.return before basic.ack, so the ack proves no return
+	// is coming. Without one, a return can never be ruled out. So they are
+	// always confirmed, here, while the caller's own publishes stay on channel
+	// unconfirmed as asked. Nil when confirming, because channel already is
+	// such a channel. Guarded by mu, and replaced with it on recovery.
+	hops *amqp.Channel
 
 	// generation says which connection conn and channel are: Dial's is the
 	// first and every recovery makes another. A publish reads it with the write
@@ -404,22 +422,32 @@ func Dial(ctx context.Context, url string, cfg ...Config) (*Transport, error) {
 		outstanding: make(chan struct{}, bound),
 		returned:    map[string]string{},
 	}
-	if !c.WithoutConfirms {
-		if err := ch.Confirm(false); err != nil {
-			_ = ch.Close()
+	// WithoutConfirms leaves the caller's channel alone and opens a second one,
+	// confirmed, for the library's own hops; see hops. Either way exactly one
+	// channel is in confirm mode and watched for returns.
+	confirmed := ch
+	if c.WithoutConfirms {
+		hops, err := conn.Channel()
+		if err != nil {
 			_ = conn.Close()
-			return nil, fmt.Errorf("acemq: the broker will not enable publisher confirms: %w", err)
+			return nil, fmt.Errorf("acemq: connected to the broker but cannot open a channel: %w", err)
 		}
-		transport.confirming = true
-		// Buffered for every publish that may be in flight at once. The client
-		// hands a return to this channel with a blocking send from the same
-		// goroutine that resolves confirms, so a full buffer would stop confirms
-		// arriving — and the publishers that would drain it are all waiting for
-		// exactly those confirms. One slot per outstanding publish makes that
-		// deadlock unreachable: a publish produces at most one return, and a
-		// publish that has been answered has already been drained.
-		transport.returns = ch.NotifyReturn(make(chan amqp.Return, bound))
+		transport.hops = hops
+		confirmed = hops
 	}
+	if err := confirmed.Confirm(false); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("acemq: the broker will not enable publisher confirms: %w", err)
+	}
+	transport.confirming = !c.WithoutConfirms
+	// Buffered for every publish that may be in flight at once. The client
+	// hands a return to this channel with a blocking send from the same
+	// goroutine that resolves confirms, so a full buffer would stop confirms
+	// arriving — and the publishers that would drain it are all waiting for
+	// exactly those confirms. One slot per outstanding publish makes that
+	// deadlock unreachable: a publish produces at most one return, and a
+	// publish that has been answered has already been drained.
+	transport.returns = confirmed.NotifyReturn(make(chan amqp.Return, bound))
 
 	go transport.watchBlocked(conn.NotifyBlocked(make(chan amqp.Blocking, 4)))
 
@@ -559,7 +587,9 @@ func (t *Transport) Publish(
 		return result, &acemq.PublishingPausedError{Reason: reason}
 	}
 
-	if !t.confirming {
+	// The library's own hops are confirmed whatever the connection was dialled
+	// with; see hops.
+	if !t.confirming && !onbehalf.Marked(ctx) {
 		if _, _, err := t.send(ctx, exchange, routingKey, msg.Mandatory, false, publishing); err != nil {
 			return result, &acemq.PublishFailedError{
 				MessageID: msg.MessageID, Exchange: exchange, RoutingKey: routingKey, Err: err}
@@ -644,12 +674,16 @@ func (t *Transport) send(
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	sent := inFlight{channel: t.channel, generation: t.generation}
+	ch := t.channel
+	if confirm && t.hops != nil {
+		ch = t.hops
+	}
+	sent := inFlight{channel: ch, generation: t.generation}
 	if !confirm {
-		return nil, sent, t.channel.PublishWithContext(
+		return nil, sent, ch.PublishWithContext(
 			ctx, exchange, routingKey, mandatory, false, publishing)
 	}
-	confirmation, err := t.channel.PublishWithDeferredConfirmWithContext(
+	confirmation, err := ch.PublishWithDeferredConfirmWithContext(
 		ctx, exchange, routingKey, mandatory, false, publishing)
 	return confirmation, sent, err
 }
@@ -1345,6 +1379,7 @@ func (t *Transport) reconnectOnce() (chan *amqp.Error, error) {
 	t.mu.Lock()
 	t.conn = fresh.conn
 	t.channel = fresh.channel
+	t.hops = fresh.hops
 	t.generation++
 	t.mu.Unlock()
 

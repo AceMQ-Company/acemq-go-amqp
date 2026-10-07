@@ -26,7 +26,6 @@ package rabbitmq_test
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -35,16 +34,8 @@ import (
 )
 
 func TestAnOutboxRecordNothingIsBoundToIsKeptUntilSomethingIs(t *testing.T) {
-	url := os.Getenv("ACEMQ_TEST_AMQP_URL")
-	if url == "" {
-		t.Skip("ACEMQ_TEST_AMQP_URL is not set; skipping the tests that need a broker")
-	}
 	ctx := context.Background()
-	mq, err := acemq.Connect(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = mq.Close() }()
+	mq := onBehalfBroker(t)
 
 	name := fmt.Sprintf("acemq-outbox-unroutable-%d", time.Now().UnixNano())
 	if err := mq.DeclareExchange(ctx, name, "topic", acemq.TransientExchange()); err != nil {

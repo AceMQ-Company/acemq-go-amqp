@@ -21,6 +21,7 @@ import (
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+	"github.com/AceMQ-Company/acemq-go-amqp/internal/onbehalf"
 )
 
 // ReplayResult is what a replay did.
@@ -218,7 +219,7 @@ func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (ReplayResul
 		// succeeds: a destination nothing is bound to is confirmed and dropped by
 		// the broker, and without the return the replay would delete the last
 		// copy of a message it was asked to recover.
-		published, err := conn.PublishRaw(ctx, from.Exchange, routingKey, acemq.Outbound{
+		published, err := conn.PublishRaw(onbehalf.Mark(ctx), from.Exchange, routingKey, acemq.Outbound{
 			Body:        message.Body,
 			ContentType: message.ContentType,
 			MessageID:   goingBack.ID,

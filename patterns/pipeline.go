@@ -20,6 +20,7 @@ import (
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+	"github.com/AceMQ-Company/acemq-go-amqp/internal/onbehalf"
 )
 
 // The outcomes of a pipeline run, which are the words every AceMQ library
@@ -308,7 +309,7 @@ func Then[In, Out any](
 			return acemq.Accept()
 		}
 
-		err = publisher.Send(ctx, out,
+		err = publisher.Send(onbehalf.Mark(ctx), out,
 			acemq.CorrelationID(m.Envelope.CorrelationID),
 			acemq.CausationID(m.Envelope.ID))
 		if err != nil {

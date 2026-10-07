@@ -21,6 +21,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/AceMQ-Company/acemq-go-amqp/internal/onbehalf"
 )
 
 // Message is a delivery that has been decoded.
@@ -711,7 +713,7 @@ func (c *Consumer) republish(
 		return false, fmt.Errorf("acemq: cannot republish onto %q: %w", queue, err)
 	}
 
-	result, err := c.conn.PublishRaw(ctx, "", queue, Outbound{
+	result, err := c.conn.PublishRaw(onbehalf.Mark(ctx), "", queue, Outbound{
 		Body:        d.Body,
 		ContentType: d.ContentType,
 		MessageID:   env.ID,

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+	"github.com/AceMQ-Company/acemq-go-amqp/internal/onbehalf"
 )
 
 // OutboxRecord is a message waiting to be published.
@@ -367,7 +368,7 @@ func (r *OutboxRelay) Sweep(ctx context.Context) (int, error) {
 	observer := r.conn.Observer()
 	published := 0
 	for _, record := range records {
-		result, err := r.conn.PublishRaw(ctx, record.Exchange, record.RoutingKey, acemq.Outbound{
+		result, err := r.conn.PublishRaw(onbehalf.Mark(ctx), record.Exchange, record.RoutingKey, acemq.Outbound{
 			Body:        record.Body,
 			ContentType: record.ContentType,
 			MessageID:   record.ID,

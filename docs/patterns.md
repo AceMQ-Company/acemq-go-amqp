@@ -400,6 +400,11 @@ way. A declared pipeline and `FollowSlip` build their own publisher for each hop
 and always publish mandatory: a next step nothing is bound to is a failed hop,
 retried and then dead-lettered, never accepted.
 
+Every hop the library makes for you — `Then`'s included — is also published with
+publisher confirms, even on a connection dialled `WithoutConfirms`, because a
+return is only known once the broker has confirmed. See
+[Publisher confirms](reliability.md#publisher-confirms).
+
 ### Naming a step, so a finished run is visible
 
 `patterns.InPipeline` and `patterns.AtStep` name a `Then` or a `FollowSlip`, and

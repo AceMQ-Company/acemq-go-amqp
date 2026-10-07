@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+	"github.com/AceMQ-Company/acemq-go-amqp/internal/onbehalf"
 )
 
 // A declared pipeline: one name, its steps in order, a queue behind each of
@@ -252,7 +253,7 @@ func (s *pipelineStep[In, Out]) start(
 		// as this returns, so a next step whose queue has gone would otherwise
 		// lose the message with nothing reporting it.
 		err = acemq.NewPublisher[Out](conn, next.Exchange, next.RoutingKey, acemq.Mandatory[Out]()).
-			Send(ctx, out, all...)
+			Send(onbehalf.Mark(ctx), out, all...)
 		if err != nil {
 			return acemq.Retry(fmt.Errorf(
 				"acemq: pipeline %s step %s finished with message %s but the next message did"+

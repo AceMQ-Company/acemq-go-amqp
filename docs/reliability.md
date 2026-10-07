@@ -340,6 +340,23 @@ mq, err := acemq.NewConn(transport)
 `Confirmed` is then false, because nothing was promised and claiming otherwise
 would be a lie that looks like a guarantee.
 
+`WithoutConfirms` covers **your** publishes, and only those. Under it a `Send` is
+unconfirmed, `Confirmed` is false, and `Routed` is always true — even with
+`Mandatory` — because without a confirm a return can never be ruled out: the
+broker sends `basic.return` before `basic.ack`, and only the ack proves none is
+coming.
+
+What the library publishes on your behalf is confirmed regardless, on one extra
+channel the connection opens for it: retry hops, rung hops, `{queue}.dlq` and
+`{queue}.parked` set-asides, the outbox relay, routing-slip, pipeline and `Then`
+hops, the scheduler's hops and deliveries, and `Replay`. Each of those
+acknowledges or marks something done as soon as its publish returns, so each has
+to know the message reached a queue; on a connection without confirms they
+would otherwise settle work after the message went nowhere. The price is a
+broker round trip per hop, the same as on a confirmed connection.
+
+The in-memory transport behaves the same way as `memory://name?confirms=off`.
+
 ## Messages that reach no queue
 
 An unroutable message is dropped by the broker, silently. The publisher

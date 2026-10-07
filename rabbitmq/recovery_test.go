@@ -37,6 +37,7 @@ import (
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+	"github.com/AceMQ-Company/acemq-go-amqp/internal/onbehalf"
 )
 
 // TestPublishingSurvivesTheConnectionBeingReplacedUnderIt is the regression
@@ -157,5 +158,43 @@ func TestPublishingSurvivesTheConnectionBeingReplacedUnderIt(t *testing.T) {
 	if generation, want := transport.generation, uint64(swaps+1); generation != want {
 		t.Errorf("the transport is on generation %d after %d reconnections, want %d",
 			generation, swaps, want)
+	}
+}
+
+// TestTheHopChannelIsRemadeWithTheConnection checks that on a connection
+// without confirms, the library's own hops are still confirmed, and still told
+// about returns, after a reconnection replaced the channel they travel on.
+func TestTheHopChannelIsRemadeWithTheConnection(t *testing.T) {
+	url := os.Getenv("ACEMQ_TEST_AMQP_URL")
+	if url == "" {
+		t.Skip("ACEMQ_TEST_AMQP_URL is not set; skipping the tests that need a broker")
+	}
+	ctx := context.Background()
+	transport, err := Dial(ctx, url, Config{WithoutConfirms: true, WithoutRecovery: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = transport.Close() }()
+
+	before := transport.hops
+	_ = transport.connection().Close()
+	if _, err := transport.reconnectOnce(); err != nil {
+		t.Fatal(err)
+	}
+	if transport.hops == nil || transport.hops == before {
+		t.Fatal("the hop channel was not remade with the connection")
+	}
+
+	nowhere := fmt.Sprintf("acemq-nowhere-%d", time.Now().UnixNano())
+	hop, err := transport.Publish(onbehalf.Mark(ctx), "", nowhere,
+		acemq.Outbound{Body: []byte("x"), MessageID: "hop-1", Mandatory: true})
+	if err != nil || !hop.Confirmed || hop.Routed {
+		t.Errorf("a hop into nowhere after reconnecting came back %+v, %v; expected confirmed and not routed",
+			hop, err)
+	}
+	own, err := transport.Publish(ctx, "", nowhere,
+		acemq.Outbound{Body: []byte("x"), MessageID: "own-1", Mandatory: true})
+	if err != nil || own.Confirmed || !own.Routed {
+		t.Errorf("the caller's publish came back %+v, %v; expected unconfirmed, as dialled", own, err)
 	}
 }

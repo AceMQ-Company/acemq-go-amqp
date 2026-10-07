@@ -33,6 +33,28 @@ import (
 	"github.com/AceMQ-Company/acemq-go-amqp/patterns"
 )
 
+// withoutConfirms in a test's name makes brokerFor's broker one without
+// publisher confirms.
+const withoutConfirms = "/without-confirms/"
+
+// TestOnBehalfHopsWithoutConfirms runs every test above on a connection
+// without publisher confirms. The caller's own publishes are unconfirmed there,
+// but the library's hops are confirmed regardless: without a confirm a return
+// cannot be ruled out, and each of these settles its input on the answer.
+func TestOnBehalfHopsWithoutConfirms(t *testing.T) {
+	for name, test := range map[string]func(*testing.T){
+		"slip":           TestASlipHopNothingIsBoundToIsNotAccepted,
+		"pipeline":       TestADeclaredPipelineHopNothingIsBoundToIsNotAccepted,
+		"replay":         TestReplayKeepsAMessageItHasNowhereToPut,
+		"scheduler-due":  TestTheSchedulerKeepsADueMessageNothingIsBoundTo,
+		"scheduler-rung": TestTheSchedulerKeepsAMessageWhoseRungIsGone,
+		"scheduler-now":  TestSchedulingStraightIntoNowhereIsAnError,
+		"outbox":         TestARecordStaysInTheOutboxWhenPublishingFails,
+	} {
+		t.Run(strings.TrimPrefix(withoutConfirms, "/")+name, test)
+	}
+}
+
 // waitForCount waits for a queue to hold n messages.
 func waitForCount(t *testing.T, mq *acemq.Conn, queue string, n int64) {
 	t.Helper()

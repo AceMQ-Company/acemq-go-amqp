@@ -23,6 +23,7 @@ import (
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+	"github.com/AceMQ-Company/acemq-go-amqp/internal/onbehalf"
 )
 
 // HeaderRoutingSlip carries the itinerary on the message as JSON.
@@ -518,7 +519,7 @@ func FollowSlip[T any](
 		// and without the return this step would accept a message that is now
 		// nowhere. Unroutable is a failed hop, retried like any other.
 		err = acemq.NewPublisher[T](conn, next.Exchange, next.RoutingKey, acemq.Mandatory[T]()).
-			Send(ctx, payload, onwards...)
+			Send(onbehalf.Mark(ctx), payload, onwards...)
 		if err != nil {
 			return acemq.Retry(fmt.Errorf(
 				"acemq: %s is done for message %s but the next step did not go out: %w",

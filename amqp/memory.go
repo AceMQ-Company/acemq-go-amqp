@@ -22,6 +22,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/AceMQ-Company/acemq-go-amqp/internal/onbehalf"
 )
 
 // The in-memory transport, reached as memory://name.
@@ -36,6 +38,11 @@ import (
 // have to coordinate:
 //
 //	mq, err := acemq.Connect(ctx, "memory://"+t.Name())
+//
+// memory://name?confirms=off behaves as a RabbitMQ connection dialled with
+// WithoutConfirms: a publish is reported unconfirmed and routed, whatever
+// happened to it, except the publishes the library makes on its own behalf,
+// which are confirmed there too and so report routing honestly here.
 func init() {
 	RegisterTransport("memory", dialMemory)
 }
@@ -62,7 +69,7 @@ func dialMemory(_ context.Context, rawURL string, _ DialOptions) (Transport, err
 		}
 		brokers[name] = broker
 	}
-	return &memTransport{broker: broker}, nil
+	return &memTransport{broker: broker, unconfirmed: parsed.Query().Get("confirms") == "off"}, nil
 }
 
 type memBroker struct {
@@ -83,6 +90,9 @@ type memBinding struct {
 
 type memTransport struct {
 	broker *memBroker
+
+	// unconfirmed mirrors a RabbitMQ connection without publisher confirms.
+	unconfirmed bool
 
 	mu     sync.Mutex
 	subs   []*memSubscription
@@ -229,7 +239,7 @@ func (t *memTransport) Bind(_ context.Context, queue, exchange, routingKey strin
 }
 
 func (t *memTransport) Publish(
-	_ context.Context, exchange, routingKey string, msg Outbound,
+	ctx context.Context, exchange, routingKey string, msg Outbound,
 ) (PublishResult, error) {
 	t.broker.mu.Lock()
 	targets := t.broker.route(exchange, routingKey)
@@ -244,6 +254,14 @@ func (t *memTransport) Publish(
 			replyTo:     msg.ReplyTo,
 			headers:     copyHeaders(msg.Headers),
 		})
+	}
+
+	// Without confirms nothing is known: a return can never be told from one
+	// that has not arrived yet, so the RabbitMQ transport reports routed and
+	// unconfirmed, and this says the same. Not for the library's own hops,
+	// which RabbitMQ confirms on a channel of their own.
+	if t.unconfirmed && !onbehalf.Marked(ctx) {
+		return PublishResult{MessageID: msg.MessageID, Routed: true}, nil
 	}
 
 	// Everything here is in memory and has already happened, so the message is
@@ -570,7 +588,9 @@ func copyHeaders(h map[string]any) map[string]any {
 // transport is written to avoid.
 func (t *memTransport) Supports(c Capability) bool {
 	switch c {
-	case CapabilityPublisherConfirms, CapabilityDeadLettering:
+	case CapabilityPublisherConfirms:
+		return !t.unconfirmed
+	case CapabilityDeadLettering:
 		return true
 	default:
 		return false

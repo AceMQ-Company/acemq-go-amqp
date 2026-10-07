@@ -21,6 +21,7 @@ import (
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
+	"github.com/AceMQ-Company/acemq-go-amqp/internal/onbehalf"
 )
 
 // The names the scheduler owns on the broker.
@@ -339,7 +340,7 @@ func (s *Scheduler) route(
 	// destination nothing is bound to, is confirmed and dropped by the broker,
 	// and without the return the scheduled message would be gone with nothing
 	// reporting it. An error instead, so the control consumer sets it aside.
-	result, err := s.conn.PublishRaw(ctx, ScheduleExchange, ScheduleRungName(rung), acemq.Outbound{
+	result, err := s.conn.PublishRaw(onbehalf.Mark(ctx), ScheduleExchange, ScheduleRungName(rung), acemq.Outbound{
 		Body:        body,
 		ContentType: acemq.BytesContentType,
 		MessageID:   env.ID,
@@ -380,7 +381,7 @@ func (s *Scheduler) deliver(ctx context.Context, body []byte, headers map[string
 		return err
 	}
 
-	result, err := s.conn.PublishRaw(ctx, exchange, routingKey, acemq.Outbound{
+	result, err := s.conn.PublishRaw(onbehalf.Mark(ctx), exchange, routingKey, acemq.Outbound{
 		Body:        body,
 		ContentType: contentType,
 		MessageID:   env.ID,

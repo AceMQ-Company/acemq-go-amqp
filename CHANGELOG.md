@@ -32,6 +32,17 @@ While the version is `0.x` the public API may change in any release.
   publishes that arrived. `patterns.Then` uses the publisher you give it and is
   unchanged; its documentation now says to make that publisher mandatory. The
   default for an ordinary `Publisher` is unchanged.
+- **On a connection without publisher confirms, the library's own publishes
+  no longer lose a message that reaches no queue.** With `WithoutConfirms` a
+  return can never be ruled out — the broker sends `basic.return` before
+  `basic.ack`, so only the ack proves none is coming — and the transport
+  reported every publish as routed. A retry hop to a missing rung, a set-aside
+  to a missing `{queue}.dlq` or `{queue}.parked`, the outbox relay, a slip or
+  declared-pipeline hop, `Then`'s hop, the scheduler's hops and delivery, and
+  `Replay` therefore settled their input after a publish that went nowhere:
+  the same losses the two entries above fixed for confirmed connections.
+  Reproduced against a real broker for every one of them. The in-memory
+  transport mirrors the mode as `memory://name?confirms=off`.
 - **A stream reader carries on where it was after a reconnection.** The
   transport reattached every consumer with the arguments it started with, so a
   stream subscription asked for its original `x-stream-offset` again: a reader
@@ -40,6 +51,19 @@ While the version is `0.x` the public API may change in any release.
   reattached stream subscription now starts at the oldest offset it was given
   and had not settled, or just after the newest it had. Queue consumers are
   unchanged. Found by apps/03-ledger in the examples repository.
+
+### Changed
+
+- **The library's own publishes are always confirmed.** Retry, rung, park and
+  dead-letter hops, the outbox relay, slip, pipeline and scheduler hops and
+  `Replay` publish mandatory with publisher confirms whatever the connection was
+  dialled with. A connection dialled `WithoutConfirms` opens one extra channel,
+  in confirm mode, for them; the default connection is unchanged. Your own
+  publishers keep the mode you chose: under `WithoutConfirms` their publishes
+  are still unconfirmed, `Confirmed` is false and `Routed` is always true. The
+  cost is a broker round trip per hop, as on a confirmed connection: a consumer
+  retrying every message once went from about 17,000 to about 2,100 messages a
+  second against a local broker.
 
 ## [0.9.5] - 2026-10-05
 

@@ -39,9 +39,15 @@ type OrderPlaced struct {
 	OrderID string `json:"orderId"`
 }
 
+// brokerFor gives each test its own in-memory broker. Run under
+// TestOnBehalfHopsWithoutConfirms, it is one without publisher confirms.
 func brokerFor(t *testing.T, opts ...acemq.ConnOption) *acemq.Conn {
 	t.Helper()
-	mq, err := acemq.Connect(context.Background(), "memory://"+t.Name(), opts...)
+	url := "memory://" + t.Name()
+	if strings.Contains(t.Name(), withoutConfirms) {
+		url += "?confirms=off"
+	}
+	mq, err := acemq.Connect(context.Background(), url, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
