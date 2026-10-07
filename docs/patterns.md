@@ -53,6 +53,12 @@ acemq: the responder failed: no such product
 timeout is the absence of an answer, and the work may well have been done —
 which is why a request that changes anything should be idempotent.
 
+The reply is published **without** mandatory, deliberately. A generated reply
+queue is auto-deleting and goes away with a requester that gave up, and a reply
+nobody is waiting for is not a message worth keeping. A reply that reaches no
+queue is therefore dropped, the request is accepted, and the requester — if it
+is still there — sees `ErrRequestTimedOut`.
+
 By default replies come back on an exclusive, auto-deleting queue that goes away
 with the process. It is a classic queue and has to be: RabbitMQ allows a quorum
 queue to be neither exclusive nor auto-deleting.
@@ -387,6 +393,13 @@ The input is accepted only once the output is published. If publishing fails the
 input is retried and the work runs again, so a step that changes anything should
 be idempotent.
 
+`Then` publishes with the publisher you give it, so **give it a mandatory one**
+(`acemq.Mandatory[Shipment]()`). A publisher without it cannot tell a message
+that reached no queue from one that arrived, and the input is accepted either
+way. A declared pipeline and `FollowSlip` build their own publisher for each hop
+and always publish mandatory: a next step nothing is bound to is a failed hop,
+retried and then dead-lettered, never accepted.
+
 ### Naming a step, so a finished run is visible
 
 `patterns.InPipeline` and `patterns.AtStep` name a `Then` or a `FollowSlip`, and
@@ -467,6 +480,13 @@ rather than losing them.
 A message is acknowledged only after the broker has confirmed the new copy. A
 crash in that gap replays it twice, which is the right way round for a
 dead-letter queue.
+
+The new copy is published **mandatory**. A destination nothing is bound to is
+confirmed by the broker and then dropped, so until 0.9.5 a replay into it
+acknowledged the last copy of the message it was asked to recover. Now that
+message is returned to the queue it came from, the replay stops with
+`Reason` `failed`, and the error is a `*acemq.PublishFailedError` with
+`Unroutable` set.
 
 Bodies are read as bytes, not through the connection's codec. A body that will
 not decode is exactly the kind that ends up in a dead-letter queue.
@@ -878,6 +898,13 @@ bound to the `acemq.schedule` direct exchange under its own name. An expired
 message lands on `acemq.schedule.due`, where the scheduler either delivers it or
 puts it on the largest rung that does not overshoot what is left. A one-day delay
 is twenty-four hops and a one-minute delay is one, which is the right way round.
+
+Both hops — onto a rung, and out to the destination — are published
+**mandatory**. A rung somebody deleted, or a destination nothing is bound to,
+fails the hop rather than being confirmed and dropped: the control consumer sets
+the message aside on `acemq.schedule.due.dlq` with the reason, and `At` or `In`
+for a moment already past returns the unroutable `*acemq.PublishFailedError` to
+the caller. Up to 0.9.5 such a message was acknowledged and gone.
 
 `patterns.ScheduleTopology()` is the whole thing, exported so a deployment can
 declare it up front or compare it with what another AceMQ library declares:

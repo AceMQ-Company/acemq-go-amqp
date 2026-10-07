@@ -16,6 +16,7 @@ package patterns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -213,13 +214,21 @@ func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (ReplayResul
 		headers[HeaderReplayedAt] = time.Now().UTC().Format(time.RFC3339)
 		headers[HeaderReplayCount] = replayCount(message.Envelope) + 1
 
-		_, err = conn.PublishRaw(ctx, from.Exchange, routingKey, acemq.Outbound{
+		// Mandatory, because the original is acknowledged as soon as this
+		// succeeds: a destination nothing is bound to is confirmed and dropped by
+		// the broker, and without the return the replay would delete the last
+		// copy of a message it was asked to recover.
+		published, err := conn.PublishRaw(ctx, from.Exchange, routingKey, acemq.Outbound{
 			Body:        message.Body,
 			ContentType: message.ContentType,
 			MessageID:   goingBack.ID,
 			Headers:     headers,
 			Persistent:  true,
+			Mandatory:   true,
 		})
+		if err == nil && !published.Routed {
+			err = unroutable(goingBack.ID, from.Exchange, routingKey, published.ReturnReason)
+		}
 		if err != nil {
 			// Returned rather than dropped, and the replay stops. A replay that
 			// loses messages is worse than one that stops early.
@@ -255,5 +264,18 @@ func replayCount(env acemq.Envelope) int {
 		return int(v)
 	default:
 		return 0
+	}
+}
+
+// unroutable is the error for a message published on the caller's behalf that
+// reached no queue: the same [acemq.PublishFailedError] a mandatory
+// [acemq.Publisher] returns, so errors.As finds it either way.
+func unroutable(messageID, exchange, routingKey, reason string) error {
+	if reason == "" {
+		reason = "no queue is bound to receive it"
+	}
+	return &acemq.PublishFailedError{
+		MessageID: messageID, Exchange: exchange, RoutingKey: routingKey,
+		Unroutable: true, Err: errors.New(reason),
 	}
 }

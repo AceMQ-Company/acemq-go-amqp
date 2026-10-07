@@ -513,7 +513,11 @@ func FollowSlip[T any](
 			acemq.CausationID(m.Envelope.ID),
 		}, carrying...)
 
-		err = acemq.NewPublisher[T](conn, next.Exchange, next.RoutingKey).
+		// Mandatory, because accepting below is what makes this hop final: a
+		// next stop nothing is bound to is confirmed and dropped by the broker,
+		// and without the return this step would accept a message that is now
+		// nowhere. Unroutable is a failed hop, retried like any other.
+		err = acemq.NewPublisher[T](conn, next.Exchange, next.RoutingKey, acemq.Mandatory[T]()).
 			Send(ctx, payload, onwards...)
 		if err != nil {
 			return acemq.Retry(fmt.Errorf(

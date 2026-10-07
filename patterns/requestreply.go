@@ -448,6 +448,10 @@ func Serve[Req, Resp any](
 	return &Responder{consumer: consumer, counts: counts}, nil
 }
 
+// reply answers a request. Not mandatory, deliberately: a generated reply queue
+// is auto-deleting and goes when its requester gives up, and a reply nobody is
+// waiting for is not worth keeping. A reply that reaches no queue is dropped and
+// the request accepted; a requester still waiting sees ErrRequestTimedOut.
 func reply[Req, Resp any](
 	ctx context.Context, conn *acemq.Conn, replyTo string, request acemq.Message[Req], response Resp,
 ) error {

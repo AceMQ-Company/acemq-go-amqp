@@ -247,7 +247,12 @@ func (s *pipelineStep[In, Out]) start(
 		// itinerary names its own next exchange and routing key, which may be
 		// somewhere this pipeline never declared. [FollowSlip] does the same for the
 		// same reason.
-		err = acemq.NewPublisher[Out](conn, next.Exchange, next.RoutingKey).Send(ctx, out, all...)
+		//
+		// Mandatory for the reason [FollowSlip] is: the input is accepted as soon
+		// as this returns, so a next step whose queue has gone would otherwise
+		// lose the message with nothing reporting it.
+		err = acemq.NewPublisher[Out](conn, next.Exchange, next.RoutingKey, acemq.Mandatory[Out]()).
+			Send(ctx, out, all...)
 		if err != nil {
 			return acemq.Retry(fmt.Errorf(
 				"acemq: pipeline %s step %s finished with message %s but the next message did"+

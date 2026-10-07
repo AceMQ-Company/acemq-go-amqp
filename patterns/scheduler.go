@@ -160,6 +160,7 @@ func ScheduleTopology() *acemq.Topology {
 
 	t.Queue(ScheduleControlQueue, acemq.OfType(acemq.QueueClassic)).
 		Binding(ScheduleControlQueue, ScheduleExchange, ScheduleControlQueue)
+
 	return t
 }
 
@@ -333,17 +334,26 @@ func (s *Scheduler) route(
 		return err
 	}
 
-	s.hops.Add(1)
-	_, err = s.conn.PublishRaw(ctx, ScheduleExchange, ScheduleRungName(rung), acemq.Outbound{
+	// Mandatory here and in deliver, because the control message is
+	// acknowledged as soon as this returns: a rung that has been deleted, or a
+	// destination nothing is bound to, is confirmed and dropped by the broker,
+	// and without the return the scheduled message would be gone with nothing
+	// reporting it. An error instead, so the control consumer sets it aside.
+	result, err := s.conn.PublishRaw(ctx, ScheduleExchange, ScheduleRungName(rung), acemq.Outbound{
 		Body:        body,
 		ContentType: acemq.BytesContentType,
 		MessageID:   env.ID,
 		Headers:     env.ToWire(),
 		Persistent:  true,
+		Mandatory:   true,
 	})
+	if err == nil && !result.Routed {
+		err = unroutable(env.ID, ScheduleExchange, ScheduleRungName(rung), result.ReturnReason)
+	}
 	if err != nil {
 		return fmt.Errorf("acemq: cannot put a scheduled message on %s: %w", ScheduleRungName(rung), err)
 	}
+	s.hops.Add(1)
 	return nil
 }
 
@@ -370,18 +380,22 @@ func (s *Scheduler) deliver(ctx context.Context, body []byte, headers map[string
 		return err
 	}
 
-	s.delivered.Add(1)
-	_, err = s.conn.PublishRaw(ctx, exchange, routingKey, acemq.Outbound{
+	result, err := s.conn.PublishRaw(ctx, exchange, routingKey, acemq.Outbound{
 		Body:        body,
 		ContentType: contentType,
 		MessageID:   env.ID,
 		Headers:     env.ToWire(),
 		Persistent:  true,
+		Mandatory:   true,
 	})
+	if err == nil && !result.Routed {
+		err = unroutable(env.ID, exchange, routingKey, result.ReturnReason)
+	}
 	if err != nil {
 		return fmt.Errorf("acemq: cannot deliver a scheduled message to %q/%q: %w",
 			exchange, routingKey, err)
 	}
+	s.delivered.Add(1)
 	return nil
 }
 

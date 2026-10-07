@@ -16,6 +16,22 @@ While the version is `0.x` the public API may change in any release.
   publishes mandatory, as Java's relay does: an unroutable record is a failed
   publish, counted under `outcome=failed` against the record's attempts, and
   stays in the outbox until something is bound to receive it.
+- **Nothing else the library publishes for you is lost when it reaches no
+  queue either.** A routing-slip hop (`FollowSlip`), a declared pipeline's hop to
+  its next step, the scheduler's hop onto a rung and its final delivery, and
+  `Replay`'s new copy were all published without mandatory and then settled:
+  the input accepted, the control message or the replayed original
+  acknowledged. A destination nothing was bound to was confirmed, dropped by the
+  broker, and the last copy went with it — reproduced against a real broker for
+  replay, slip and scheduler. Each is mandatory now and treats a return as a
+  failed publish: a slip or pipeline hop is retried and then dead-lettered to
+  `{queue}.dlq`, a scheduled message is set aside on `acemq.schedule.due.dlq`
+  (and `At`/`In` for a moment already past returns the error), and `Replay`
+  returns the message to its queue and stops with an unroutable
+  `*PublishFailedError`. The scheduler's `Delivered` and `Hops` now count only
+  publishes that arrived. `patterns.Then` uses the publisher you give it and is
+  unchanged; its documentation now says to make that publisher mandatory. The
+  default for an ordinary `Publisher` is unchanged.
 - **A stream reader carries on where it was after a reconnection.** The
   transport reattached every consumer with the arguments it started with, so a
   stream subscription asked for its original `x-stream-offset` again: a reader
