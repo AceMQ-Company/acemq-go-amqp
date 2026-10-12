@@ -85,6 +85,13 @@ rather than a count of anything. Seven days becomes `7D`, ninety minutes becomes
 `24h`. You do not have to know that to use it; you do have to know it if you are
 comparing arguments against a stream declared by hand.
 
+An hour is `1h`, the spelling every AceMQ library uses. Java releases before
+0.7.13 wrote `3600s`, and the broker compares the argument as a string
+(confirmed on RabbitMQ 3.13), so declaring a stream that an older Java service
+created with `MaxAge` set is refused with `PRECONDITION_FAILED` — and so is
+declaring it without `MaxAge`, because leaving out an argument the stream has is
+refused too. Delete such a stream and declare it again to settle on `1h`.
+
 ### Segment size is the granularity of everything else
 
 Retention happens a whole segment at a time: nothing is discarded until an entire
@@ -200,6 +207,15 @@ restarted reader on `FromFirst` reprocesses everything; one on `FromNext` misses
 whatever arrived while it was down. Neither carries on where the last run
 stopped, however the messages were settled. The Java and .NET libraries behave
 the same way; this is what a stream is, not a gap in the port.
+
+A dropped connection is different, because the process is still running and
+knows where it was. When the transport reconnects and reattaches a stream
+reader, it does not ask for the original `x-stream-offset` again: the reader
+starts at the oldest offset it was given and had not settled, or just after the
+newest it had — what a queue would redeliver, and nothing else. A `FromFirst`
+reader is not handed the whole stream a second time, and a `FromNext` reader
+does not skip what was appended while it was disconnected. Queue consumers are
+unaffected. A checkpoint is still what carries a position across a restart.
 
 Checkpointing is therefore yours. RabbitMQ stamps every stream delivery with an
 `x-stream-offset` header, and because that name is outside the reserved

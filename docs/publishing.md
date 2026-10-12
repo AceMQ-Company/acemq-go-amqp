@@ -58,6 +58,23 @@ err := pub.Send(ctx, order,
 | `Header` | one of your own headers |
 | `Attempt`, `FirstSeen`, `DeadLetterReason` | for a message being replayed or moved by hand |
 
+### Confirms, and what the library publishes for you
+
+`Send` returns once the broker has confirmed the message. A connection dialled
+with `rabbitmq.Config{WithoutConfirms: true}` turns that off for **your**
+publishers: `Send` returns once the message is written, `Confirmed` is false,
+and `Routed` is always true.
+
+What the library publishes on your behalf is confirmed and published mandatory
+whatever the connection was dialled with — retry, rung, `{queue}.dlq` and
+`{queue}.parked` hops, the outbox relay, routing-slip, pipeline and `Then` hops,
+the scheduler's hops and deliveries, and `Replay`. A connection without confirms
+opens one extra channel, in confirm mode, for them. Each of those settles a
+message or marks a record done on the strength of its publish, so one that
+reaches no queue is a failed publish and the message is kept — retried,
+dead-lettered or left in the outbox — never acknowledged and lost. Details in
+[reliability](reliability.md#publisher-confirms).
+
 ## Publishing a batch
 
 A loop over `Send` pays a full broker round trip per message: publish, wait for

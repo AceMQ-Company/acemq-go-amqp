@@ -203,6 +203,9 @@ It publishes them **mandatory**, as Java's relay does. A record nothing is bound
 to receive — the service that wants the event has not declared its queue yet —
 is a failed publish and stays in the outbox, rather than being dropped by the
 broker and marked as sent. Up to 0.9.5 it was the second, and the event was gone.
+The same holds on a connection dialled `WithoutConfirms`: the relay publishes on
+the library's own confirm channel, so a record is marked sent only once the
+broker has confirmed it reached a queue.
 
 ### A record the broker will never take
 
