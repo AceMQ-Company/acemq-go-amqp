@@ -85,6 +85,7 @@ type consumeConfig struct {
 	tag         string
 	args        map[string]any
 	drain       time.Duration
+	noDLQ       bool
 }
 
 // ConsumeOption configures a consumer.
@@ -147,6 +148,18 @@ const DefaultDrainTimeout = 20 * time.Second
 // the bound, so a handler that honours the cancellation can still settle on the
 // channel its delivery arrived on.
 const drainGrace = 500 * time.Millisecond
+
+// NoDeadLetterQueues skips declaring {queue}.dlq, {queue}.parked and the retry
+// ladder for this consumer.
+//
+// Only for a consumer whose handler accepts every delivery and reads it with
+// [BytesCodec], so nothing is ever retried, parked or dead-lettered. A message
+// this consumer did try to put on one of those queues would be unroutable and
+// dropped. A request-reply requester uses it: its reply queue is exclusive and
+// auto-deleting, and durable queues declared beside it would outlive it.
+func NoDeadLetterQueues() ConsumeOption {
+	return func(cfg *consumeConfig) { cfg.noDLQ = true }
+}
 
 // ConsumerTag names this consumer to the broker, which is what shows up in the
 // management interface when somebody is working out who is holding a message.
@@ -216,9 +229,11 @@ func Consume[T any](
 	// cannot make is one that disagrees with what is on the broker, and a
 	// consumer that started anyway would be running against a topology it does
 	// not understand.
-	if err := c.ladder.Declare(ctx, conn); err != nil {
-		cancel()
-		return nil, err
+	if !cfg.noDLQ {
+		if err := c.ladder.Declare(ctx, conn); err != nil {
+			cancel()
+			return nil, err
+		}
 	}
 
 	if err := conn.track(c); err != nil {

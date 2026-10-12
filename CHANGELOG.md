@@ -8,6 +8,30 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-10-12
+
+### Fixed
+
+- **A reply the requester cannot decode is returned by `Do` at once.** The reply
+  consumer decoded each reply itself and parked one its codec could not read, so
+  `Do` waited out its whole timeout and returned `ErrRequestTimedOut`. Replies
+  are now read as raw bytes, always acknowledged and decoded in `Do`, which
+  returns the codec's error straight away. A responder's failure still comes
+  back as the responder's failure even when its body will not decode. This is
+  how the Java, .NET and Python requesters already work.
+- **A requester no longer leaves two queues behind on the broker.** Every
+  requester with a generated reply queue declared durable
+  `acemq-reply-<id>.dlq` and `acemq-reply-<id>.parked` queues, which stayed after
+  the requester closed and the reply queue itself was gone, two per requester
+  ever started. Nothing is declared beside the reply queue now. Queues left by
+  earlier versions can be deleted; nothing reads them.
+
+### Added
+
+- **`acemq.NoDeadLetterQueues()`**, a consume option that skips declaring
+  `{queue}.dlq`, `{queue}.parked` and the retry ladder. It is for a consumer that
+  accepts everything it receives, as the requester's reply consumer does.
+
 ## [0.9.7] - 2026-10-12
 
 ### Fixed

@@ -55,7 +55,7 @@ type Requester[Req, Resp any] struct {
 	consumer     *acemq.Consumer
 	publisher    *acemq.Publisher[Req]
 	pendingMu    sync.Mutex
-	pending      map[string]chan acemq.Message[Resp]
+	pending      map[string]chan acemq.Message[[]byte]
 	closeOnce    sync.Once
 	closeErr     error
 	replyQueueMu sync.Mutex
@@ -127,15 +127,22 @@ func NewRequester[Req, Resp any](
 		routingKey: routingKey,
 		replyQueue: replyQueue,
 		timeout:    cfg.timeout,
-		pending:    map[string]chan acemq.Message[Resp]{},
+		pending:    map[string]chan acemq.Message[[]byte]{},
 	}
 	r.publisher = acemq.NewPublisher[Req](conn, exchange, routingKey)
 
+	// Replies are taken as raw bytes and every one is accepted; Do decodes.
+	// A reply that will not decode is then the caller's error, returned at
+	// once, rather than a message the consumer parks while Do waits out its
+	// timeout. With nothing ever retried or parked, no .dlq, .parked or retry
+	// queues are declared either: durable queues beside an auto-deleting reply
+	// queue would outlive every requester. The same as Java and .NET.
 	consumer, err := acemq.Consume(ctx, conn, replyQueue,
-		func(_ context.Context, m acemq.Message[Resp]) acemq.Ack {
+		func(_ context.Context, m acemq.Message[[]byte]) acemq.Ack {
 			r.deliver(m)
 			return acemq.Accept()
-		})
+		},
+		acemq.ConsumeWith(acemq.BytesCodec{}), acemq.NoDeadLetterQueues())
 	if err != nil {
 		return nil, fmt.Errorf("acemq: cannot consume replies from %q: %w", replyQueue, err)
 	}
@@ -148,7 +155,7 @@ func NewRequester[Req, Resp any](
 // A reply nobody is waiting for is dropped, which is what a reply to a request
 // that already timed out is. Blocking here would stall the reply consumer for
 // everybody else.
-func (r *Requester[Req, Resp]) deliver(m acemq.Message[Resp]) {
+func (r *Requester[Req, Resp]) deliver(m acemq.Message[[]byte]) {
 	key := m.Envelope.CorrelationID
 
 	r.pendingMu.Lock()
@@ -202,7 +209,7 @@ func (r *Requester[Req, Resp]) Do(ctx context.Context, request Req, opts ...acem
 	// The correlation identifier is what pairs a reply with its request, so it
 	// is generated here rather than taken from the caller's options.
 	correlation := acemq.NewID()
-	waiter := make(chan acemq.Message[Resp], 1)
+	waiter := make(chan acemq.Message[[]byte], 1)
 
 	r.pendingMu.Lock()
 	r.pending[correlation] = waiter
@@ -241,8 +248,15 @@ func (r *Requester[Req, Resp]) Do(ctx context.Context, request Req, opts ...acem
 			r.observe(acemq.OutcomeFailed, time.Since(started))
 			return zero, fmt.Errorf("acemq: the responder failed: %v", failure)
 		}
+		// Decoded after the error check, so a responder's failure with an
+		// unreadable body still surfaces as the responder's failure.
+		var response Resp
+		if err := decodeReply(r.conn.Codec(), m.ContentType, m.Body, &response); err != nil {
+			r.observe(acemq.OutcomeFailed, time.Since(started))
+			return zero, fmt.Errorf("acemq: cannot decode the reply (correlation %s): %w", correlation, err)
+		}
 		r.observe(acemq.OutcomeAnswered, time.Since(started))
-		return m.Payload, nil
+		return response, nil
 	case <-timeout.C:
 		// The work may well have been done. A timeout is the absence of an
 		// answer, not evidence that nothing happened — which is why it is its
@@ -255,6 +269,17 @@ func (r *Requester[Req, Resp]) Do(ctx context.Context, request Req, opts ...acem
 		r.observe(acemq.OutcomeFailed, time.Since(started))
 		return zero, ctx.Err()
 	}
+}
+
+// decodeReply decodes by the reply's content type where the codec can choose,
+// the way the consumer does.
+func decodeReply(codec acemq.Codec, contentType string, body []byte, dst any) error {
+	if chooser, ok := codec.(interface {
+		DecodeAs(contentType string, body []byte, dst any) error
+	}); ok {
+		return chooser.DecodeAs(contentType, body, dst)
+	}
+	return codec.Decode(body, dst)
 }
 
 // ReplyQueue is the queue replies arrive on.

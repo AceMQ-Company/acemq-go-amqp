@@ -184,6 +184,11 @@ this library declares. Reach for it only when replies must survive a restart.
 > queue a `x-expires` of your own through `acemq.QueueArg` if the service that
 > reads it is not permanent.
 
+The reply queue gets no `.dlq`, `.parked` or retry queues of its own. The
+requester reads every reply as raw bytes, acknowledges it, and decodes it in
+`Do`, so a reply its codec cannot read comes back from `Do` as an error at once
+rather than as a timeout, and closing the requester leaves nothing on the broker.
+
 `requester.ReplyQueue()` returns the name, which is worth logging at start-up:
 it is the queue to look at in the management interface when replies are not
 arriving.
