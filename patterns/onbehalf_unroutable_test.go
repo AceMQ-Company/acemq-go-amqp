@@ -49,7 +49,8 @@ func TestOnBehalfHopsWithoutConfirms(t *testing.T) {
 		"replay":         TestReplayKeepsAMessageItHasNowhereToPut,
 		"scheduler-due":  TestTheSchedulerKeepsADueMessageNothingIsBoundTo,
 		"scheduler-rung": TestTheSchedulerKeepsAMessageWhoseRungIsGone,
-		"scheduler-now":  TestSchedulingStraightIntoNowhereIsAnError,
+		"scheduler-now":  TestSchedulingStraightIntoNowhereKeepsTheMessage,
+		"scheduler-keep": TestTheSchedulerSetsAsideADueMessageItCannotKeep,
 		"outbox":         TestARecordStaysInTheOutboxWhenPublishingFails,
 	} {
 		t.Run(strings.TrimPrefix(withoutConfirms, "/")+name, test)
@@ -207,11 +208,49 @@ func TestTheSchedulerKeepsADueMessageNothingIsBoundTo(t *testing.T) {
 	defer scheduler.Close()
 
 	// As if a rung had just expired it, due, for a queue that does not exist.
+	// Kept in the scheduler and tried again after the ten-second rung, as .NET,
+	// Ruby and Java keep it, rather than dead-lettered on the first refusal.
+	publishToControl(t, mq, "", "invoices", time.Now().Add(-time.Minute))
+
+	waitForCount(t, mq, patterns.ScheduleRungName(10*time.Second), 1)
+	if n, _ := mq.MessageCount(ctx, acemq.DeadLetterQueue(patterns.ScheduleControlQueue)); n != 0 {
+		t.Errorf("%d dead-lettered, want 0: an unroutable due message is retried in place", n)
+	}
+	if scheduler.Delivered() != 0 || scheduler.Hops() != 1 {
+		t.Errorf("delivered %d, hops %d; want 0 and 1", scheduler.Delivered(), scheduler.Hops())
+	}
+
+	// The rung expiring it again, now that something is bound: it arrives.
+	if err := mq.DeclareQueue(ctx, "invoices"); err != nil {
+		t.Fatal(err)
+	}
+	expire(t, mq, patterns.ScheduleRungName(10*time.Second))
+	waitForCount(t, mq, "invoices", 1)
+	if scheduler.Delivered() != 1 {
+		t.Errorf("delivered %d, want 1", scheduler.Delivered())
+	}
+}
+
+// A due message that cannot be delivered, and cannot be put back on the retry
+// rung either, is set aside rather than acknowledged away.
+func TestTheSchedulerSetsAsideADueMessageItCannotKeep(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t, acemq.WithRetry(acemq.NoRetry()))
+
+	scheduler, err := patterns.NewScheduler(ctx, mq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scheduler.Close()
+
+	if err := mq.DeleteQueue(ctx, patterns.ScheduleRungName(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	publishToControl(t, mq, "", "invoices", time.Now().Add(-time.Minute))
 
 	setAsideFor(t, mq, acemq.DeadLetterQueue(patterns.ScheduleControlQueue))
-	if scheduler.Delivered() != 0 {
-		t.Errorf("delivered %d, want 0: it reached no queue", scheduler.Delivered())
+	if scheduler.Delivered() != 0 || scheduler.Hops() != 0 {
+		t.Errorf("delivered %d, hops %d; want 0 and 0", scheduler.Delivered(), scheduler.Hops())
 	}
 }
 
@@ -236,7 +275,7 @@ func TestTheSchedulerKeepsAMessageWhoseRungIsGone(t *testing.T) {
 	}
 }
 
-func TestSchedulingStraightIntoNowhereIsAnError(t *testing.T) {
+func TestSchedulingStraightIntoNowhereKeepsTheMessage(t *testing.T) {
 	ctx := context.Background()
 	mq := brokerFor(t)
 
@@ -246,11 +285,36 @@ func TestSchedulingStraightIntoNowhereIsAnError(t *testing.T) {
 	}
 	defer scheduler.Close()
 
-	err = scheduler.In(ctx, 0, "", "invoices", Invoice{Number: "INV-9"})
-	var failed *acemq.PublishFailedError
-	if !errors.As(err, &failed) || !failed.Unroutable {
+	if err := scheduler.In(ctx, 0, "", "invoices", Invoice{Number: "INV-9"}); err != nil {
 		t.Errorf("scheduling for now into a queue that does not exist returned %v;"+
-			" expected an unroutable PublishFailedError", err)
+			" expected the message to be kept and retried", err)
+	}
+	waitForCount(t, mq, patterns.ScheduleRungName(10*time.Second), 1)
+	if scheduler.Delivered() != 0 {
+		t.Errorf("delivered %d, want 0", scheduler.Delivered())
+	}
+}
+
+// expire moves the message at the head of a rung to the control queue, as the
+// rung's time to live would.
+func expire(t *testing.T, mq *acemq.Conn, rung string) {
+	t.Helper()
+	m, ok, err := mq.Pull(context.Background(), rung)
+	if err != nil || !ok {
+		t.Fatalf("nothing on %s: %v", rung, err)
+	}
+	if _, err := mq.PublishRaw(context.Background(), patterns.ScheduleExchange,
+		patterns.ScheduleControlQueue, acemq.Outbound{
+			Body:        m.Body,
+			ContentType: m.ContentType,
+			MessageID:   m.Envelope.ID,
+			Headers:     m.Envelope.ToWire(),
+			Persistent:  true,
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Ack(); err != nil {
+		t.Fatal(err)
 	}
 }
 

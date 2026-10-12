@@ -16,6 +16,7 @@ package patterns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -96,6 +97,15 @@ var scheduleRungs = []time.Duration{
 	10 * time.Second,
 	time.Second,
 }
+
+// scheduleRetryRung is how long a due message that could not be delivered waits
+// before the next try.
+//
+// Unbounded in attempts, as in .NET, Ruby and Java: a target that is not bound
+// yet is a deployment-order problem that fixes itself, and the message is the
+// one thing that must survive it. Ten seconds, Java's figure, keeps a target
+// that is never bound from spinning.
+const scheduleRetryRung = 10 * time.Second
 
 // ScheduleRungs lists the rungs, longest first.
 func ScheduleRungs() []time.Duration {
@@ -319,7 +329,21 @@ func (s *Scheduler) route(
 	if remaining < shortest {
 		// Due, or so nearly due that another hop would cost more than the
 		// accuracy it buys.
-		return s.deliver(ctx, body, headers)
+		err := s.deliver(ctx, body, headers)
+		if err == nil {
+			return nil
+		}
+		// Unroutable or refused at due time. The message stays in the scheduler
+		// and goes round the ten-second rung to be tried again, for as long as it
+		// takes. Dead-lettering it on the first refusal turned "the target is not
+		// bound yet" into a message nobody delivers. A rung rather than a sleep:
+		// the wait holds no prefetch slot and survives a restart. If the rung
+		// will not take it either, the error goes back to the control consumer,
+		// which sets the message aside rather than acknowledging it away.
+		if hopErr := s.hop(ctx, body, headers, scheduleRetryRung); hopErr != nil {
+			return errors.Join(err, hopErr)
+		}
+		return nil
 	}
 
 	rung := shortest
@@ -329,7 +353,11 @@ func (s *Scheduler) route(
 			break
 		}
 	}
+	return s.hop(ctx, body, headers, rung)
+}
 
+// hop puts the message on a rung.
+func (s *Scheduler) hop(ctx context.Context, body []byte, headers map[string]any, rung time.Duration) error {
 	env, err := scheduleEnvelope(headers)
 	if err != nil {
 		return err

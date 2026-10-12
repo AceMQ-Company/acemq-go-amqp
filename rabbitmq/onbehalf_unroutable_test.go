@@ -331,13 +331,39 @@ func TestAScheduledDeliveryIntoNowhereIsKeptAgainstARealBroker(t *testing.T) {
 	}
 	defer scheduler.Close()
 
-	// Due straight away is an error to the caller rather than a silence.
-	nowhere := fmt.Sprintf("acemq-scheduled-nowhere-%d", time.Now().UnixNano())
-	err = scheduler.In(ctx, 0, "", nowhere, OrderPlaced{OrderID: "o-1"})
-	if err == nil || !strings.Contains(err.Error(), "reached no queue") {
-		t.Errorf("scheduling into nowhere returned %v; expected it to say it reached no queue", err)
+	dlq := acemq.DeadLetterQueue(patterns.ScheduleControlQueue)
+	before, err := mq.MessageCount(ctx, dlq)
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	// Through the one-second rung and back to the scheduler, due, for a queue
+	// that does not exist yet. Kept and tried again through the ten-second rung,
+	// as .NET, Ruby and Java keep it, rather than dead-lettered.
+	target := fmt.Sprintf("acemq-scheduled-later-%d", time.Now().UnixNano())
+	defer func() { _ = mq.DeleteQueue(context.Background(), target) }()
+	if err := scheduler.In(ctx, 2*time.Second, "", target, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the due message to be put back on a rung", func() bool { return scheduler.Hops() >= 2 })
 	if scheduler.Delivered() != 0 {
 		t.Errorf("delivered %d into nowhere", scheduler.Delivered())
+	}
+	if after, _ := mq.MessageCount(ctx, dlq); after != before {
+		t.Errorf("%s went from %d to %d; an unroutable due message is retried in place", dlq, before, after)
+	}
+
+	// Bound late, as when the consuming service starts after the scheduler: the
+	// next try delivers it.
+	if err := mq.DeclareQueue(ctx, target, acemq.OfType(acemq.QueueClassic)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for scheduler.Delivered() == 0 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	eventuallyHolds(t, mq, target, 1)
+	if scheduler.Delivered() != 1 {
+		t.Errorf("delivered %d, want 1", scheduler.Delivered())
 	}
 }

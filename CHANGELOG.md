@@ -8,6 +8,24 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-10-12
+
+### Fixed
+
+- **A scheduled message that is due but reaches no queue is kept, not
+  dead-lettered.** When the target had nothing bound for the routing key at due
+  time, the scheduler sent the message to `acemq.schedule.due.dlq` on the first
+  attempt, so a binding declared a moment late meant a message nobody delivered.
+  It now stays in the scheduler and is tried again every ten seconds, through the
+  ten-second rung, until it is delivered. There is no attempt limit, as in Java,
+  .NET and Ruby. `Scheduler.In` and `Scheduler.At` with a time already due no
+  longer return an unroutable `*acemq.PublishFailedError`; the message is kept the
+  same way. `Delivered()` counts only messages that arrived, and `Hops()` counts
+  each retry, so a target nobody binds shows as hops climbing with deliveries
+  standing still. A message that cannot be put back on the rung either — the rung
+  was deleted — is still set aside on `acemq.schedule.due.dlq`, never
+  acknowledged away.
+
 ## [0.9.6] - 2026-10-11
 
 ### Fixed

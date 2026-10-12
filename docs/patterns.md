@@ -908,10 +908,20 @@ is twenty-four hops and a one-minute delay is one, which is the right way round.
 
 Both hops — onto a rung, and out to the destination — are published
 **mandatory**. A rung somebody deleted, or a destination nothing is bound to,
-fails the hop rather than being confirmed and dropped: the control consumer sets
-the message aside on `acemq.schedule.due.dlq` with the reason, and `At` or `In`
-for a moment already past returns the unroutable `*acemq.PublishFailedError` to
-the caller. Up to 0.9.5 such a message was acknowledged and gone.
+fails the hop rather than being confirmed and dropped. Up to 0.9.5 such a
+message was acknowledged and gone.
+
+A message that is due but reaches no queue — the target has nothing bound for
+its routing key yet — is kept: it goes back through the ten-second rung and is
+tried again every ten seconds until it is delivered, with no attempt limit, as
+the Java, .NET and Ruby schedulers do. `At` or `In` for a moment already past
+keeps it the same way and returns no error. `Delivered()` counts only messages
+that arrived, so `Hops()` climbing while `Delivered()` stands still is the sign
+of a target nobody has bound. Only when the message can be put on no rung at all
+— a rung somebody deleted — does the control consumer set it aside on
+`acemq.schedule.due.dlq` with the reason, and `At` or `In` return the error.
+Up to 0.9.6 an unroutable due message went to `acemq.schedule.due.dlq` on the
+first attempt.
 
 `patterns.ScheduleTopology()` is the whole thing, exported so a deployment can
 declare it up front or compare it with what another AceMQ library declares:
