@@ -340,6 +340,26 @@ jobs:
         if: failure()
         run: docker logs acemq-tls-313
 
+  tck:
+    # The AceMQ TCK: the same cases every AceMQ library runs, checked by one
+    # runner on the broker's own state. The action starts its own broker and
+    # passes ACEMQ_TCK_AMQP_URL to the driver. The pin below is the TCK version
+    # this library passes.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build the TCK driver
+        run: go build -o "$RUNNER_TEMP/tckdriver" ./internal/tckdriver
+
+      - uses: AceMQ-Company/acemq-amqp-tck@v0.1.0
+        with:
+          driver: $RUNNER_TEMP/tckdriver
+
   badge-matches-the-release:
     name: the README badge names the current release
     runs-on: ubuntu-latest

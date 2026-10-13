@@ -261,6 +261,11 @@ func NewEnvelope(msgType string, opts ...EnvelopeOption) (Envelope, error) {
 	}
 
 	env := b.env
+	if env.Type == "" {
+		// A publish under an empty routing key, such as to a fanout exchange,
+		// still gets a type, and the same one every other library gives it.
+		env.Type = "message"
+	}
 	if env.ID == "" {
 		env.ID = newID()
 	}

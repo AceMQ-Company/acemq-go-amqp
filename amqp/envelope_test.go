@@ -191,6 +191,16 @@ func TestTheDefaultsAreTheOnesJavaApplies(t *testing.T) {
 	}
 }
 
+func TestAnEmptyRoutingKeyIsTypedMessage(t *testing.T) {
+	env, err := NewEnvelope("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Type != "message" {
+		t.Errorf("Type = %q, want message", env.Type)
+	}
+}
+
 func TestAnAbsentValueIsAnAbsentHeaderRatherThanANullOne(t *testing.T) {
 	env, err := NewEnvelope("order.placed")
 	if err != nil {

@@ -182,8 +182,8 @@ func TestAResponderFailureIsFailedAndNotAnswered(t *testing.T) {
 	}
 	defer func() { _ = requester.Close() }()
 
-	if _, err := requester.Do(ctx, Quote{Widget: "widget"}); err == nil {
-		t.Fatal("a failing responder answered successfully")
+	if _, err := requester.Do(ctx, Quote{Widget: "widget"}); !errors.Is(err, patterns.ErrResponderFailed) {
+		t.Fatalf("Do returned %v, want ErrResponderFailed", err)
 	}
 
 	if got := countOf(t, metrics, acemq.MetricRequestTotal, "failing", acemq.OutcomeFailed); got != 1 {

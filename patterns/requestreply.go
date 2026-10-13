@@ -39,6 +39,11 @@ import (
 // request that changes anything should be idempotent. See [IdempotencyStore].
 var ErrRequestTimedOut = errors.New("acemq: no reply arrived before the deadline")
 
+// ErrResponderFailed is returned when the reply came back carrying the
+// responder's failure in [HeaderError]. The round trip completed; the answer
+// was a failure. Test for it with errors.Is.
+var ErrResponderFailed = errors.New("acemq: the responder failed")
+
 // Requester sends a request and waits for the reply.
 //
 // Messaging is asynchronous, and request-reply is a synchronous shape drawn on
@@ -246,7 +251,7 @@ func (r *Requester[Req, Resp]) Do(ctx context.Context, request Req, opts ...acem
 			// not the same thing as no answer. Tagged failed rather than
 			// answered so a dashboard can tell the two apart.
 			r.observe(acemq.OutcomeFailed, time.Since(started))
-			return zero, fmt.Errorf("acemq: the responder failed: %v", failure)
+			return zero, fmt.Errorf("%w: %v", ErrResponderFailed, failure)
 		}
 		// Decoded after the error check, so a responder's failure with an
 		// unreadable body still surfaces as the responder's failure.
