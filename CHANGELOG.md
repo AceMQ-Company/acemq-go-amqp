@@ -10,7 +10,7 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
-- Runs the AceMQ TCK v0.1.0. The driver is `internal/tckdriver`, test tooling
+- Runs the AceMQ TCK v0.2.0. The driver is `internal/tckdriver`, test tooling
   that is not part of the API, and CI runs it in a `tck` job.
 - **`patterns.ErrResponderFailed`.** A reply carrying the responder's failure
   is now returned wrapping it, so a caller can tell it from a timeout or a
