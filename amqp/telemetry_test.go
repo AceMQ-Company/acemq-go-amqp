@@ -133,6 +133,12 @@ func TestRetriesAndDeadLetteringAreCounted(t *testing.T) {
 	if got := countFor(metrics, MetricConsumeTotal); got != 2 {
 		t.Errorf("%s = %d, want 2", MetricConsumeTotal, got)
 	}
+	// Which attempt each delivery was on, under Java's name and tags: 1 then 2.
+	attemptsKey := metricKey(MetricConsumeAttempts,
+		map[string]string{TagQueue: "orders", TagMessageType: "orders"})
+	if s, ok := metrics.Durations()[attemptsKey]; !ok || s.Count != 2 || s.Sum != 3 || s.Max != 2 {
+		t.Errorf("%s = %+v (present %v), want two samples, 1 and 2", attemptsKey, s, ok)
+	}
 }
 
 // TestTheOutcomeTagIsTheEnginesDecisionNotTheHandlersRequest pins the tag on the

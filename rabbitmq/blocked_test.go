@@ -31,6 +31,7 @@ package rabbitmq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -383,4 +384,105 @@ func TestABlockedConnectionDoesNotStayBlockedAfterARecovery(t *testing.T) {
 
 	unblockTheConnection(t, transport)
 	restored = true
+}
+
+// TestAPublishIntoABlockedBrokerIsBounded is TEL-003 in miniature. The publish
+// that meets the alarm is already written, so it waits for its confirm — for
+// BlockedTimeout and no longer — and fails as possibly published. The publish
+// after it is declined unwritten, at once.
+func TestAPublishIntoABlockedBrokerIsBounded(t *testing.T) {
+	url := os.Getenv("ACEMQ_TEST_AMQP_URL")
+	if url == "" {
+		t.Skip("ACEMQ_TEST_AMQP_URL is not set; skipping the tests that need a broker")
+	}
+
+	ctx := context.Background()
+	const bound = 2 * time.Second
+	transport, err := Dial(ctx, url, Config{WithoutRecovery: true, BlockedTimeout: bound})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := blockedTestQueue(t)
+	if err := transport.DeclareQueue(ctx, queue, acemq.QueueSpec{Durable: true}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		unblockTheConnection(t, transport)
+		_ = transport.DeleteQueue(ctx, queue)
+		_ = transport.Close()
+	}()
+
+	setWatermark(t, blockedWatermark)
+	time.Sleep(2 * time.Second)
+
+	started := time.Now()
+	_, err = transport.Publish(ctx, "", queue, acemq.Outbound{MessageID: "first", Body: []byte("x")})
+	took := time.Since(started)
+	var paused *acemq.PublishingPausedError
+	if err == nil || !acemq.IsBlocked(err) || errors.As(err, &paused) {
+		t.Fatalf("the publish that met the alarm returned %v, want a ConnectionBlockedError", err)
+	}
+	if took > bound+5*time.Second {
+		t.Errorf("it took %s with a %s bound", took, bound)
+	}
+
+	started = time.Now()
+	_, err = transport.Publish(ctx, "", queue, acemq.Outbound{MessageID: "second", Body: []byte("x")})
+	if !errors.As(err, &paused) {
+		t.Fatalf("a publish made knowing the broker is blocked returned %v, want PublishingPausedError", err)
+	}
+	if took := time.Since(started); took > blockedAnswerFast {
+		t.Errorf("declining it took %s", took)
+	}
+}
+
+// TestABlockThatLiftsMidWaitLetsThePublishFinish: the bound is on a block that
+// lasts, not on a publish that met a brief one.
+func TestABlockThatLiftsMidWaitLetsThePublishFinish(t *testing.T) {
+	url := os.Getenv("ACEMQ_TEST_AMQP_URL")
+	if url == "" {
+		t.Skip("ACEMQ_TEST_AMQP_URL is not set; skipping the tests that need a broker")
+	}
+
+	ctx := context.Background()
+	transport, err := Dial(ctx, url, Config{WithoutRecovery: true, BlockedTimeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := blockedTestQueue(t)
+	if err := transport.DeclareQueue(ctx, queue, acemq.QueueSpec{Durable: true}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		setWatermark(t, restoreWatermark)
+		_ = transport.DeleteQueue(ctx, queue)
+		_ = transport.Close()
+	}()
+
+	setWatermark(t, blockedWatermark)
+	time.Sleep(2 * time.Second)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := transport.Publish(ctx, "", queue, acemq.Outbound{MessageID: "held", Body: []byte("x")})
+		done <- err
+	}()
+
+	deadline := time.Now().Add(blockWaitLimit)
+	for transport.BlockedReason() == "" && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if transport.BlockedReason() == "" {
+		t.Fatal("the broker never blocked this connection")
+	}
+	setWatermark(t, restoreWatermark)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the publish failed after the block lifted: %v", err)
+		}
+	case <-time.After(25 * time.Second):
+		t.Fatal("the publish did not finish after the block lifted")
+	}
 }

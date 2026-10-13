@@ -77,6 +77,7 @@ that never reads metrics does not pay for them.
 | `acemq.consume.total` | deliveries settled, tagged `outcome` |
 | `acemq.consume.duration` | seconds per message in a handler, tagged `outcome` |
 | `acemq.consume.in.flight` | being handled right now |
+| `acemq.consume.attempts` | which attempt each delivery was on, a unitless distribution through `Observer.Observe`, tagged `queue` and `message.type` |
 | `acemq.messages.retried.total` | another attempt was actually scheduled |
 | `acemq.messages.dead.lettered.total` | the engine gave up on it |
 | `acemq.messages.set.aside.failed` | it could not be moved to a dead-letter or parking queue |
@@ -103,18 +104,18 @@ The two request metrics are written by `patterns.Requester.Do`, tagged
 
 #### Named but not written
 
-Three more names are part of the family vocabulary and are declared in
+Two more names are part of the family vocabulary and are declared in
 `amqp/telemetry.go` so an `Observer` can be written against one list — but this
 library does not emit them, and says so rather than leaving you to wonder why the
 series is empty.
 
 | Metric | Why not |
 |---|---|
-| `acemq.consume.attempts` | `Observer` has counters, gauges and durations and no general distribution. The number is on every message as `Envelope.Attempt`, so a handler can record it in one line. |
 | `acemq.pipeline.run.duration`, `acemq.pipeline.run.total` | Go has no `Pipeline` type owning its steps the way Java does. A finished run is reported through `patterns.RunObserver`; install your own and write these two names if you want counters. |
 
-`acemq.request.duration` and `acemq.request.total` used to be in this table. They
-are written now, which is what a name in it is supposed to become.
+`acemq.request.duration`, `acemq.request.total` and `acemq.consume.attempts` used
+to be in this table. They are written now, which is what a name in it is supposed
+to become.
 
 ### The tag names
 

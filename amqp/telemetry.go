@@ -86,6 +86,14 @@ const (
 	// bounded by prefetch times concurrency.
 	MetricConsumeInFlight = "acemq.consume.in.flight"
 
+	// MetricConsumeAttempts is which attempt a delivery was on when it was
+	// handled, as a distribution with no unit, so a rising one shows a
+	// struggling dependency. Recorded through [Observer.Observe] once per
+	// delivery, as it arrives, tagged with queue and message.type — Java's
+	// DistributionSummary of the same name and tags, less transport, which no Go
+	// metric carries.
+	MetricConsumeAttempts = "acemq.consume.attempts"
+
 	// MetricRetriedTotal counts messages sent to a retry queue — another
 	// attempt actually being scheduled, not merely asked for.
 	//
@@ -175,20 +183,11 @@ const (
 // be written against one list, and so that adding the emission later cannot
 // invent a second spelling for something Java already named.
 //
-// It used to hold the two request/reply names as well. Those are written now —
-// see [MetricRequestTotal] — which is what a name in this block is supposed to
+// It used to hold the two request/reply names and acemq.consume.attempts as
+// well. Those are written now — see [MetricRequestTotal] and
+// [MetricConsumeAttempts] — which is what a name in this block is supposed to
 // become.
 const (
-	// MetricConsumeAttempts is which attempt a delivery was, as a distribution,
-	// so a rising one shows a struggling dependency.
-	//
-	// Not written by this library. [Observer] has counters, gauges and durations
-	// and no general distribution, and adding one to a published interface to
-	// carry a small integer is not worth what it breaks. The number is on every
-	// message as Envelope.Attempt, so an application that wants it can record it
-	// from a handler in one line.
-	MetricConsumeAttempts = "acemq.consume.attempts"
-
 	// MetricPipelineRunDuration is how long a message had existed when it left a
 	// pipeline, and MetricPipelineRunTotal counts runs that finished, tagged
 	// with the outcome and the step it ended at.
@@ -307,7 +306,9 @@ type Observer interface {
 	// Count adds to a counter. Labels are name/value pairs, already flattened.
 	Count(metric string, delta int64, labels map[string]string)
 
-	// Observe records a duration in seconds.
+	// Observe records one sample of a distribution: a duration in seconds for
+	// the *.duration metrics, and a plain number with no unit for
+	// [MetricConsumeAttempts].
 	Observe(metric string, seconds float64, labels map[string]string)
 
 	// Gauge sets a current value.

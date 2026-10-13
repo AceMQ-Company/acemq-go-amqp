@@ -317,6 +317,8 @@ func handleDelivery[T any](
 	env := envelopeFromDelivery(d)
 
 	observer := c.conn.observer
+	observer.Observe(MetricConsumeAttempts, float64(env.Attempt),
+		map[string]string{TagQueue: c.queue, TagMessageType: env.Type})
 	labels := map[string]string{TagQueue: c.queue}
 	observer.Gauge(MetricConsumeInFlight, c.inFlight(1), labels)
 	// In a closure: a deferred call's arguments are evaluated at once, which

@@ -305,7 +305,15 @@ publish on that connection then blocks until it unblocks. A publisher that does
 not know this looks exactly like one that has hung, and restarting the service
 does not help.
 
-Publishing while blocked returns an error instead:
+Publishing while blocked returns an error instead. A publish made once the
+block is known is not written at all and fails at once with
+`PublishingPausedError`, counted `refused`. The publish that ran into the alarm
+was already written — RabbitMQ only blocks a connection once it publishes — so
+it waits for its confirm for at most `rabbitmq.Config.BlockedTimeout` (30
+seconds by default, as in Java) of continuous block, then fails with a
+`ConnectionBlockedError`, counted `failed` because it may have arrived. A block
+that lifts before then lets it finish normally, and the context's deadline
+still applies.
 
 ```go
 if acemq.IsBlocked(err) {

@@ -189,6 +189,21 @@ type Config struct {
 	// second by default, doubling to at most thirty.
 	RecoveryDelay time.Duration
 
+	// BlockedTimeout bounds how long a publish already written waits for its
+	// confirm while the broker is blocking the connection. Thirty seconds by
+	// default, which is Java's blockedTimeout.
+	//
+	// RabbitMQ tells a connection it is blocked only once that connection
+	// publishes, so the first message into a memory or disk alarm is on the wire
+	// before anything is known, and its confirm does not come until the alarm
+	// clears. Without a bound that publish hangs for as long as the alarm lasts.
+	// With one it fails with a [acemq.ConnectionBlockedError] — reported as
+	// failed, because it may have arrived — and an unblock before the bound lets
+	// it finish normally. A publish made once the block is known is not written
+	// at all: it fails at once with [acemq.PublishingPausedError]. The caller's
+	// context deadline still applies on top of this.
+	BlockedTimeout time.Duration
+
 	// OnRecovery is told about every connection loss and every attempt to come
 	// back, so a service can log or alert on it. Recovery that nobody can see
 	// is only half an improvement on dying quietly.
@@ -309,6 +324,27 @@ type Transport struct {
 	// fail, which looks identical to a wedged process.
 	blockedMu sync.RWMutex
 	blocked   string
+	// blockedChanged is closed, and replaced, every time blocked changes, so a
+	// publish waiting on a confirm hears a block or an unblock as it happens.
+	blockedChanged chan struct{}
+}
+
+// setBlocked records the broker's blocked state and wakes everything waiting
+// on it. An empty reason is not blocked.
+func (t *Transport) setBlocked(reason string) {
+	t.blockedMu.Lock()
+	defer t.blockedMu.Unlock()
+	t.blocked = reason
+	close(t.blockedChanged)
+	t.blockedChanged = make(chan struct{})
+}
+
+// blockedState is the blocked reason and the channel that closes when it next
+// changes, read together.
+func (t *Transport) blockedState() (string, <-chan struct{}) {
+	t.blockedMu.RLock()
+	defer t.blockedMu.RUnlock()
+	return t.blocked, t.blockedChanged
 }
 
 // watchBlocked records the broker asking publishers to stop.
@@ -319,13 +355,16 @@ type Transport struct {
 // service, does not help.
 func (t *Transport) watchBlocked(blockings <-chan amqp.Blocking) {
 	for b := range blockings {
-		t.blockedMu.Lock()
-		if b.Active {
-			t.blocked = b.Reason
-		} else {
-			t.blocked = ""
+		if b.Active && b.Reason == "" {
+			// The reason is optional in the protocol, and empty is how this
+			// transport says "not blocked".
+			b.Reason = "the broker did not say"
 		}
-		t.blockedMu.Unlock()
+		if b.Active {
+			t.setBlocked(b.Reason)
+		} else {
+			t.setBlocked("")
+		}
 
 		if b.Active {
 			t.report(RecoveryEvent{Kind: "blocked", Err: &acemq.ConnectionBlockedError{Reason: b.Reason}})
@@ -421,6 +460,8 @@ func Dial(ctx context.Context, url string, cfg ...Config) (*Transport, error) {
 		stopRecov:   make(chan struct{}),
 		outstanding: make(chan struct{}, bound),
 		returned:    map[string]string{},
+
+		blockedChanged: make(chan struct{}),
 	}
 	// WithoutConfirms leaves the caller's channel alone and opens a second one,
 	// confirmed, for the library's own hops; see hops. Either way exactly one
@@ -616,10 +657,11 @@ func (t *Transport) Publish(
 			MessageID: msg.MessageID, Exchange: exchange, RoutingKey: routingKey, Err: err}
 	}
 
-	acked, err := confirmation.WaitContext(ctx)
+	acked, err := t.awaitConfirm(ctx, confirmation)
 	if err != nil {
 		return result, fmt.Errorf(
-			"acemq: waiting for the broker to confirm message %s: %w", msg.MessageID, err)
+			"acemq: waiting for the broker to confirm message %s, which may or may not have "+
+				"arrived: %w", msg.MessageID, err)
 	}
 	if !acked {
 		if lost, ok := t.lostRatherThanRefused(sent); ok {
@@ -645,6 +687,63 @@ func (t *Transport) Publish(
 		}
 	}
 	return result, nil
+}
+
+// defaultBlockedTimeout is Java's blockedTimeout.
+const defaultBlockedTimeout = 30 * time.Second
+
+func (t *Transport) blockedTimeout() time.Duration {
+	if t.cfg.BlockedTimeout > 0 {
+		return t.cfg.BlockedTimeout
+	}
+	return defaultBlockedTimeout
+}
+
+// awaitConfirm waits for the broker to answer one publish: for as long as the
+// context allows while the connection is not blocked, and for no longer than
+// [Config.BlockedTimeout] of continuous block while it is.
+//
+// This is where a resource alarm is actually met. The broker blocks a
+// connection only once it publishes, so the publish that ran into the alarm is
+// already written and its confirm will not come until the alarm clears. A block
+// that lifts before the bound restarts the clock and lets the confirm arrive.
+func (t *Transport) awaitConfirm(
+	ctx context.Context, confirmation *amqp.DeferredConfirmation,
+) (bool, error) {
+	var blockedSince time.Time
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		reason, changed := t.blockedState()
+		var expired <-chan time.Time
+		if reason == "" {
+			blockedSince = time.Time{}
+		} else {
+			if blockedSince.IsZero() {
+				blockedSince = time.Now()
+			}
+			if timer != nil {
+				timer.Stop()
+			}
+			timer = time.NewTimer(time.Until(blockedSince.Add(t.blockedTimeout())))
+			expired = timer.C
+		}
+
+		select {
+		case <-confirmation.Done():
+			return confirmation.Acked(), nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-changed:
+		case <-expired:
+			return false, fmt.Errorf("still blocked after %s: %w",
+				t.blockedTimeout(), &acemq.ConnectionBlockedError{Reason: reason})
+		}
+	}
 }
 
 // inFlight is what a publish has to remember about where it went, so that a
@@ -1363,6 +1462,7 @@ func (t *Transport) reconnectOnce() (chan *amqp.Error, error) {
 		Name:                    t.cfg.Name,
 		WithoutConfirms:         t.cfg.WithoutConfirms,
 		MaxOutstandingPublishes: t.cfg.MaxOutstandingPublishes,
+		BlockedTimeout:          t.cfg.BlockedTimeout,
 		// The replacement must not start a recovery loop of its own; this one
 		// takes over its connection and keeps watching.
 		WithoutRecovery: true,
@@ -1387,9 +1487,7 @@ func (t *Transport) reconnectOnce() (chan *amqp.Error, error) {
 	// alone it would refuse every publish on the new one for ever, because the
 	// unblock that cleared it can only arrive on a connection nobody is
 	// watching: fresh's own watcher writes into fresh, which is discarded here.
-	t.blockedMu.Lock()
-	t.blocked = ""
-	t.blockedMu.Unlock()
+	t.setBlocked("")
 	go t.watchBlocked(fresh.conn.NotifyBlocked(make(chan amqp.Blocking, 4)))
 
 	// The old channel's returns died with it, and anything still filed against
