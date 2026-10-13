@@ -384,9 +384,8 @@ func PullInto[T any](ctx context.Context, conn *Conn, queue string) (*Pulled, T,
 
 // Version is this library's version, for logging what a service is running.
 //
-// Set at release time. It goes back to "dev" on the main branch after a
-// release, so a build from source never claims to be a version somebody could
-// look up.
+// Set at release time and left there, so a build from main reports the release
+// it follows.
 const Version = "0.9.8"
 
 var errNilInterceptor = errorString("acemq: the interceptor is nil")

@@ -23,10 +23,11 @@ import (
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
 	"github.com/AceMQ-Company/acemq-go-amqp/patterns"
-	_ "github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
+	"github.com/AceMQ-Company/acemq-go-amqp/rabbitmq"
 )
 
-var ops = []string{"hello", "begin", "end", "publish", "consume", "handled", "schedule", "request"}
+var ops = []string{"hello", "begin", "end", "publish", "consume", "handled", "schedule", "request",
+	"declareStream", "readStream", "metrics"}
 
 type args map[string]any
 
@@ -61,7 +62,37 @@ type tally struct {
 	mu          sync.Mutex
 	counts      map[string]int
 	redelivered map[string]int
+	order       []string
 }
+
+// count records a delivery and returns how many times its id has been seen.
+func (t *tally) count(m acemq.Message[map[string]any]) (string, int) {
+	id := fmt.Sprint(m.Payload["id"])
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.counts[id]++
+	if m.Redelivered {
+		t.redelivered[id]++
+	}
+	t.order = append(t.order, id)
+	return id, t.counts[id]
+}
+
+// recorder is the telemetry seam's observer: one sample per report.
+type recorder struct {
+	mu      sync.Mutex
+	samples []map[string]any
+}
+
+func (r *recorder) add(name string, labels map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.samples = append(r.samples, map[string]any{"name": name, "tags": labels})
+}
+
+func (r *recorder) Count(name string, _ int64, labels map[string]string)     { r.add(name, labels) }
+func (r *recorder) Observe(name string, _ float64, labels map[string]string) { r.add(name, labels) }
+func (r *recorder) Gauge(name string, _ int64, labels map[string]string)     { r.add(name, labels) }
 
 type driver struct {
 	url        string
@@ -70,6 +101,7 @@ type driver struct {
 	conn       *acemq.Conn
 	consumers  []*acemq.Consumer
 	tallies    map[string]*tally
+	metrics    *recorder
 	scheduler  *patterns.Scheduler
 	requesters map[[2]string]*patterns.Requester[any, any]
 }
@@ -94,7 +126,20 @@ func (d *driver) begin(a args) (any, error) {
 		return nil, err
 	}
 	d.ctx, d.cancel = context.WithCancel(context.Background())
-	d.conn, err = acemq.Connect(d.ctx, d.url, acemq.WithOrigin(a.str("clientName", "tck")+"@"+host))
+	d.metrics = &recorder{}
+	opts := []acemq.ConnOption{
+		acemq.WithOrigin(a.str("clientName", "tck") + "@" + host), acemq.WithObserver(d.metrics)}
+	if confirms, ok := a["confirms"].(bool); ok && !confirms {
+		// The library's switch for the user's own publishes lives on the
+		// RabbitMQ transport's configuration.
+		transport, err := rabbitmq.Dial(d.ctx, d.url, rabbitmq.Config{WithoutConfirms: true})
+		if err != nil {
+			return nil, err
+		}
+		d.conn, err = acemq.NewConn(transport, opts...)
+		return map[string]any{}, err
+	}
+	d.conn, err = acemq.Connect(d.ctx, d.url, opts...)
 	return map[string]any{}, err
 }
 
@@ -171,14 +216,7 @@ func (d *driver) consume(a args) (any, error) {
 	t := &tally{counts: map[string]int{}, redelivered: map[string]int{}}
 
 	handle := func(_ context.Context, m acemq.Message[map[string]any]) acemq.Ack {
-		id := fmt.Sprint(m.Payload["id"])
-		t.mu.Lock()
-		t.counts[id]++
-		n := t.counts[id]
-		if m.Redelivered {
-			t.redelivered[id]++
-		}
-		t.mu.Unlock()
+		id, n := t.count(m)
 		time.Sleep(sleep)
 		if n <= failFirst.num(id, 0) {
 			return acemq.Retry(fmt.Errorf("tck: failing %s on purpose, delivery %d", id, n))
@@ -214,7 +252,62 @@ func (d *driver) handled(a args) (any, error) {
 	for k, v := range t.redelivered {
 		redelivered[k] = v
 	}
-	return map[string]any{"counts": counts, "redelivered": redelivered}, nil
+	order := append([]string{}, t.order...)
+	return map[string]any{"counts": counts, "redelivered": redelivered, "order": order}, nil
+}
+
+func (d *driver) declareStream(a args) (any, error) {
+	conn, err := d.mq()
+	if err != nil {
+		return nil, err
+	}
+	err = patterns.DeclareStream(d.ctx, conn, a.str("queue", ""),
+		patterns.StreamRetention{MaxAge: a.millis("maxAgeMs", 0)})
+	return map[string]any{}, err
+}
+
+func (d *driver) readStream(a args) (any, error) {
+	conn, err := d.mq()
+	if err != nil {
+		return nil, err
+	}
+	var offset patterns.StreamOffset
+	switch a.str("offset", "next") {
+	case "first":
+		offset = patterns.FromFirst()
+	case "next":
+		offset = patterns.FromNext()
+	default:
+		return nil, unsupportedError{"readStream offset " + a.str("offset", "")}
+	}
+	t := &tally{counts: map[string]int{}, redelivered: map[string]int{}}
+	consumer, err := patterns.ReadStream(d.ctx, conn, a.str("queue", ""),
+		func(_ context.Context, m acemq.Message[map[string]any]) acemq.Ack {
+			t.count(m)
+			return acemq.Accept()
+		}, patterns.StreamOptions{Offset: offset})
+	if err != nil {
+		return nil, err
+	}
+	d.consumers = append(d.consumers, consumer)
+	d.tallies[a.str("handle", "")] = t
+	return map[string]any{}, nil
+}
+
+func (d *driver) metricsOp(args) (any, error) {
+	if d.metrics == nil {
+		return nil, errors.New("tck: begin was not called")
+	}
+	d.metrics.mu.Lock()
+	defer d.metrics.mu.Unlock()
+	names, seen := []string{}, map[string]bool{}
+	for _, s := range d.metrics.samples {
+		if name := s["name"].(string); !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	return map[string]any{"names": names, "samples": append([]map[string]any{}, d.metrics.samples...)}, nil
 }
 
 func (d *driver) schedule(a args) (any, error) {
@@ -257,7 +350,10 @@ func (d *driver) request(a args) (any, error) {
 func kindOf(err error) string {
 	var unsupported unsupportedError
 	var failed *acemq.PublishFailedError
+	var paused *acemq.PublishingPausedError
 	switch {
+	case errors.As(err, &paused):
+		return "paused"
 	case errors.As(err, &unsupported):
 		return "unsupported"
 	case errors.Is(err, patterns.ErrRequestTimedOut):
@@ -266,7 +362,7 @@ func kindOf(err error) string {
 		if failed.Unroutable {
 			return "unroutable"
 		}
-		return "refused"
+		return "nacked"
 	case errors.Is(err, patterns.ErrResponderFailed):
 		return "responder"
 	case acemq.IsFatal(err):
@@ -284,6 +380,7 @@ func main() {
 	handlers := map[string]func(args) (any, error){
 		"hello": d.hello, "begin": d.begin, "end": d.end, "publish": d.publish,
 		"consume": d.consume, "handled": d.handled, "schedule": d.schedule, "request": d.request,
+		"declareStream": d.declareStream, "readStream": d.readStream, "metrics": d.metricsOp,
 	}
 
 	in := bufio.NewScanner(os.Stdin)

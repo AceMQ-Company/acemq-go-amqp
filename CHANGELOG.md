@@ -22,6 +22,12 @@ While the version is `0.x` the public API may change in any release.
   no type given, `x-acemq-type` is the routing key, and it went out empty when
   that was empty, such as for a publish to a fanout exchange. It is now
   `message`, as in the other AceMQ libraries.
+- **A retry hop to a rung the broker refuses requeues the delivery.** When the
+  broker nacked the publish to `{queue}.retry.{delay}`, the consumer treated the
+  rung as missing and held the delivery for the whole delay, keeping a prefetch
+  slot. It is now requeued at once, as a refused hop to the source queue
+  already was. A rung that is not on the broker still falls back to waiting in
+  the consumer.
 
 ## [0.9.8] - 2026-10-12
 

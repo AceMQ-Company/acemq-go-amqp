@@ -923,6 +923,69 @@ func TestARungThatIsNotThereFallsBackToWaitingHere(t *testing.T) {
 	}
 }
 
+// refusingRungs is a broker that nacks every publish to a rung.
+type refusingRungs struct{ Transport }
+
+func (r refusingRungs) Publish(
+	ctx context.Context, exchange, routingKey string, msg Outbound,
+) (PublishResult, error) {
+	if strings.Contains(routingKey, ".retry.") {
+		return PublishResult{MessageID: msg.MessageID}, &PublishFailedError{
+			MessageID: msg.MessageID, Exchange: exchange, RoutingKey: routingKey,
+			Err: errors.New("the broker refused it")}
+	}
+	return r.Transport.Publish(ctx, exchange, routingKey, msg)
+}
+
+func TestARungTheBrokerRefusesRequeuesTheDelivery(t *testing.T) {
+	// AMQP-RETRY-001: a failed hop requeues its delivery. Waiting here instead
+	// would hold it for the whole delay, an hour in this policy.
+	ctx := context.Background()
+	memory, err := dialMemory(ctx, "memory://"+t.Name(), DialOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := FixedRetry(3, time.Hour)
+	mq, err := NewConn(refusingRungs{memory}, WithRetry(policy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mq.Close()
+	declare(t, mq, "orders")
+
+	var mu sync.Mutex
+	var redelivered []bool
+	sub, err := Consume(ctx, mq, "orders",
+		func(_ context.Context, m Message[OrderPlaced]) Ack {
+			mu.Lock()
+			defer mu.Unlock()
+			redelivered = append(redelivered, m.Redelivered)
+			if len(redelivered) == 1 {
+				return Retry(errors.New("once"))
+			}
+			return Accept()
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := NewPublisher[OrderPlaced](mq, "", "orders").
+		Send(ctx, OrderPlaced{OrderID: "o-1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the refused hop to come back", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(redelivered) >= 2
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if !redelivered[1] {
+		t.Error("the delivery came back without the redelivered flag, so it was not requeued")
+	}
+}
+
 // countOf adds up a metric across whatever labels it was counted with.
 func countOf(m *Metrics, metric string) int64 {
 	var total int64

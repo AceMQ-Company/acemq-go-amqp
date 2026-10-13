@@ -8,8 +8,9 @@ anything. So everything that can be checked is checked before the tag exists.
 ## Before tagging
 
 1. **Set the version constant.** `acemq.Version` in `amqp/interceptors.go`
-   is `"dev"` on main. A released library that reports `dev` tells an operator
-   nothing about what is running.
+   names the previous release on main until this step changes it. A released
+   library that reports the wrong version tells an operator nothing about what
+   is running.
 
    ```go
    const Version = "0.1.0"

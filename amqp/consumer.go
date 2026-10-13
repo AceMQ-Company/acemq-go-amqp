@@ -589,6 +589,9 @@ func (c *Consumer) exhausted(env Envelope) string {
 // counter belongs to the message, and a message that has been round the broker
 // is no less on its second attempt than one that waited here.
 //
+// A rung the broker refuses requeues the delivery and reports true: it has
+// been settled.
+//
 // False means the rung is not on the broker, and the caller should fall back to
 // waiting here. Degraded rather than fatal: the message is still deliverable,
 // and waiting for it here is what this library did before there were rungs.
@@ -601,7 +604,15 @@ func (c *Consumer) retryInBroker(
 	}
 
 	routed, err := c.republish(ctx, d, rung, env.NextAttempt())
-	if err != nil || !routed {
+	if err != nil {
+		// The rung is there and the broker would not take the message: nacked,
+		// refused, or the channel went. Requeued, as a failed hop to the source
+		// queue is, rather than held here for the whole delay with a prefetch
+		// slot it is not using.
+		c.nack(d, true)
+		return true
+	}
+	if !routed {
 		// Counted rather than logged, because this library writes no log lines:
 		// a topology that declares the queue without its rungs otherwise looks
 		// like it works, right up until a long backoff quietly becomes a held
