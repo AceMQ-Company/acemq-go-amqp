@@ -6,7 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
-## [Unreleased]
+## [0.9.9] - 2026-10-13
 
 ### Added
 
@@ -15,6 +15,12 @@ While the version is `0.x` the public API may change in any release.
 - **`patterns.ErrResponderFailed`.** A reply carrying the responder's failure
   is now returned wrapping it, so a caller can tell it from a timeout or a
   transport error with `errors.Is`. The message is unchanged.
+- **`acemq.consume.attempts` is written.** Every delivery records which attempt
+  it was on through `Observer.Observe`, as a unitless distribution tagged
+  `queue` and `message.type`, Java's name and tags less `transport`. `Observe`
+  is documented as one sample of a distribution rather than only a duration.
+- **`rabbitmq.Config.BlockedTimeout`**, 30 seconds by default as in Java. See
+  the fix below.
 
 ### Fixed
 
@@ -28,6 +34,16 @@ While the version is `0.x` the public API may change in any release.
   slot. It is now requeued at once, as a refused hop to the source queue
   already was. A rung that is not on the broker still falls back to waiting in
   the consumer.
+- **A publish into a blocked broker no longer hangs.** RabbitMQ blocks a
+  connection only once it publishes, so the publish that ran into a memory or
+  disk alarm was already written and waited for its confirm until the alarm
+  cleared, with no bound but the caller's context. It now waits at most
+  `BlockedTimeout` of continuous block and then fails with a
+  `ConnectionBlockedError`, counted `failed` because it may have arrived; a
+  block that lifts before then lets it finish. A publish made once the block is
+  known is still declined unwritten with `PublishingPausedError`, counted
+  `refused`. A `connection.blocked` with no reason no longer reads as not
+  blocked.
 
 ## [0.9.8] - 2026-10-12
 
