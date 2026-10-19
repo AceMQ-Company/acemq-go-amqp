@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## [Unreleased]
+
+### Fixed
+
+- **`patterns.Replay` returns only once the declined messages are back.** The
+  messages a filter passed over were returned with `basic.nack`, which the
+  broker never answers, so a depth read the moment `Replay` returned could
+  count none of them; on a quorum queue it read 0 of 200. Each is now published
+  back to the queue it came from with a confirm and the original acknowledged
+  after it, so the count is right as soon as `Replay` returns, for classic and
+  quorum queues alike. They go back to the tail of the queue, which on a
+  drained queue is where they were. The API is unchanged.
+
 ## [0.9.9] - 2026-10-13
 
 ### Added

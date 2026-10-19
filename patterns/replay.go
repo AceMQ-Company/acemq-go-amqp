@@ -136,7 +136,7 @@ const (
 )
 
 // Replay moves messages from a queue back onto an exchange.
-func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (ReplayResult, error) {
+func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (result ReplayResult, err error) {
 	if from.Queue == "" {
 		return ReplayResult{}, fmt.Errorf("acemq: a replay needs a queue to read from")
 	}
@@ -146,8 +146,6 @@ func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (ReplayResul
 		ctx, cancel = context.WithTimeout(ctx, from.Deadline)
 		defer cancel()
 	}
-
-	var result ReplayResult
 
 	// Messages the filter declines are held, not returned one at a time.
 	//
@@ -159,11 +157,10 @@ func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (ReplayResul
 	// half way through returns them rather than losing them.
 	var declined []*acemq.Pulled
 	defer func() {
-		for _, message := range declined {
-			// Nothing to report: the pass is over, and a message that cannot be
-			// returned is one the broker will return itself when this
-			// connection closes.
-			_ = message.Nack(true)
+		// Even a cancelled replay puts back what it holds.
+		if putErr := putBack(context.WithoutCancel(ctx), conn, from.Queue, declined); putErr != nil && err == nil {
+			result.Reason = "failed"
+			err = putErr
 		}
 	}()
 
@@ -251,6 +248,44 @@ func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (ReplayResul
 		}
 		result.Moved++
 	}
+}
+
+// putBack returns what the filter declined to the queue it came from, and
+// returns only once the broker holds every one of them there again.
+//
+// Not by basic.nack, which the broker never answers: a depth read the moment
+// Replay returned could count none of them, and for a quorum queue a further
+// round trip on the same channel does not order the two either. Each is
+// published back with a confirm instead, and the original acknowledged only
+// once the copy is confirmed. They go to the tail, which on a drained queue is
+// where they were.
+func putBack(ctx context.Context, conn *acemq.Conn, queue string, declined []*acemq.Pulled) error {
+	var failed error
+	for _, message := range declined {
+		published, err := conn.PublishRaw(onbehalf.Mark(ctx), "", queue, acemq.Outbound{
+			Body:        message.Body,
+			ContentType: message.ContentType,
+			MessageID:   message.Envelope.ID,
+			ReplyTo:     message.Envelope.ReplyTo,
+			Headers:     message.Envelope.ToWire(),
+			Persistent:  true,
+			Mandatory:   true,
+		})
+		if err == nil && !published.Routed {
+			err = unroutable(message.Envelope.ID, "", queue, published.ReturnReason)
+		}
+		if err == nil {
+			err = message.Ack()
+		} else {
+			// The copy did not land, so the original stays: returned the old
+			// way, or by the broker when this connection closes.
+			_ = message.Nack(true)
+		}
+		if err != nil && failed == nil {
+			failed = fmt.Errorf("acemq: cannot put a declined message back on %q: %w", queue, err)
+		}
+	}
+	return failed
 }
 
 func replayCount(env acemq.Envelope) int {

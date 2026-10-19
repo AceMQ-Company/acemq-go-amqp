@@ -1428,6 +1428,70 @@ func TestReplayTakesEveryMatchOnARealBroker(t *testing.T) {
 	}
 }
 
+// TestReplayReturnsOnlyOnceTheDeclinedAreBack is the depth check a caller makes
+// the moment Replay returns: the messages the filter passed over must already
+// be counted on the queue they came from, with no wait in between.
+//
+// The returns are basic.nack, which the broker never answers, and the count is
+// asked on a channel of its own, so nothing orders the one before the other
+// unless Replay itself waits for the broker to have them back.
+func TestReplayReturnsOnlyOnceTheDeclinedAreBack(t *testing.T) {
+	ctx := context.Background()
+	mq := connect(t)
+
+	for _, queueType := range []string{"classic", "quorum"} {
+		t.Run(queueType, func(t *testing.T) {
+			queue := queueName(t)
+			dead := queue + "-dead"
+			removeAtEnd(t, []string{queue, dead}, nil)
+
+			if err := mq.DeclareQueue(ctx, queue); err != nil {
+				t.Fatal(err)
+			}
+			if err := mq.DeclareQueue(ctx, dead, acemq.OfType(acemq.QueueType(queueType))); err != nil {
+				t.Fatal(err)
+			}
+
+			const declined, matched = 200, 5
+			publisher := acemq.NewPublisher[OrderPlaced](mq, "", dead)
+			for i := range declined + matched {
+				id := "drop"
+				if i%(declined/matched+1) == 0 {
+					id = "keep"
+				}
+				if err := publisher.Send(ctx, OrderPlaced{OrderID: id}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			result, err := patterns.Replay(ctx, mq, patterns.ReplayFrom{
+				Queue:      dead,
+				RoutingKey: queue,
+				Filter: func(_ acemq.Envelope, body []byte) bool {
+					return strings.Contains(string(body), "keep")
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Moved != matched || result.Skipped != declined {
+				t.Fatalf("got %s, want %d moved and %d skipped", result, matched, declined)
+			}
+
+			// No waitFor: this is the race.
+			for q, want := range map[string]int64{dead: declined, queue: matched} {
+				count, err := mq.MessageCount(ctx, q)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if count != want {
+					t.Errorf("%s holds %d right after the replay returned, want %d", q, count, want)
+				}
+			}
+		})
+	}
+}
+
 // TestTheSourceQueueIsDeclaredIdenticallyInEveryLanguage puts the source queue's
 // own argument table in front of a real broker.
 //
