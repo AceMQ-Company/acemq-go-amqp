@@ -553,7 +553,9 @@ func TestAFailingHandlerStopsTheReaderAtThatMessage(t *testing.T) {
 	}
 	defer func() { _ = sub.Close() }()
 
-	for i, id := range []string{"a", "b", "c"} {
+	// One at a time: this fake keeps delivering after Close, which a real
+	// transport's Stop does not, so c goes in only once the reader has stopped.
+	for i, id := range []string{"a", "b"} {
 		transport.hand(id, int64(i), streamEvent{OrderID: id})
 	}
 
@@ -565,7 +567,7 @@ func TestAFailingHandlerStopsTheReaderAtThatMessage(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("the reader never stopped")
 	}
-	transport.hand("d", int64(3), streamEvent{OrderID: "d"})
+	transport.hand("c", int64(2), streamEvent{OrderID: "c"})
 	time.Sleep(50 * time.Millisecond)
 
 	mu.Lock()

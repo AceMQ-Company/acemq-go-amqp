@@ -651,7 +651,8 @@ func TestATopicExchangeRoutesOnARealBroker(t *testing.T) {
 	defer sub.Close()
 
 	for _, key := range []string{"orders.created.eu", "orders.created.us"} {
-		if err := acemq.NewPublisher[OrderPlaced](mq, exchange, key).
+		// The us key matches nothing, which is the point; it is not an error.
+		if err := acemq.NewPublisher[OrderPlaced](mq, exchange, key, acemq.AllowUnroutable[OrderPlaced]()).
 			Send(ctx, OrderPlaced{OrderID: key}); err != nil {
 			t.Fatal(err)
 		}

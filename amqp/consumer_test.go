@@ -521,10 +521,10 @@ func TestAnUnroutableMandatoryMessageIsAnError(t *testing.T) {
 	}
 }
 
-func TestAnUnroutableMessageIsSilentWithoutMandatory(t *testing.T) {
-	// Not a bug: it is what AMQP does, and what most publishers want. The test
-	// records the difference so that Mandatory has something to be different
-	// from.
+func TestAnUnroutableMessageIsSilentWithAllowUnroutable(t *testing.T) {
+	// The opt-out from the mandatory default: what AMQP does without the flag.
+	// The test records the difference so that the default has something to be
+	// different from.
 	ctx := context.Background()
 	mq := brokerFor(t)
 
@@ -532,11 +532,11 @@ func TestAnUnroutableMessageIsSilentWithoutMandatory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := NewPublisher[OrderPlaced](mq, "events", "nothing.listens.here").
+	err := NewPublisher[OrderPlaced](mq, "events", "nothing.listens.here", AllowUnroutable[OrderPlaced]()).
 		Send(ctx, OrderPlaced{OrderID: "o-1"})
 
 	if err != nil {
-		t.Fatalf("publishing without Mandatory reported a routing problem: %v", err)
+		t.Fatalf("publishing with AllowUnroutable reported a routing problem: %v", err)
 	}
 }
 

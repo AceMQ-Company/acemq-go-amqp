@@ -362,7 +362,7 @@ func TestFromNextSkipsWhatIsAlreadyThere(t *testing.T) {
 // copy at a new offset, visible to every consumer and to every replay for ever.
 // The assertion is both halves — the message is in {stream}.parked, and the
 // stream is exactly as long as it was.
-func TestARetryOnARealStreamParksInsteadOfAppending(t *testing.T) {
+func TestARetryOnARealStreamParksInsteadOfAppendingWhenAskedTo(t *testing.T) {
 	mq := connect(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -378,7 +378,8 @@ func TestARetryOnARealStreamParksInsteadOfAppending(t *testing.T) {
 			}
 			return acemq.Retry(errors.New("the projection store is down"))
 		},
-		patterns.StreamOptions{Offset: patterns.FromFirst(), Prefetch: 1, Name: "retrying"})
+		patterns.StreamOptions{Offset: patterns.FromFirst(), Prefetch: 1, Name: "retrying",
+			OnFailure: patterns.ParkOnFailure})
 	if err != nil {
 		t.Fatalf("ReadStream: %v", err)
 	}
