@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## [Unreleased]
+
+### Added
+
+- The TCK driver's `pipeline` op takes `behaviour`, so a step's own handler
+  fails for the first `n` deliveries of an id (TCK SLIP-003). A pipeline step
+  that fails with no `StepRetry` was already attempted once and dead-lettered
+  to `{pipeline}.{step}.dlq` with every header kept (AMQP-SLIP-004); a test now
+  pins it.
+
+### Fixed
+
+- `TestABatchCostsFarLessThanOneRoundTripPerMessage` no longer fails on a busy
+  machine. It counted wall-clock time against one median round trip; it now
+  counts the writes the transport put on the wire while the write before was
+  still unconfirmed, which is zero for a transport that serialises on the
+  confirm and does not depend on load.
+
 ## [0.9.11] - 2026-10-20
 
 ### Added

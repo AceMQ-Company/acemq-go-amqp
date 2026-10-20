@@ -33,19 +33,13 @@ import (
 //
 // They need a broker, like every other test in this package. See brokerURL.
 
-// batchSize is large enough that the difference between waiting once and
-// waiting N times is not noise on any machine, and small enough that the test
-// is quick even when it is slow.
+// batchSize is enough concurrent publishes that a pipelining transport cannot
+// help overlapping some of them, on any machine.
 const batchSize = 200
 
-// roundTripSamples is how many single sends are timed to establish what one
-// broker round trip costs on the machine the test is running on. Hard-coding a
-// duration would make this test a measurement of somebody's laptop.
-const roundTripSamples = 20
-
 // dialTransport opens a transport directly, so a test can set what only Config
-// carries.
-func dialTransport(t *testing.T, cfg rabbitmq.Config) *acemq.Conn {
+// carries and read what only the transport counts.
+func dialTransport(t *testing.T, cfg rabbitmq.Config) (*acemq.Conn, *rabbitmq.Transport) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -59,61 +53,17 @@ func dialTransport(t *testing.T, cfg rabbitmq.Config) *acemq.Conn {
 		t.Fatalf("cannot build a connection: %v", err)
 	}
 	t.Cleanup(func() { _ = mq.Close() })
-	return mq
+	return mq, transport
 }
 
-// oneRoundTrip is the median cost of publishing a single message and waiting
-// for its confirm, which is what a publish used to cost every time.
-func oneRoundTrip(t *testing.T, ctx context.Context, pub *acemq.Publisher[OrderPlaced]) time.Duration {
+// sendBatch publishes batchSize messages with SendAll and returns how many of
+// the writes went out while the write before was still unconfirmed.
+func sendBatch(t *testing.T, cfg rabbitmq.Config) int64 {
 	t.Helper()
-
-	samples := make([]time.Duration, 0, roundTripSamples)
-	for i := 0; i < roundTripSamples; i++ {
-		started := time.Now()
-		if err := pub.Send(ctx, OrderPlaced{OrderID: fmt.Sprintf("warm-%d", i)}); err != nil {
-			t.Fatalf("warm-up send %d: %v", i, err)
-		}
-		samples = append(samples, time.Since(started))
-	}
-
-	// The median rather than the mean: one scheduling hiccup in twenty would
-	// otherwise raise the bar this test has to clear, which is the wrong way
-	// for a timing test to be flaky.
-	for i := 1; i < len(samples); i++ {
-		for j := i; j > 0 && samples[j] < samples[j-1]; j-- {
-			samples[j], samples[j-1] = samples[j-1], samples[j]
-		}
-	}
-	return samples[len(samples)/2]
-}
-
-// TestABatchCostsFarLessThanOneRoundTripPerMessage is the proof that the
-// confirm wait left the channel lock.
-//
-// Before this change Transport.Publish held the publishing mutex across
-// DeferredConfirmation.WaitContext, so SendAll pipelined at the library layer
-// and then queued underneath: every message paid a full broker round trip, one
-// after another, and a batch of N cost N of them. The library's own batch tests
-// could not see it, because the in-memory transport has no round trip to pay.
-//
-// The assertion is deliberately generous — half of what the serialised version
-// would cost — because the point is not to measure a speedup precisely but to
-// fail loudly if the serialisation ever comes back. Running this against the
-// previous implementation gives a ratio of about 1.0.
-//
-// It was a quarter, which is a budget the numerator and the denominator are not
-// steady enough to share. The denominator is one median round trip, measured
-// serially; the numerator is 200 publishes contending for one channel under
-// -race. Those two do not slow down together on a loaded machine, and a shared
-// CI runner is a loaded machine: the same code measured 3.2x, 3.8x and 5.1x on
-// three consecutive runs there while a laptop put it between 11x and 18x. Half
-// still fails by a factor of two against the 1.0 this exists to catch, and stops
-// failing for the reason a timing test must never fail — the machine it is on.
-func TestABatchCostsFarLessThanOneRoundTripPerMessage(t *testing.T) {
 	queue := queueName(t)
 	removeAtEnd(t, []string{queue}, nil)
 
-	mq := connect(t)
+	mq, transport := dialTransport(t, cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -121,17 +71,11 @@ func TestABatchCostsFarLessThanOneRoundTripPerMessage(t *testing.T) {
 		t.Fatalf("declare: %v", err)
 	}
 
-	pub := acemq.NewPublisher[OrderPlaced](mq, "", queue)
-	roundTrip := oneRoundTrip(t, ctx, pub)
-
 	payloads := make([]OrderPlaced, batchSize)
 	for i := range payloads {
 		payloads[i] = OrderPlaced{OrderID: fmt.Sprintf("order-%d", i), TotalCents: int64(i)}
 	}
-
-	started := time.Now()
-	results, err := pub.SendAll(ctx, payloads)
-	batch := time.Since(started)
+	results, err := acemq.NewPublisher[OrderPlaced](mq, "", queue).SendAll(ctx, payloads)
 	if err != nil {
 		t.Fatalf("SendAll: %v", err)
 	}
@@ -143,16 +87,35 @@ func TestABatchCostsFarLessThanOneRoundTripPerMessage(t *testing.T) {
 			t.Fatalf("result %d was not confirmed", i)
 		}
 	}
+	return rabbitmq.Overlapped(transport)
+}
 
-	serialised := time.Duration(batchSize) * roundTrip
-	budget := serialised / 2
-	t.Logf("one round trip %v, %d serialised would be %v, the batch took %v (%.1fx faster)",
-		roundTrip, batchSize, serialised, batch, float64(serialised)/float64(batch))
-	if batch > budget {
-		t.Errorf(
-			"a batch of %d took %v, which is more than half the %v it would cost "+
-				"at one round trip per message; the confirm wait is serialising publishes again",
-			batchSize, batch, serialised)
+// TestABatchCostsFarLessThanOneRoundTripPerMessage is the proof that the
+// confirm wait left the channel lock.
+//
+// Before that change Transport.Publish held the publishing mutex across
+// DeferredConfirmation.WaitContext, so SendAll pipelined at the library layer
+// and then queued underneath: every message paid a full broker round trip, one
+// after another, and a batch of N cost N of them. The library's own batch tests
+// could not see it, because the in-memory transport has no round trip to pay.
+//
+// It used to time the batch against one median round trip and fail on a busy CI
+// runner, because the two do not slow down together under load. It now counts
+// what the speedup comes from: writes that went out while the write before was
+// still unconfirmed. A transport that waits for each confirm before the next
+// write counts exactly none, however fast or slow the machine is, and the bound
+// of one outstanding publish below is that transport.
+func TestABatchCostsFarLessThanOneRoundTripPerMessage(t *testing.T) {
+	overlapped := sendBatch(t, rabbitmq.Config{})
+	t.Logf("%d of %d writes went out before the previous confirm", overlapped, batchSize)
+	if overlapped == 0 {
+		t.Errorf("none of %d writes went out while another was unconfirmed; "+
+			"the confirm wait is serialising publishes again", batchSize)
+	}
+
+	if serial := sendBatch(t, rabbitmq.Config{MaxOutstandingPublishes: 1}); serial != 0 {
+		t.Errorf("with one outstanding publish %d writes overlapped, want 0; "+
+			"the count does not measure what this test relies on", serial)
 	}
 }
 
@@ -325,12 +288,12 @@ func TestEveryUnroutableMessageInABatchGetsItsOwnReturn(t *testing.T) {
 // MaxOutstandingPublishes of 1 permits exactly one unconfirmed publish, which
 // is a round trip per message — what this transport did before the change, now
 // available on request rather than by accident. Correctness is the assertion
-// here; the timing assertion above is what says the default does better.
+// here; the overlap count above is what says the default does better.
 func TestOneOutstandingPublishIsTheOldBehaviour(t *testing.T) {
 	queue := queueName(t)
 	removeAtEnd(t, []string{queue}, nil)
 
-	mq := dialTransport(t, rabbitmq.Config{MaxOutstandingPublishes: 1})
+	mq, _ := dialTransport(t, rabbitmq.Config{MaxOutstandingPublishes: 1})
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 

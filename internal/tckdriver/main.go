@@ -404,21 +404,30 @@ func (d *driver) replay(a args) (any, error) {
 }
 
 // pipeline declares and starts a pipeline whose every step is the identity on
-// the JSON body, counted under handle.
+// the JSON body, counted under handle, failing as behaviour names it.
 func (d *driver) pipeline(a args) (any, error) {
 	conn, err := d.mq()
 	if err != nil {
 		return nil, err
 	}
 	t := &tally{counts: map[string]int{}, redelivered: map[string]int{}}
-	identity := func(_ context.Context, m acemq.Message[map[string]any]) (map[string]any, bool, error) {
-		t.count(m)
-		return m.Payload, true, nil
-	}
+	behaviour := a.obj("behaviour")
 	var steps []patterns.StepSpec
 	if names, ok := a["steps"].([]any); ok {
 		for _, name := range names {
-			steps = append(steps, patterns.PipelineStep(fmt.Sprint(name), identity))
+			b := behaviour.obj(fmt.Sprint(name))
+			failFirst, sleep := b.obj("failFirst"), b.millis("sleepMs", 0)
+			// The step's own handler fails, with no retry policy configured
+			// anywhere: the step is what the library builds by default.
+			step := func(_ context.Context, m acemq.Message[map[string]any]) (map[string]any, bool, error) {
+				id, n := t.count(m)
+				time.Sleep(sleep)
+				if n <= failFirst.num(id, 0) {
+					return nil, false, fmt.Errorf("tck: failing %s on purpose, delivery %d", id, n)
+				}
+				return m.Payload, true, nil
+			}
+			steps = append(steps, patterns.PipelineStep(fmt.Sprint(name), step))
 		}
 	}
 	p, err := patterns.NewPipeline[map[string]any](d.ctx, conn, a.str("name", ""), steps...)

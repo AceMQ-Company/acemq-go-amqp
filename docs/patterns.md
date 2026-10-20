@@ -334,6 +334,12 @@ Each step gets `{pipeline}.{step}`, so a slow stage is a deep queue you can see
 and scale on its own with `StepConsumers`. A single consumer doing all four in
 sequence gives you none of that.
 
+A step whose handler returns an error and has no `StepRetry` is attempted once:
+the message goes to `{pipeline}.{step}.dlq` with attempt 1, an `x-acemq-error`,
+and every header it arrived with — the route headers and any `x-acemq-` header
+this version does not know included — and nothing is published to the next step
+(AMQP-SLIP-004).
+
 **The topology is Java's, to the letter**: exchange named for the pipeline and
 declared `direct`, queue `{pipeline}.{step}`, binding key the step's name, and the
 declared route carried on the message as `x-acemq-route` plus a position. So a

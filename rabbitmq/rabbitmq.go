@@ -291,6 +291,12 @@ type Transport struct {
 	// Its capacity is also what sizes the returns buffer; see maxOutstanding.
 	outstanding chan struct{}
 
+	// lastConfirm is the confirmation of the latest confirmed write, and
+	// overlapped counts the writes made while it was still unanswered. Both are
+	// guarded by mu; see send.
+	lastConfirm *amqp.DeferredConfirmation
+	overlapped  int64
+
 	// returned holds returns that have arrived but whose publisher has not
 	// looked yet, keyed by message id, exchange and routing key; see returnKey.
 	//
@@ -784,6 +790,19 @@ func (t *Transport) send(
 	}
 	confirmation, err := ch.PublishWithDeferredConfirmWithContext(
 		ctx, exchange, routingKey, mandatory, false, publishing)
+	if err == nil {
+		// Counted on the wire rather than timed: a write made while the one
+		// before is still unconfirmed is what pipelining is, and a transport that
+		// waited for each confirm before the next write would count none.
+		if t.lastConfirm != nil {
+			select {
+			case <-t.lastConfirm.Done():
+			default:
+				t.overlapped++
+			}
+		}
+		t.lastConfirm = confirmation
+	}
 	return confirmation, sent, err
 }
 

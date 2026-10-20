@@ -24,6 +24,7 @@ package patterns_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -347,5 +348,84 @@ func TestDescribeNamesEveryStepAndItsDescription(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("Describe() = %q, missing %q", got, want)
 		}
+	}
+}
+
+// TestAFailingStepWithNoRetryPolicyIsAttemptedOnce is AMQP-SLIP-004: no policy on
+// the step or the connection means one attempt, then {pipeline}.{step}.dlq with
+// every header the step received — route headers and an x-acemq- header this
+// version does not know included — and nothing published to the next step.
+func TestAFailingStepWithNoRetryPolicyIsAttemptedOnce(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+
+	var calls, reachedNext atomic.Int64
+	pipeline, err := patterns.NewPipeline[pipeOrder](ctx, mq, "once",
+		patterns.PipelineStep("a",
+			func(_ context.Context, m acemq.Message[pipeOrder]) (pipeOrder, bool, error) {
+				return m.Payload, true, nil
+			}),
+		patterns.PipelineStep("b",
+			func(_ context.Context, m acemq.Message[pipeOrder]) (pipeOrder, bool, error) {
+				calls.Add(1)
+				return pipeOrder{}, false, errors.New("step b failed")
+			}),
+		patterns.PipelineStep("c",
+			func(_ context.Context, m acemq.Message[pipeOrder]) (struct{}, bool, error) {
+				reachedNext.Add(1)
+				return struct{}{}, true, nil
+			}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pipeline.Close() }()
+
+	headers := map[string]any{
+		acemq.HeaderID: "m1", acemq.HeaderRoute: "a,b,c", acemq.HeaderRoutePosition: 1,
+		acemq.HeaderRouteID: "run-1", "x-acemq-future": "kept", "x-tenant": "acme",
+	}
+	if _, err := mq.PublishRaw(ctx, "", "once.b", acemq.Outbound{
+		Body: []byte(`{"id":"m1"}`), ContentType: acemq.JSONContentType, MessageID: "m1",
+		Headers: headers, Mandatory: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "the dead letter", func() bool {
+		n, err := mq.MessageCount(ctx, "once.b.dlq")
+		return err == nil && n == 1
+	})
+	m, found, err := mq.Pull(ctx, "once.b.dlq")
+	if err != nil || !found {
+		t.Fatalf("Pull: %v, found=%v", err, found)
+	}
+	defer func() { _ = m.Ack() }()
+
+	wire := m.Envelope.ToWire()
+	for name, want := range headers {
+		if name == acemq.HeaderRoutePosition {
+			if m.Envelope.RoutePosition != 1 {
+				t.Errorf("route position = %d, want 1", m.Envelope.RoutePosition)
+			}
+			continue
+		}
+		if wire[name] != want {
+			t.Errorf("%s = %v, want %v", name, wire[name], want)
+		}
+	}
+	if m.Envelope.Attempt != 1 {
+		t.Errorf("x-acemq-attempt = %d, want 1", m.Envelope.Attempt)
+	}
+	if wire[acemq.HeaderError] == nil {
+		t.Error("the dead letter does not say why it failed")
+	}
+
+	// Long enough for a retry the default should not make.
+	time.Sleep(300 * time.Millisecond)
+	if n := calls.Load(); n != 1 {
+		t.Errorf("the failing step ran %d times, want 1", n)
+	}
+	if n := reachedNext.Load(); n != 0 {
+		t.Errorf("the next step ran %d times", n)
 	}
 }
