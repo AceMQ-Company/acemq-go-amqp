@@ -487,6 +487,13 @@ Holding them takes them out of the way for the length of the pass, and the
 broker still has them, so a replay that dies half way through returns them
 rather than losing them.
 
+When the pass ends, each declined message is published back to the queue it came
+from with a confirm, and the original acknowledged after it, so `Replay` returns
+only once they are back: a depth read straight after it counts them, on a quorum
+queue too. They go to the tail of the queue, which on a drained queue is where
+they were. (Up to 0.9.9 they were returned with `basic.nack`, which the broker
+never answers, and a quorum queue could read 0 straight after the replay.)
+
 A message is acknowledged only after the broker has confirmed the new copy. A
 crash in that gap replays it twice, which is the right way round for a
 dead-letter queue.
