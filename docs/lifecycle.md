@@ -281,6 +281,12 @@ nacked *with* requeue, never rejected, and `acemq.MetricSetAsideFailed` counts
 each one. On a queue with no dead-letter exchange a reject would have been the
 end of the message.
 
+The same holds outside a shutdown. When the broker refuses the set-aside
+publish, or returns it as unroutable, the delivery goes back with a requeue
+after a pause of one second, and the worker is not held while it waits. Since
+0.9.11; before, it was requeued at once and refused again at once, some four
+hundred times a second into a full parked queue.
+
 **Which is why the cancellation comes last, and never first.** Cancelling the
 consumers' context is not a way to hurry a drain along. It is what happens when
 the drain has already run out of time, to get the deliveries back to the broker
