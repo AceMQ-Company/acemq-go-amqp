@@ -356,7 +356,7 @@ jobs:
       - name: Build the TCK driver
         run: go build -o "$RUNNER_TEMP/tckdriver" ./internal/tckdriver
 
-      - uses: AceMQ-Company/acemq-amqp-tck@v0.2.0
+      - uses: AceMQ-Company/acemq-amqp-tck@v0.3.0
         with:
           driver: $RUNNER_TEMP/tckdriver
 
