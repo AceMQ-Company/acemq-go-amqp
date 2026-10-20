@@ -709,15 +709,28 @@ func (c *Consumer) setAside(ctx context.Context, d Delivery, env Envelope, targe
 		// none — the common case — that is nowhere: the message was lost
 		// whenever the set-aside did not land, most often during shutdown. Back
 		// on the queue it is at worst seen again; rejected it is gone.
+		//
+		// After a pause, and off this worker. A set-aside the broker refused is
+		// refused again at once, so a delivery requeued straight away spins: a
+		// park into a full queue went round some four hundred times a second,
+		// and on a quorum queue every turn is a log entry the queue works through
+		// before anything else it is asked, the eventual acknowledgement
+		// included. Held unsettled meanwhile, it is lost by nothing: a channel
+		// that closes first returns it to the broker.
 		c.conn.observer.Count(MetricSetAsideFailed, 1, map[string]string{
 			TagQueue: c.queue, TagTarget: target})
-		c.nack(d, true)
+		// ponytail: fixed pause; a growing one if refusals last long enough to matter.
+		time.AfterFunc(setAsideRefusedPause, func() { c.nack(d, true) })
 		return
 	}
 	if d.Ack != nil {
 		_ = d.Ack()
 	}
 }
+
+// setAsideRefusedPause is how long a delivery whose set-aside did not land is
+// held before it goes back to the broker.
+const setAsideRefusedPause = time.Second
 
 // setAsideTimeout bounds one set-aside republish, including its confirm, once
 // it no longer answers to the handler's context. The same thirty seconds the

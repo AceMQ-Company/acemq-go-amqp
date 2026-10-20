@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // foreign is what a newer or non-AceMQ publisher might send: a full envelope,
@@ -184,6 +185,11 @@ func TestAParkThatDoesNotLandGoesBackToTheQueue(t *testing.T) {
 	}
 
 	waitFor(t, "the refused park", func() bool { return countOf(metrics, MetricSetAsideFailed) > 0 })
+	// Requeued after a pause, not at once: a refused park does not spin.
+	time.Sleep(setAsideRefusedPause / 2)
+	if n := countOf(metrics, MetricSetAsideFailed); n != 1 {
+		t.Errorf("the park was refused %d times in half a pause, want 1", n)
+	}
 	declare(t, mq, "orders.parked")
 	waitFor(t, "the park to land once the queue is back", func() bool {
 		n, err := mq.MessageCount(ctx, "orders.parked")

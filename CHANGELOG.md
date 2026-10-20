@@ -42,6 +42,11 @@ While the version is `0.x` the public API may change in any release.
   `{stream}.parked` and read on; that is now
   `StreamOptions{OnFailure: patterns.ParkOnFailure}`. `acemq.Reject` and
   `acemq.Park` still set one message aside and read on.
+- **A set-aside the broker refuses goes back after a pause.** When the publish
+  to `{queue}.dlq` or `{queue}.parked` is refused or unroutable, the delivery is
+  still requeued, never dropped, but after one second and without holding the
+  worker. Requeued at once it was refused again at once, some four hundred
+  times a second into a full parked queue.
 - **`acemq-replayed-at` has millisecond precision**: `2026-10-20T09:15:02.123Z`,
   was whole seconds (AMQP-ENV-013).
 
