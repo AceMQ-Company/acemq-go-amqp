@@ -8,6 +8,11 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- The TCK driver answers `replay`: one filtered `patterns.Replay` with default
+  settings, for the TCK case that reads the source queue the moment it returns.
+
 ### Fixed
 
 - **`patterns.Replay` returns only once the declined messages are back.** The

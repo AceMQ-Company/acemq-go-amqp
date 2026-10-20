@@ -27,7 +27,7 @@ import (
 )
 
 var ops = []string{"hello", "begin", "end", "publish", "consume", "handled", "schedule", "request",
-	"declareStream", "readStream", "metrics"}
+	"declareStream", "readStream", "metrics", "replay"}
 
 type args map[string]any
 
@@ -346,6 +346,37 @@ func (d *driver) request(a args) (any, error) {
 	return map[string]any{"reply": reply}, nil
 }
 
+// replay is one filtered patterns.Replay with default settings, answered as
+// soon as it returns.
+func (d *driver) replay(a args) (any, error) {
+	conn, err := d.mq()
+	if err != nil {
+		return nil, err
+	}
+	ids := map[string]bool{}
+	if list, ok := a["ids"].([]any); ok {
+		for _, id := range list {
+			if s, ok := id.(string); ok {
+				ids[s] = true
+			}
+		}
+	}
+	result, err := patterns.Replay(d.ctx, conn, patterns.ReplayFrom{
+		Queue: a.str("from", ""), Exchange: "", RoutingKey: a.str("queue", ""),
+		Filter: func(_ acemq.Envelope, body []byte) bool {
+			var msg struct {
+				ID string `json:"id"`
+			}
+			return json.Unmarshal(body, &msg) == nil && ids[msg.ID]
+		},
+	})
+	if err != nil {
+		// The contract reports every replay failure as kind "other".
+		return nil, fmt.Errorf("tck: replay failed: %v", err)
+	}
+	return map[string]any{"replayed": result.Moved}, nil
+}
+
 // kindOf maps an error onto the TCK's closed list of failure kinds.
 func kindOf(err error) string {
 	var unsupported unsupportedError
@@ -381,6 +412,7 @@ func main() {
 		"hello": d.hello, "begin": d.begin, "end": d.end, "publish": d.publish,
 		"consume": d.consume, "handled": d.handled, "schedule": d.schedule, "request": d.request,
 		"declareStream": d.declareStream, "readStream": d.readStream, "metrics": d.metricsOp,
+		"replay": d.replay,
 	}
 
 	in := bufio.NewScanner(os.Stdin)
