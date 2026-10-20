@@ -114,25 +114,35 @@ func TestAReturnIsFiledForItsOwnPublishAndNotAnother(t *testing.T) {
 
 	// Asked for out of order, because publishers finish in whatever order the
 	// broker confirms them and not the order they wrote in.
-	if reason, found := transport.takeReturn("c"); !found || reason != "312 NO_ROUTE" {
+	if reason, found := transport.takeReturn("c", "", ""); !found || reason != "312 NO_ROUTE" {
 		t.Errorf("c got (%q, %v), want its own return", reason, found)
 	}
-	if reason, found := transport.takeReturn("a"); !found || reason != "312 NO_ROUTE" {
+	if reason, found := transport.takeReturn("a", "", ""); !found || reason != "312 NO_ROUTE" {
 		t.Errorf("a got (%q, %v); the return was lost draining past it", reason, found)
 	}
-	if reason, found := transport.takeReturn("b"); !found || reason != "312 NO_ROUTE" {
+	if reason, found := transport.takeReturn("b", "", ""); !found || reason != "312 NO_ROUTE" {
 		t.Errorf("b got (%q, %v); the return was lost draining past it", reason, found)
 	}
 
 	// Taken once. A second ask is a different publish that happened to reuse an
 	// identifier, and answering it with an old return would report a message as
 	// unroutable that the broker took.
-	if reason, found := transport.takeReturn("a"); found {
+	if reason, found := transport.takeReturn("a", "", ""); found {
 		t.Errorf("a's return came back a second time as %q", reason)
 	}
 
+	// The same id sent somewhere else is a different publish: a library hop
+	// republishes a message under its own id.
+	returns <- amqp.Return{MessageId: "d", RoutingKey: "orders.dlq", ReplyCode: 312, ReplyText: "NO_ROUTE"}
+	if reason, found := transport.takeReturn("d", "", "orders"); found {
+		t.Errorf("a publish to orders got the return of its dead letter, %q", reason)
+	}
+	if _, found := transport.takeReturn("d", "", "orders.dlq"); !found {
+		t.Error("the dead letter's own return was lost")
+	}
+
 	// A message the broker routed has no return, and must not be given one.
-	if reason, found := transport.takeReturn("never-published"); found {
+	if reason, found := transport.takeReturn("never-published", "", ""); found {
 		t.Errorf("a message nobody returned got %q", reason)
 	}
 }
@@ -158,7 +168,7 @@ func TestUnclaimedReturnsDoNotAccumulateForEver(t *testing.T) {
 	const written = 200
 	for i := 0; i < written; i++ {
 		returns <- amqp.Return{MessageId: string(rune('A'+i%26)) + "-" + time.Duration(i).String()}
-		transport.takeReturn("nobody")
+		transport.takeReturn("nobody", "", "")
 	}
 
 	if held := len(transport.returned); held > 64 {

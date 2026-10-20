@@ -292,7 +292,7 @@ type Transport struct {
 	outstanding chan struct{}
 
 	// returned holds returns that have arrived but whose publisher has not
-	// looked yet, keyed by message id.
+	// looked yet, keyed by message id, exchange and routing key; see returnKey.
 	//
 	// A map rather than the channel alone, because with several publishes
 	// outstanding a publisher draining the channel meets returns belonging to
@@ -681,7 +681,7 @@ func (t *Transport) Publish(
 		// The protocol sends basic.return before the confirm for the same
 		// publish, so by now any return is already in the channel and this
 		// does not need to wait for one.
-		if reason, returned := t.takeReturn(msg.MessageID); returned {
+		if reason, returned := t.takeReturn(msg.MessageID, exchange, routingKey); returned {
 			result.Routed = false
 			result.ReturnReason = reason
 		}
@@ -894,17 +894,30 @@ func (t *Transport) release() {
 // Returns for other messages are filed rather than put back. Pushing them into
 // the buffered channel again would drop them once it filled, and with a batch
 // in flight a publisher meets other publishers' returns constantly.
-func (t *Transport) takeReturn(messageID string) (string, bool) {
+func (t *Transport) takeReturn(messageID, exchange, routingKey string) (string, bool) {
 	t.returnsMu.Lock()
 	defer t.returnsMu.Unlock()
 
 	t.drainReturnsLocked()
 
-	reason, found := t.returned[messageID]
+	key := returnKey(messageID, exchange, routingKey)
+	reason, found := t.returned[key]
 	if found {
-		delete(t.returned, messageID)
+		delete(t.returned, key)
 	}
 	return reason, found
+}
+
+// returnKey is what a return is filed under: the message id and where it was
+// sent.
+//
+// The id alone is not enough, because the library republishes a message under
+// its own id — a retry hop, a dead letter, a park. A consumer can receive the
+// caller's message and have that hop returned before the caller's own Send has
+// drained the returns, and keyed by id the caller then read the hop's NO_ROUTE
+// as its own and failed a publish the broker had routed.
+func returnKey(messageID, exchange, routingKey string) string {
+	return messageID + "\x00" + exchange + "\x00" + routingKey
 }
 
 // drainReturnsLocked moves everything waiting in the channel into the map.
@@ -915,8 +928,9 @@ func (t *Transport) drainReturnsLocked() {
 			if !ok {
 				return
 			}
-			t.returned[r.MessageId] = fmt.Sprintf("%d %s", r.ReplyCode, r.ReplyText)
-			t.returnedSeen = append(t.returnedSeen, r.MessageId)
+			key := returnKey(r.MessageId, r.Exchange, r.RoutingKey)
+			t.returned[key] = fmt.Sprintf("%d %s", r.ReplyCode, r.ReplyText)
+			t.returnedSeen = append(t.returnedSeen, key)
 			t.evictOldReturnsLocked()
 		default:
 			return

@@ -57,6 +57,13 @@ While the version is `0.x` the public API may change in any release.
   envelope's own fields and dropped every reserved header without one, such as
   one a newer library added. They are now carried unchanged (AMQP-ENV-014).
   They are still not shown in `Envelope.Headers`.
+- **A routed publish is no longer reported unroutable because of a library
+  hop.** The RabbitMQ transport filed a `basic.return` by message id alone, and
+  a retry hop, dead letter or park republishes a message under its own id: a
+  consumer could take the message and have that hop returned before the
+  caller's mandatory `Send` read its returns, and the `Send` then failed with
+  the hop's `NO_ROUTE`. Returns are now matched by id, exchange and routing
+  key.
 - `patterns.Replay` reads an `acemq-replay-count` of any integer width; a
   count sent as an 8- or 16-bit integer was read as 0.
 
