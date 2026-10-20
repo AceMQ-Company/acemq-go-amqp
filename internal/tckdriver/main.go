@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"reflect"
 	"sync"
@@ -27,7 +28,7 @@ import (
 )
 
 var ops = []string{"hello", "begin", "end", "publish", "consume", "handled", "schedule", "request",
-	"declareStream", "readStream", "metrics", "replay"}
+	"declareStream", "readStream", "metrics", "replay", "pipeline"}
 
 type args map[string]any
 
@@ -100,6 +101,7 @@ type driver struct {
 	cancel     context.CancelFunc
 	conn       *acemq.Conn
 	consumers  []*acemq.Consumer
+	pipelines  []io.Closer
 	tallies    map[string]*tally
 	metrics    *recorder
 	scheduler  *patterns.Scheduler
@@ -152,6 +154,10 @@ func (d *driver) end(args) (any, error) {
 		_ = d.scheduler.Close()
 		d.scheduler = nil
 	}
+	for _, p := range d.pipelines {
+		_ = p.Close()
+	}
+	d.pipelines = nil
 	for _, c := range d.consumers {
 		_ = c.Close()
 	}
@@ -194,7 +200,16 @@ func (d *driver) publish(a args) (any, error) {
 			opts = append(opts, acemq.Header(name, value))
 		}
 	}
-	publisher := acemq.NewPublisher[any](conn, a.str("exchange", ""), a.str("routingKey", ""))
+	// Absent is the library's default, which is mandatory.
+	var popts []acemq.PublisherOption[any]
+	if mandatory, ok := a["mandatory"].(bool); ok {
+		if mandatory {
+			popts = append(popts, acemq.Mandatory[any]())
+		} else {
+			popts = append(popts, acemq.AllowUnroutable[any]())
+		}
+	}
+	publisher := acemq.NewPublisher[any](conn, a.str("exchange", ""), a.str("routingKey", ""), popts...)
 	result, err := publisher.SendResult(d.ctx, a["body"], opts...)
 	if err != nil {
 		return nil, err
@@ -208,14 +223,41 @@ func (d *driver) consume(a args) (any, error) {
 		return nil, err
 	}
 	queue := a.str("queue", "")
-	retry := a.obj("retry")
-	policy := acemq.FixedRetry(retry.num("maxAttempts", 3), retry.millis("delayMs", 1000))
-	behaviour := a.obj("behaviour")
+	t := &tally{counts: map[string]int{}, redelivered: map[string]int{}}
+	handle := failing(t, a.obj("behaviour"))
+	if idempotent, _ := a["idempotent"].(bool); idempotent {
+		// The count is inside the wrapper, so a suppressed duplicate is not
+		// counted. Zero is the store's default retention.
+		handle = patterns.Idempotent(patterns.NewInMemoryIdempotencyStore(0), handle)
+	}
+
+	topology := acemq.NewTopology().Queue(queue).DeadLetters(queue)
+	opts := []acemq.ConsumeOption{acemq.Prefetch(a.num("prefetch", 10))}
+	// Absent is no retry policy at all: the consumer as the library builds it
+	// when the caller configures none.
+	if retry := a.obj("retry"); retry != nil {
+		policy := acemq.FixedRetry(retry.num("maxAttempts", 3), retry.millis("delayMs", 1000))
+		topology = topology.Retries(queue, policy)
+		opts = append(opts, acemq.RetryWith(policy))
+	}
+	if err := topology.Apply(d.ctx, conn); err != nil {
+		return nil, err
+	}
+	consumer, err := acemq.Consume(d.ctx, conn, queue, handle, opts...)
+	if err != nil {
+		return nil, err
+	}
+	d.consumers = append(d.consumers, consumer)
+	d.tallies[a.str("handle", "")] = t
+	return map[string]any{}, nil
+}
+
+// failing is the contract's handler: count, sleep, and fail with the library's
+// ordinary retryable failure for the first n deliveries of an id in failFirst.
+func failing(t *tally, behaviour args) acemq.Handler[map[string]any] {
 	failFirst := behaviour.obj("failFirst")
 	sleep := behaviour.millis("sleepMs", 0)
-	t := &tally{counts: map[string]int{}, redelivered: map[string]int{}}
-
-	handle := func(_ context.Context, m acemq.Message[map[string]any]) acemq.Ack {
+	return func(_ context.Context, m acemq.Message[map[string]any]) acemq.Ack {
 		id, n := t.count(m)
 		time.Sleep(sleep)
 		if n <= failFirst.num(id, 0) {
@@ -223,19 +265,6 @@ func (d *driver) consume(a args) (any, error) {
 		}
 		return acemq.Accept()
 	}
-
-	topology := acemq.NewTopology().Queue(queue).DeadLetters(queue).Retries(queue, policy)
-	if err := topology.Apply(d.ctx, conn); err != nil {
-		return nil, err
-	}
-	consumer, err := acemq.Consume(d.ctx, conn, queue, handle,
-		acemq.RetryWith(policy), acemq.Prefetch(a.num("prefetch", 10)))
-	if err != nil {
-		return nil, err
-	}
-	d.consumers = append(d.consumers, consumer)
-	d.tallies[a.str("handle", "")] = t
-	return map[string]any{}, nil
 }
 
 func (d *driver) handled(a args) (any, error) {
@@ -282,10 +311,7 @@ func (d *driver) readStream(a args) (any, error) {
 	}
 	t := &tally{counts: map[string]int{}, redelivered: map[string]int{}}
 	consumer, err := patterns.ReadStream(d.ctx, conn, a.str("queue", ""),
-		func(_ context.Context, m acemq.Message[map[string]any]) acemq.Ack {
-			t.count(m)
-			return acemq.Accept()
-		}, patterns.StreamOptions{Offset: offset})
+		failing(t, a.obj("behaviour")), patterns.StreamOptions{Offset: offset})
 	if err != nil {
 		return nil, err
 	}
@@ -377,6 +403,33 @@ func (d *driver) replay(a args) (any, error) {
 	return map[string]any{"replayed": result.Moved}, nil
 }
 
+// pipeline declares and starts a pipeline whose every step is the identity on
+// the JSON body, counted under handle.
+func (d *driver) pipeline(a args) (any, error) {
+	conn, err := d.mq()
+	if err != nil {
+		return nil, err
+	}
+	t := &tally{counts: map[string]int{}, redelivered: map[string]int{}}
+	identity := func(_ context.Context, m acemq.Message[map[string]any]) (map[string]any, bool, error) {
+		t.count(m)
+		return m.Payload, true, nil
+	}
+	var steps []patterns.StepSpec
+	if names, ok := a["steps"].([]any); ok {
+		for _, name := range names {
+			steps = append(steps, patterns.PipelineStep(fmt.Sprint(name), identity))
+		}
+	}
+	p, err := patterns.NewPipeline[map[string]any](d.ctx, conn, a.str("name", ""), steps...)
+	if err != nil {
+		return nil, err
+	}
+	d.pipelines = append(d.pipelines, p)
+	d.tallies[a.str("handle", "")] = t
+	return map[string]any{}, nil
+}
+
 // kindOf maps an error onto the TCK's closed list of failure kinds.
 func kindOf(err error) string {
 	var unsupported unsupportedError
@@ -412,7 +465,7 @@ func main() {
 		"hello": d.hello, "begin": d.begin, "end": d.end, "publish": d.publish,
 		"consume": d.consume, "handled": d.handled, "schedule": d.schedule, "request": d.request,
 		"declareStream": d.declareStream, "readStream": d.readStream, "metrics": d.metricsOp,
-		"replay": d.replay,
+		"replay": d.replay, "pipeline": d.pipeline,
 	}
 
 	in := bufio.NewScanner(os.Stdin)

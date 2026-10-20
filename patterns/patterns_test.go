@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -965,14 +966,62 @@ func TestReplayMovesMessagesBack(t *testing.T) {
 				patterns.HeaderReplayedAt, m.Envelope.Headers[patterns.HeaderReplayedAt],
 				m.Envelope.Headers)
 		}
-		if _, err := time.Parse(time.RFC3339, at); err != nil {
-			t.Errorf("%s = %q, which is not RFC 3339: %v",
-				patterns.HeaderReplayedAt, at, err)
+		if !regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$`).MatchString(at) {
+			t.Errorf("%s = %q, want millisecond ISO-8601 UTC (AMQP-ENV-013)",
+				patterns.HeaderReplayedAt, at)
 		}
 
 		if m.Envelope.Headers[patterns.HeaderReplayCount] == nil {
 			t.Errorf("no %s: %v", patterns.HeaderReplayCount, m.Envelope.Headers)
 		}
+	}
+}
+
+// TestAReplayRestartsTheAttemptAndKeepsEveryOtherHeader is AMQP-REPLAY-003 and
+// AMQP-ENV-014: attempt 1, no x-acemq-error, the count advanced, and every other
+// header — one in the reserved namespace this version does not know included —
+// unchanged.
+func TestAReplayRestartsTheAttemptAndKeepsEveryOtherHeader(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+	for _, q := range []string{"orders", "orders.dlq"} {
+		if err := mq.DeclareQueue(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := mq.PublishRaw(ctx, "", "orders.dlq", acemq.Outbound{
+		Body: []byte(`{"id":"r1"}`), ContentType: acemq.JSONContentType, MessageID: "r1",
+		Headers: map[string]any{
+			acemq.HeaderID: "r1", acemq.HeaderAttempt: 3, acemq.HeaderError: "handler failed",
+			acemq.HeaderCorrelation: "corr-rp", patterns.HeaderReplayCount: int8(1),
+			"x-acemq-future": "kept", "x-tenant": "acme",
+		},
+		Mandatory: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := patterns.Replay(ctx, mq, patterns.ReplayFrom{Queue: "orders.dlq", RoutingKey: "orders"})
+	if err != nil || result.Moved != 1 {
+		t.Fatalf("Replay = %s, %v", result, err)
+	}
+	m, found, err := mq.Pull(ctx, "orders")
+	if err != nil || !found {
+		t.Fatalf("Pull: %v, found=%v", err, found)
+	}
+	defer func() { _ = m.Ack() }()
+
+	wire := m.Envelope.ToWire()
+	for name, want := range map[string]any{
+		acemq.HeaderAttempt: 1, patterns.HeaderReplayCount: 2, patterns.HeaderReplayedFrom: "orders.dlq",
+		acemq.HeaderCorrelation: "corr-rp", "x-acemq-future": "kept", "x-tenant": "acme",
+	} {
+		if wire[name] != want {
+			t.Errorf("%s = %v, want %v", name, wire[name], want)
+		}
+	}
+	if _, present := wire[acemq.HeaderError]; present {
+		t.Errorf("x-acemq-error survived the replay: %v", wire[acemq.HeaderError])
 	}
 }
 

@@ -100,9 +100,9 @@ instructions was meant.
 
 ## A policy
 
-Without one, a message returned by `Retry` is republished at once with nothing to
-slow it down, and the broker hands it straight back as fast as it can. That is
-rarely what anybody wants for long.
+Without one a consumer makes one attempt: a message returned by `Retry` is
+dead-lettered to `{queue}.dlq` with the reason, exactly as under `NoRetry()`.
+Retrying is something you configure:
 
 ```go
 mq, err := acemq.Connect(ctx, url,
@@ -334,7 +334,7 @@ difference is only ever noticed after messages have been lost.
 ```go
 result, err := pub.SendResult(ctx, order)
 // result.Confirmed — the broker has it
-// result.Routed    — it reached a queue (with Mandatory)
+// result.Routed    — it reached a queue
 ```
 
 A broker that refuses a message is an error rather than a silent drop. Turning
@@ -367,20 +367,22 @@ The in-memory transport behaves the same way as `memory://name?confirms=off`.
 
 ## Messages that reach no queue
 
-An unroutable message is dropped by the broker, silently. The publisher
-succeeds, the consumer waits, and nothing anywhere says why — usually because a
-binding was never made.
-
-```go
-pub := acemq.NewPublisher[OrderPlaced](mq, "events", "order.placed",
-	acemq.Mandatory[OrderPlaced]())
-```
-
-Now that is an error at the point of publishing:
+An unroutable message is dropped by the broker, silently, unless it was
+published mandatory — and a `Publisher` is mandatory by default. A message
+nothing is bound to receive is an error at the point of publishing:
 
 ```
 acemq: message 7f3c… to exchange "events" with key "order.placed" reached no
 queue (312 NO_ROUTE); the broker dropped it
+```
+
+It is a `*acemq.PublishFailedError` with `Unroutable` true, so it can be told
+from a broker nack (`Unroutable` false) with `errors.As`. Opt out for a
+destination where nobody listening is normal:
+
+```go
+pub := acemq.NewPublisher[OrderPlaced](mq, "events", "order.placed",
+	acemq.AllowUnroutable[OrderPlaced]())
 ```
 
 It costs a round trip only when the message is actually unroutable. RabbitMQ

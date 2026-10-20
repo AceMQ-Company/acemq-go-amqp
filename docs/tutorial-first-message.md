@@ -141,14 +141,9 @@ people. `acemq.Consume` is a function for the same reason.
 
 ## Delete the binding and watch it fail
 
-Comment out the `Bind` call and run it again. Nothing happens — the publish
-succeeds and the message goes nowhere, because that is what an AMQP broker does
-with a message no queue is bound to receive. Ask to be told instead:
-
-```go
-pub := acemq.NewPublisher[OrderPlaced](mq, "orders", "order.placed",
-	acemq.Mandatory[OrderPlaced]())
-```
+Comment out the `Bind` call and run it again. The publish fails, because a
+`Publisher` is mandatory by default and the broker returns a message no queue is
+bound to receive:
 
 ```
 acemq: message 7d3f… to exchange "orders" with key "order.placed" reached no
@@ -351,8 +346,7 @@ func main() {
 	}
 	defer sub.Close()
 
-	pub := acemq.NewPublisher[OrderPlaced](mq, "orders", "order.placed",
-		acemq.Mandatory[OrderPlaced]())
+	pub := acemq.NewPublisher[OrderPlaced](mq, "orders", "order.placed")
 
 	results, err := pub.SendAll(ctx, []OrderPlaced{
 		{OrderID: "A-1", TotalCents: 4250},

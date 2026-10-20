@@ -393,7 +393,7 @@ func TestDeclareStreamAgainstMemoryStillSucceeds(t *testing.T) {
 // The unit test next door proves the Ack is rewritten. This proves what the
 // engine then does with it: the message is republished to {stream}.parked with
 // the reason on its envelope, and nothing at all goes back to the stream.
-func TestARetryFromAStreamHandlerLandsInTheParkedQueue(t *testing.T) {
+func TestARetryFromAStreamHandlerLandsInTheParkedQueueWhenAskedTo(t *testing.T) {
 	transport := newFakeStream()
 	mq := streamConn(t, transport)
 
@@ -403,7 +403,7 @@ func TestARetryFromAStreamHandlerLandsInTheParkedQueue(t *testing.T) {
 			defer func() { handled <- struct{}{} }()
 			return acemq.Retry(errors.New("the projection store is down"))
 		},
-		patterns.StreamOptions{Offset: patterns.FromFirst(), Prefetch: 100})
+		patterns.StreamOptions{Offset: patterns.FromFirst(), Prefetch: 100, OnFailure: patterns.ParkOnFailure})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,5 +524,58 @@ func TestRejectingOnAStreamCopiesRatherThanMoves(t *testing.T) {
 	}
 	if back := transport.sentTo("orders.log"); len(back) != 0 {
 		t.Errorf("rejecting put %d copies back into the stream", len(back))
+	}
+}
+
+// TestAFailingHandlerStopsTheReaderAtThatMessage is AMQP-STREAM-004, the
+// default: the reader closes at the failure, handles nothing after it, and
+// copies the message nowhere — not the stream, not {stream}.dlq or .parked.
+func TestAFailingHandlerStopsTheReaderAtThatMessage(t *testing.T) {
+	transport := newFakeStream()
+	mq := streamConn(t, transport)
+
+	var mu sync.Mutex
+	var order []string
+	stopped := make(chan error, 1)
+	sub, err := patterns.ReadStream(context.Background(), mq, "orders.log",
+		func(_ context.Context, m acemq.Message[streamEvent]) acemq.Ack {
+			mu.Lock()
+			order = append(order, m.Payload.OrderID)
+			mu.Unlock()
+			if m.Payload.OrderID == "b" {
+				return acemq.Retry(errors.New("the projection store is down"))
+			}
+			return acemq.Accept()
+		},
+		patterns.StreamOptions{Offset: patterns.FromFirst(), OnStop: func(err error) { stopped <- err }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	for i, id := range []string{"a", "b", "c"} {
+		transport.hand(id, int64(i), streamEvent{OrderID: id})
+	}
+
+	select {
+	case err := <-stopped:
+		if !strings.Contains(err.Error(), "the projection store is down") {
+			t.Errorf("OnStop got %v, want the handler's reason", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the reader never stopped")
+	}
+	transport.hand("d", int64(3), streamEvent{OrderID: "d"})
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(order, ",") != "a,b" {
+		t.Errorf("the handler saw %v, want a then b and nothing after", order)
+	}
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	if len(transport.published) != 0 {
+		t.Errorf("%d copies were published, want none", len(transport.published))
 	}
 }

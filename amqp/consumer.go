@@ -470,13 +470,11 @@ func (c *Consumer) settle(
 			return
 		}
 
+		// No policy configured — the zero RetryPolicy — is one attempt: the
+		// message is dead-lettered now, as under NoRetry. Earlier versions sent it
+		// straight back with no limit, which turned one bad message into a hot
+		// loop nothing ever stopped.
 		wait, again := c.retry.NextWait(env.Attempt, env.Age())
-		if c.retry.MaxAttempts == 0 {
-			// No policy configured: send it straight back and let the broker
-			// decide how fast to bring it round. Documented on WithRetry as
-			// rarely what anybody wants for long.
-			wait, again = Wait{}, true
-		}
 		if !again {
 			// The message asked for another attempt and there is none left.
 			// This is the moment the two things a reader wants diverge: the
@@ -566,6 +564,9 @@ func (c *Consumer) settledAfterHandler(hook *settlementHook, s Settlement, took 
 
 // exhausted says why there is no next attempt, in words an operator can act on.
 func (c *Consumer) exhausted(env Envelope) string {
+	if c.retry.MaxAttempts == 0 {
+		return "no retry policy, so one attempt"
+	}
 	if env.Attempt >= c.retry.MaxAttempts {
 		attempts := "attempts"
 		if c.retry.MaxAttempts == 1 {

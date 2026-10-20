@@ -138,7 +138,7 @@ original is nacked and requeued instead. The attempt is **not** incremented and
 the retry policy is not consulted, so a message is never dead-lettered for being
 in progress. Once the lease ends, the next look claims it and runs the handler.
 It is counted as `acemq.consume.total{outcome="in_progress"}`, not as retried or
-dead-lettered. A stream consumer refuses it as it refuses a retry.
+dead-lettered. On a stream it stops the reader, as a retry does.
 
 ```go
 patterns.Idempotent(store, handle, patterns.InProgressDelay(2*time.Second))
@@ -454,8 +454,11 @@ Those are the names Java, Python and Ruby write too, and **none of them begins
 `x-acemq-`**. That namespace is the engine's, and a header in it that the engine
 does not put on the envelope is dropped before a handler sees it — so a replay
 stamp written there would arrive on the wire and vanish. Unprefixed, the three
-come through in `Envelope.Headers`. `acemq-replayed-at` is RFC 3339, not the
-epoch milliseconds `x-acemq-first-seen` uses.
+come through in `Envelope.Headers`. `acemq-replayed-at` is millisecond ISO-8601 UTC
+(`2026-02-03T04:05:06.789Z`), not the epoch milliseconds `x-acemq-first-seen`
+uses. By default the replayed message goes back on attempt 1 without
+`x-acemq-error`; every other header, the body, `content_type` and `message_id`
+are unchanged.
 
 > **.NET is the outlier here.** It writes `x-acemq-replayed-from`,
 > `x-acemq-replayed-at` and `x-acemq-replay-count`, and a Go consumer will not see
@@ -850,9 +853,11 @@ sub, err := patterns.ReadStream(ctx, mq, "events", handle,
 consumer's position rather than removing anything, and rejecting dead-letters
 nothing, because there is nothing to remove it from. A message that cannot be
 handled has to be dealt with by the handler — logged, copied elsewhere, counted
-— and the stream moves on regardless. Nothing is lost, and nothing is retried
-for you: `ReadStream` refuses `acemq.Retry`, because on a stream a retry appends
-a second copy of the message to the log.
+— or the reader stops. Nothing is retried for you, because on a stream a retry
+appends a second copy of the message to the log: by default a handler that
+returns `acemq.Retry` stops the reader at that message, copying it nowhere, so a
+restart at the same offset sees it again. `StreamOptions{OnFailure:
+patterns.ParkOnFailure}` parks it and reads on instead.
 
 Retention is unbounded by default, which for a stream means "until the disk is
 full". Set `MaxAge` or `MaxBytes` on anything that runs for long.

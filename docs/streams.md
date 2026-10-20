@@ -269,8 +269,9 @@ more here than anywhere else in the docs.
 | On a queue | On a stream |
 |---|---|
 | `acemq.Accept()` removes the message | removes nothing; the log moves on and every other consumer still sees it |
-| `acemq.Retry(err)` republishes onto the same queue | **refused** — it would append a new copy to the log. See below |
-| `acemq.InProgress(d)` puts it back on the same queue | **refused**, the same as a retry, and for the same reason |
+| `acemq.Retry(err)` republishes onto the same queue | **stops the reader** at that message, copying it nowhere; a retry would append a new copy to the log. See below |
+| `acemq.InProgress(d)` puts it back on the same queue | **stops the reader**, the same as a retry, and for the same reason |
+| a panic is dead-lettered | **stops the reader**, the same as a retry |
 | `acemq.Reject(err)` republishes to `{queue}.dlq` | republishes to `{stream}.dlq` and works, but the original also stays in the stream |
 | `acemq.Park(err)` republishes to `{queue}.parked` | the same, with the same caveat |
 | the broker's own dead-lettering | **none** — a stream has no `x-dead-letter-exchange` |
@@ -293,10 +294,25 @@ from `FromFirst` next month would read both. A handler that returned `Retry` on
 every message would turn a stream into one that grows by a copy of itself per
 attempt, bounded only by the retry policy.
 
-So `ReadStream` does not obey it. A handler that returns `acemq.Retry` has the
-message **parked** — republished to `{stream}.parked`, which touches nothing in
-the stream — and the reason it is given is a `patterns.RetryOnStreamError` that
-names the two alternatives:
+So `ReadStream` does not obey it. By default a failed handler — `acemq.Retry`,
+`acemq.InProgress`, or a panic — **stops the reader at that message**: the
+subscription is closed, nothing after the message is handled, and no copy of it
+is written anywhere, not to `{stream}.dlq`, not to `{stream}.parked`, not to the
+stream. The stream is the record, so a reader restarted at the same offset after
+the fix sees the message again (AMQP-STREAM-004). `StreamOptions.OnStop` hears
+about it:
+
+```go
+sub, err := patterns.ReadStream(ctx, mq, "orders.log", handle, patterns.StreamOptions{
+	Offset: patterns.FromOffset(checkpoint + 1),
+	OnStop: func(err error) { log.Printf("projection halted: %v", err) },
+})
+```
+
+Setting a failure aside instead is something you turn on. `OnFailure:
+patterns.ParkOnFailure` parks the message — republished to `{stream}.parked`,
+which touches nothing in the stream — and reads on; the reason it is given is a
+`patterns.RetryOnStreamError` naming the alternatives:
 
 ```
 acemq: a handler on stream "orders.log" returned acemq.Retry for message
@@ -310,9 +326,7 @@ handler's reason was: the projection store is down
 ```
 
 The handler's own error is wrapped, so `errors.Is` against a sentinel still
-matches through the refusal. Parking is the conservative half of the choice and
-not the library deciding for you — it is what leaves the stream untouched while
-the message goes somewhere an operator will find it. Pick one deliberately:
+matches through the refusal. Or decide per message in the handler:
 
 ```go
 // Park it. The message is in {stream}.parked with the reason on its envelope,
@@ -337,21 +351,8 @@ func(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
 }
 ```
 
-Stopping is the third thing people mean by "retry" here, and it is the second
-one with the checkpoint left where it was:
-
-```go
-// Stop. The checkpoint is not advanced, so a restart comes back to this message.
-func(ctx context.Context, m acemq.Message[OrderPlaced]) acemq.Ack {
-	if err := projection.Apply(ctx, m.Payload); err != nil {
-		offset, _ := patterns.StreamOffsetOf(m.Envelope)
-		log.Printf("halting at %d: %v", offset, err)
-		halt()                 // cancel the process's context; nothing is checkpointed
-		return acemq.Accept()  // settles this delivery without copying it anywhere
-	}
-	return checkpointAndAccept(ctx, m)
-}
-```
+`acemq.Reject` and `acemq.Park` are the handler setting one message aside on
+purpose, so they are honoured whatever `OnFailure` says.
 
 **Java draws this line in the type system and Go draws it at the verb.** Java's
 `StreamConsumer` is a separate type from `MessageConsumer` precisely so the
@@ -359,12 +360,6 @@ outcomes a stream cannot honour are never offered — a single type covering bot
 would be one where half the methods throw. Go has one `acemq.Handler` and
 `ReadStream` takes it, so the refusal happens when the verb is used rather than
 when it is spelled. Same intent, one step later.
-
-`acemq.Accept()` in the stopping example is not the handler saying the work
-succeeded — it is the cheapest way to settle a delivery without appending a copy
-of it anywhere, on the way out of a process that is stopping. What makes it
-recoverable is that the checkpoint was not advanced, so the restarted reader
-comes back to this offset and sees the message again after the fix.
 
 Skipping is invisible unless you make it visible: Java has a `skipFailures()`
 mode with a `skipped()` counter behind it, and there is no equivalent here, so

@@ -485,7 +485,7 @@ func Serve[Req, Resp any](
 func reply[Req, Resp any](
 	ctx context.Context, conn *acemq.Conn, replyTo string, request acemq.Message[Req], response Resp,
 ) error {
-	return acemq.NewPublisher[Resp](conn, "", replyTo).Send(ctx, response,
+	return acemq.NewPublisher[Resp](conn, "", replyTo, acemq.AllowUnroutable[Resp]()).Send(ctx, response,
 		acemq.CorrelationID(request.Envelope.CorrelationID),
 		acemq.CausationID(request.Envelope.ID))
 }
@@ -494,7 +494,7 @@ func replyWithError[Resp any, Req any](
 	ctx context.Context, conn *acemq.Conn, replyTo string, request acemq.Message[Req], cause error,
 ) error {
 	var empty Resp
-	return acemq.NewPublisher[Resp](conn, "", replyTo).Send(ctx, empty,
+	return acemq.NewPublisher[Resp](conn, "", replyTo, acemq.AllowUnroutable[Resp]()).Send(ctx, empty,
 		acemq.CorrelationID(request.Envelope.CorrelationID),
 		acemq.CausationID(request.Envelope.ID),
 		acemq.Header(HeaderError, cause.Error()))

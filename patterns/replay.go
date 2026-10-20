@@ -124,11 +124,12 @@ const (
 	// HeaderReplayedFrom names the queue a message was replayed out of.
 	HeaderReplayedFrom = "acemq-replayed-from"
 
-	// HeaderReplayedAt is when it was replayed, as an RFC 3339 string — not
+	// HeaderReplayedAt is when it was replayed, as an ISO-8601 UTC string with
+	// exactly three fraction digits and a Z, 2026-10-20T09:15:02.123Z — not
 	// epoch milliseconds, which is how the engine's own x-acemq-first-seen
 	// travels. The two timestamps really are encoded differently on the wire.
-	// All five libraries write RFC 3339 here; Java also reads the epoch
-	// milliseconds it wrote before 0.5.0.
+	// The TCK pins the form (AMQP-ENV-013); this library wrote whole seconds
+	// before it did.
 	HeaderReplayedAt = "acemq-replayed-at"
 
 	// HeaderReplayCount is how many times it has been replayed.
@@ -209,7 +210,7 @@ func Replay(ctx context.Context, conn *acemq.Conn, from ReplayFrom) (result Repl
 
 		headers := goingBack.ToWire()
 		headers[HeaderReplayedFrom] = from.Queue
-		headers[HeaderReplayedAt] = time.Now().UTC().Format(time.RFC3339)
+		headers[HeaderReplayedAt] = time.Now().UTC().Format(replayedAtLayout)
 		headers[HeaderReplayCount] = replayCount(message.Envelope) + 1
 
 		// Mandatory, because the original is acknowledged as soon as this
@@ -288,13 +289,28 @@ func putBack(ctx context.Context, conn *acemq.Conn, queue string, declined []*ac
 	return failed
 }
 
+// replayedAtLayout is AMQP-ENV-013's millisecond ISO-8601 UTC.
+const replayedAtLayout = "2006-01-02T15:04:05.000Z"
+
+// replayCount reads acemq-replay-count at whatever integer width the client
+// decoded it as; a broker-side publisher may send a small number as a byte.
 func replayCount(env acemq.Envelope) int {
 	switch v := env.Headers[HeaderReplayCount].(type) {
 	case int:
 		return v
+	case int8:
+		return int(v)
+	case int16:
+		return int(v)
 	case int32:
 		return int(v)
 	case int64:
+		return int(v)
+	case uint8:
+		return int(v)
+	case uint16:
+		return int(v)
+	case uint32:
 		return int(v)
 	case float64:
 		return int(v)

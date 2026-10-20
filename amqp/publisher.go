@@ -54,6 +54,7 @@ func NewPublisher[T any](conn *Conn, exchange, routingKey string, opts ...Publis
 		routingKey: routingKey,
 		codec:      conn.codec,
 		persistent: true,
+		mandatory:  true,
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -78,14 +79,28 @@ func NotPersistent[T any]() PublisherOption[T] {
 
 // Mandatory makes [Publisher.Send] fail when a message reaches no queue.
 //
-// Without it the broker drops an unroutable message silently, which is the
-// quietest way to discover a binding was never made — the publisher succeeds,
-// the consumer waits, and nothing anywhere says why. With it, a message nothing
-// is bound to receive is an error at the point of publishing.
-//
-// It costs a round trip only when the message is actually unroutable.
+// The default, so this option changes nothing; it stays for code written before
+// the default changed, and for saying so explicitly. See [AllowUnroutable].
 func Mandatory[T any]() PublisherOption[T] {
 	return func(p *Publisher[T]) { p.mandatory = true }
+}
+
+// AllowUnroutable lets a message that reaches no queue be dropped by the
+// broker without an error.
+//
+// A publisher is mandatory by default: a message nothing is bound to receive
+// is returned by the broker and [Publisher.Send] fails with a
+// [*PublishFailedError] whose Unroutable is true, distinct from a broker nack.
+// Without that the broker drops the message silently, which is the quietest
+// way to discover a binding was never made — the publisher succeeds, the
+// consumer waits, and nothing anywhere says why. Opt out only for a
+// destination where nobody listening is normal, such as an event nobody has
+// subscribed to yet.
+//
+// It costs a round trip only when the message is actually unroutable. A
+// library hop is mandatory whatever this says.
+func AllowUnroutable[T any]() PublisherOption[T] {
+	return func(p *Publisher[T]) { p.mandatory = false }
 }
 
 // Send publishes one message.

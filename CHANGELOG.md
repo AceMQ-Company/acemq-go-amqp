@@ -14,6 +14,50 @@ While the version is `0.x` the public API may change in any release.
   settings, for the TCK case that reads the source queue the moment it returns.
 - Runs the AceMQ TCK v0.3.0 (was v0.2.0), which adds REPLAY-001 to the
   default run: 20 cases.
+- **`acemq.AllowUnroutable[T]()`**, the opt-out from a mandatory publisher.
+- **`patterns.StreamOptions.OnFailure` and `OnStop`.** `patterns.StopOnFailure`
+  (the default) or `patterns.ParkOnFailure`; `OnStop` hears that a failed
+  handler stopped the reader, with its reason.
+- The TCK driver answers the `pipeline` op and the new arguments:
+  `publish.mandatory`, `consume` without `retry` (no retry policy),
+  `consume.idempotent` and `readStream.behaviour`.
+
+### Changed
+
+- **A publisher is mandatory by default.** `acemq.NewPublisher` now sets
+  `mandatory`, so a message the broker can route nowhere fails `Send` with a
+  `*PublishFailedError` whose `Unroutable` is true, where it used to succeed
+  and be dropped by the broker (AMQP-PUB-006). A broker nack still has
+  `Unroutable` false. Opt out with `acemq.AllowUnroutable[T]()`;
+  `acemq.Mandatory[T]()` is now the default and stays. This covers every
+  publisher built from it: `patterns.NewRequester` requests,
+  `patterns.Start`, and `otel.NewPublisher`. Replies from `patterns.Serve`
+  stay non-mandatory, as before.
+- **A consumer with no retry policy makes one attempt.** With neither
+  `WithRetry` nor `RetryWith`, a handler's `acemq.Retry` now dead-letters the
+  message to `{queue}.dlq` at once, attempt 1, with `x-acemq-error` saying there
+  was no retry policy — as under `NoRetry()`. It used to be republished to the
+  source queue at once, for ever (AMQP-RETRY-008). Pipelines and consumer
+  groups built without a policy follow suit.
+- **A failing stream handler stops the reader.** `patterns.ReadStream` closes
+  the subscription at a message whose handler returns `acemq.Retry` or
+  `acemq.InProgress`, or panics: nothing after it is handled and no copy is
+  written anywhere (AMQP-STREAM-004). It used to park the message to
+  `{stream}.parked` and read on; that is now
+  `StreamOptions{OnFailure: patterns.ParkOnFailure}`. `acemq.Reject` and
+  `acemq.Park` still set one message aside and read on.
+- **`acemq-replayed-at` has millisecond precision**: `2026-10-20T09:15:02.123Z`,
+  was whole seconds (AMQP-ENV-013).
+
+### Fixed
+
+- **An `x-acemq-` header this version does not know survives a republish.** A
+  retry hop, a dead letter, a park and a replay rebuilt the headers from the
+  envelope's own fields and dropped every reserved header without one, such as
+  one a newer library added. They are now carried unchanged (AMQP-ENV-014).
+  They are still not shown in `Envelope.Headers`.
+- `patterns.Replay` reads an `acemq-replay-count` of any integer width; a
+  count sent as an 8- or 16-bit integer was read as 0.
 
 ### Fixed
 

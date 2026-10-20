@@ -83,10 +83,15 @@ so a stamp written there would reach the wire and vanish before the handler saw
 it. Unprefixed, the three arrive as ordinary entries in `Envelope.Headers`, which
 is where `patterns.HeaderReplayedFrom` and its two siblings read them.
 
-`acemq-replayed-at` is an **RFC 3339** string — `2026-02-03T04:05:06Z` — unlike
-`x-acemq-first-seen`, which is epoch milliseconds. The two timestamps on the wire
-really are encoded differently. Go, Java, Python and Ruby all write RFC 3339
-here; Java also reads the epoch milliseconds it wrote before 0.5.0.
+`acemq-replayed-at` is an ISO-8601 UTC string with millisecond precision —
+`2026-02-03T04:05:06.789Z` — unlike `x-acemq-first-seen`, which is epoch
+milliseconds. The two timestamps on the wire really are encoded differently.
+The TCK pins the form (AMQP-ENV-013).
+
+**An `x-acemq-` header this version does not know is kept, not lost.** It is
+not shown to a handler, but a retry hop, a dead letter, a park and a replay
+write it back exactly as it arrived (AMQP-ENV-014), so a header a newer library
+added survives a trip through this one.
 
 .NET writes the prefixed `x-acemq-` spellings of all three instead, so its replay
 stamps are dropped on the way in here rather than reaching a handler — see

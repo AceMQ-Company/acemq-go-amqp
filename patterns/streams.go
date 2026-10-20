@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync/atomic"
 	"time"
 
 	acemq "github.com/AceMQ-Company/acemq-go-amqp/amqp"
@@ -116,7 +117,36 @@ type StreamOptions struct {
 	// Name identifies a consumer to the broker, and is what makes server-side
 	// offset tracking possible.
 	Name string
+
+	// OnFailure is what a failed handler does to the reader. [StopOnFailure]
+	// when not set.
+	OnFailure StreamFailure
+
+	// OnStop, when set, is called once after a failed handler stopped the
+	// reader, with the handler's reason. The reader is closed by then.
+	OnStop func(error)
 }
+
+// StreamFailure is what a stream reader does when its handler fails: returns
+// acemq.Retry or acemq.InProgress, or panics.
+//
+// acemq.Reject and acemq.Park are not failures in this sense. They are the
+// handler setting one message aside on purpose, and are honoured either way:
+// a copy goes to {stream}.dlq or {stream}.parked and the reader goes on.
+type StreamFailure int
+
+const (
+	// StopOnFailure closes the reader at the failed message: nothing after it
+	// is handled and no copy of it is written anywhere. The stream is the
+	// record, so a reader restarted at the same offset after a fix sees the
+	// message again. The default (AMQP-STREAM-004).
+	StopOnFailure StreamFailure = iota
+
+	// ParkOnFailure parks a copy to {stream}.parked with a
+	// [*RetryOnStreamError] and reads on. What every failure did before
+	// StopOnFailure became the default.
+	ParkOnFailure
+)
 
 // DeclareStream declares a queue that keeps its messages.
 //
@@ -194,11 +224,14 @@ func durationArg(d time.Duration) string {
 // resuming exactly means recording the x-stream-offset header as you go and
 // starting from FromOffset.
 //
-// Returning acemq.Retry is refused rather than obeyed. A retry republishes the
-// message onto the queue it came from, which on a stream appends a second copy
-// to the log at a new offset, for every consumer to read now and on every replay
-// afterwards. A handler that returns it gets the message parked with a
-// [RetryOnStreamError] naming the two honest alternatives instead; see that type.
+// A failed handler — acemq.Retry, acemq.InProgress or a panic — stops the
+// reader by default: the subscription is closed at that message, nothing after
+// it is handled, and no copy of it is written anywhere. A retry is never
+// obeyed, because it republishes the message onto the queue it came from,
+// which on a stream appends a second copy to the log at a new offset for every
+// consumer to read. Set StreamOptions.OnFailure to [ParkOnFailure] to park the
+// message with a [RetryOnStreamError] and read on instead, and
+// StreamOptions.OnStop to hear that the reader stopped.
 //
 // Rejecting does not dead-letter in the broker's sense, because a stream carries
 // no x-dead-letter-exchange and nothing can be removed from it. The engine's own
@@ -233,7 +266,69 @@ func ReadStream[T any](
 		consumeOpts = append(consumeOpts, acemq.ConsumerTag(opts.Name))
 	}
 
-	return acemq.Consume(ctx, conn, stream, refuseRetry(stream, handler), consumeOpts...)
+	if opts.OnFailure == ParkOnFailure {
+		return acemq.Consume(ctx, conn, stream, refuseRetry(stream, handler), consumeOpts...)
+	}
+
+	// The handler stops the reader from inside a delivery, so the close runs on
+	// its own goroutine: Close waits for running handlers, this one included.
+	var (
+		reader  *acemq.Consumer
+		started = make(chan struct{})
+		stopped atomic.Bool
+	)
+	stop := func(reason error) {
+		if !stopped.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			<-started
+			if reader != nil {
+				_ = reader.Close()
+			}
+			if opts.OnStop != nil {
+				opts.OnStop(reason)
+			}
+		}()
+	}
+	var err error
+	reader, err = acemq.Consume(ctx, conn, stream, stopOnFailure(stream, handler, &stopped, stop), consumeOpts...)
+	close(started)
+	return reader, err
+}
+
+// stopOnFailure wraps a stream handler so a failure stops the reader rather
+// than moving past the message.
+//
+// The failed delivery and any already prefetched behind it are acknowledged
+// without being handled: on a stream an acknowledgement removes nothing and
+// only moves this run's credit, and the reader is closing.
+func stopOnFailure[T any](
+	stream string, handler acemq.Handler[T], stopped *atomic.Bool, stop func(error),
+) acemq.Handler[T] {
+	return func(ctx context.Context, m acemq.Message[T]) (ack acemq.Ack) {
+		if stopped.Load() {
+			return acemq.Accept()
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				stop(fmt.Errorf("acemq: the handler on stream %q panicked on message %s: %v",
+					stream, m.Envelope.ID, r))
+				ack = acemq.Accept()
+			}
+		}()
+		ack = handler(ctx, m)
+		if !ack.IsRetry() && !ack.IsInProgress() {
+			return ack
+		}
+		reason := ack.Err()
+		if reason == nil {
+			reason = errors.New("acemq: the message is in progress elsewhere")
+		}
+		stop(fmt.Errorf("acemq: the handler on stream %q failed on message %s, so the reader"+
+			" stopped there: %w", stream, m.Envelope.ID, reason))
+		return acemq.Accept()
+	}
 }
 
 // RetryOnStreamError is what a stream handler gets for returning acemq.Retry.
@@ -245,10 +340,9 @@ func ReadStream[T any](
 // and [ReadStream] takes it — so the line is drawn here instead, at the moment
 // the verb is used rather than at the moment it is spelled.
 //
-// The message is parked: republished to {stream}.parked, which does not touch
-// the stream, and the run moves on. That is the conservative half of the choice
-// and it is not the library deciding for you — the error says which two are on
-// offer, and both are one line in the handler:
+// Under [ParkOnFailure] the message is parked: republished to {stream}.parked,
+// which does not touch the stream, and the run moves on. The error says which
+// two choices are on offer, and both are one line in the handler:
 //
 //   - Park it. Return acemq.Park(err) yourself. The message goes to
 //     {stream}.parked as a copy and somebody looks at the queue later. The
@@ -258,10 +352,7 @@ func ReadStream[T any](
 //     acemq.Accept(), and count the gap — nothing else records it. See
 //     [StreamOffsetOf].
 //
-// Stopping is the third thing people mean by "retry" on a stream, and it is the
-// second option with the checkpoint left where it was: settle the delivery with
-// acemq.Accept, do not advance the checkpoint, and cancel the process's context.
-// A restarted reader comes back to the same offset.
+// Stopping is the third choice, and what [StopOnFailure], the default, does.
 type RetryOnStreamError struct {
 	// Stream is the stream the handler was reading.
 	Stream string

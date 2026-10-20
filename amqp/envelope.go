@@ -110,6 +110,16 @@ type Envelope struct {
 	// Headers are the application's own. Never contains anything in the reserved
 	// namespace.
 	Headers map[string]any
+
+	// reserved is every x-acemq- header the message arrived with that this
+	// version has no field for, kept exactly as it came.
+	//
+	// Not shown to the application, because the prefix is the engine's, and not
+	// dropped either: a retry hop, a dead letter, a park and a replay republish a
+	// message this library did not write, possibly one a newer library wrote,
+	// and rebuilding its headers from the fields above lost every envelope
+	// header added after this version. [Envelope.ToWire] writes them back.
+	reserved map[string]any
 }
 
 // EnvelopeOption sets a field on a message being built. The same options work
@@ -292,11 +302,19 @@ func NewEnvelope(msgType string, opts ...EnvelopeOption) (Envelope, error) {
 // routingKey supplies Type when the header is absent, and messageID supplies ID.
 func EnvelopeFromWire(headers map[string]any, routingKey, messageID string) Envelope {
 	application := make(map[string]any, len(headers))
+	var reserved map[string]any
 	for k, v := range headers {
 		// Reserved headers are the engine's and never reach the application,
-		// whether or not this version understands them.
-		if !IsAceHeader(k) {
+		// whether or not this version understands them. The ones it does not
+		// understand are carried for the next republish; see Envelope.reserved.
+		switch {
+		case !IsAceHeader(k):
 			application[k] = v
+		case !knownHeaders[k]:
+			if reserved == nil {
+				reserved = map[string]any{}
+			}
+			reserved[k] = v
 		}
 	}
 
@@ -347,7 +365,17 @@ func EnvelopeFromWire(headers map[string]any, routingKey, messageID string) Enve
 		RoutePosition: headerInt(headers, HeaderRoutePosition),
 		RouteID:       headerString(headers, HeaderRouteID),
 		Headers:       application,
+		reserved:      reserved,
 	}
+}
+
+// knownHeaders are the reserved headers this version materialises onto an
+// [Envelope] field.
+var knownHeaders = map[string]bool{
+	HeaderID: true, HeaderType: true, HeaderVersion: true, HeaderCorrelation: true,
+	HeaderCausation: true, HeaderAttempt: true, HeaderFirstSeen: true, HeaderOrigin: true,
+	HeaderError: true, HeaderClaim: true, HeaderRoute: true, HeaderRoutePosition: true,
+	HeaderRouteID: true,
 }
 
 // RouteSteps is the declared route's step names, in order, or nil when the
@@ -392,14 +420,17 @@ func envelopeFromDelivery(d Delivery) Envelope {
 // rather than writing a null, and a port that writes nulls produces messages
 // that differ from Java's for the same logical content.
 func (e Envelope) ToWire() map[string]any {
-	wire := map[string]any{
-		HeaderID:          e.ID,
-		HeaderType:        e.Type,
-		HeaderVersion:     e.Version,
-		HeaderCorrelation: e.CorrelationID,
-		HeaderAttempt:     e.Attempt,
-		HeaderFirstSeen:   e.FirstSeen.UnixMilli(),
+	wire := make(map[string]any, len(e.reserved)+len(e.Headers)+8)
+	// First, so a field this version does know always wins over a stale copy.
+	for k, v := range e.reserved {
+		wire[k] = v
 	}
+	wire[HeaderID] = e.ID
+	wire[HeaderType] = e.Type
+	wire[HeaderVersion] = e.Version
+	wire[HeaderCorrelation] = e.CorrelationID
+	wire[HeaderAttempt] = e.Attempt
+	wire[HeaderFirstSeen] = e.FirstSeen.UnixMilli()
 
 	if e.CausationID != "" {
 		wire[HeaderCausation] = e.CausationID

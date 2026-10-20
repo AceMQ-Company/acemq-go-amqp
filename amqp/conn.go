@@ -92,10 +92,9 @@ func WithOrigin(origin string) ConnOption {
 
 // WithRetry sets the retry policy consumers use by default.
 //
-// Without one a message returned by [Retry] is republished onto its own queue at
-// once, with its attempt counter advanced and nothing to stop it, and the broker
-// will hand it back as fast as it can. That is rarely what anybody wants for
-// long, so set a policy for anything that is not a toy.
+// Without one a consumer makes one attempt: a message returned by [Retry] is
+// dead-lettered to {queue}.dlq straight away, exactly as under [NoRetry]. Earlier
+// versions republished it onto its own queue at once, with nothing to stop it.
 //
 // A policy with waits at or past its [RetryPolicy.BrokerWaitThreshold] needs its
 // rung queues declared — see [Topology.Retries]. A consumer whose rungs are
