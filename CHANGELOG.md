@@ -6,14 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
-## [0.9.10] - 2026-10-20
+## [Unreleased]
 
 ### Added
 
-- The TCK driver answers `replay`: one filtered `patterns.Replay` with default
-  settings, for the TCK case that reads the source queue the moment it returns.
-- Runs the AceMQ TCK v0.3.0 (was v0.2.0), which adds REPLAY-001 to the
-  default run: 20 cases.
 - **`acemq.AllowUnroutable[T]()`**, the opt-out from a mandatory publisher.
 - **`patterns.StreamOptions.OnFailure` and `OnStop`.** `patterns.StopOnFailure`
   (the default) or `patterns.ParkOnFailure`; `OnStop` hears that a failed
@@ -58,6 +54,15 @@ While the version is `0.x` the public API may change in any release.
   They are still not shown in `Envelope.Headers`.
 - `patterns.Replay` reads an `acemq-replay-count` of any integer width; a
   count sent as an 8- or 16-bit integer was read as 0.
+
+## [0.9.10] - 2026-10-20
+
+### Added
+
+- The TCK driver answers `replay`: one filtered `patterns.Replay` with default
+  settings, for the TCK case that reads the source queue the moment it returns.
+- Runs the AceMQ TCK v0.3.0 (was v0.2.0), which adds REPLAY-001 to the
+  default run: 20 cases.
 
 ### Fixed
 
