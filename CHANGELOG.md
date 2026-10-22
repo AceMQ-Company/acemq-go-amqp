@@ -8,6 +8,33 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **`acemq.CarryHeaders(env)`**, an envelope option that copies a received
+  message's application headers and its unknown `x-acemq-` headers onto the
+  message being built, and **`(*acemq.Conn).Origin()`**.
+- The TCK driver answers `claimCheck` (the library's `patterns.ClaimCheck`
+  codec over `patterns.NewFilesystemClaimCheckStore`), `outbox`
+  (`patterns.Record` into `patterns.InMemoryOutboxStore`, relayed by
+  `patterns.NewOutboxRelay`) and `consumeGroup` (`patterns.NewConsumerGroup`).
+
+### Changed
+
+- **A pipeline hop keeps the message's headers.** `NewPipeline` steps, `Then`
+  and `FollowSlip` now carry the application headers (`x-tenant`,
+  `traceparent`, ...) and every `x-acemq-` header this version has no field
+  for on to the next step. Up to 0.9.12 a hop kept only the correlation and
+  causation and dropped the rest (TCK SLIP-004, SLIP-005). The next message
+  still has its own id, the incoming id as its causation, and attempt 1. See
+  `docs/patterns.md`, "What travels to the next step".
+
+### Fixed
+
+- **`patterns.Record` stamps the connection's origin.** A record now carries
+  the origin given to `acemq.WithOrigin`, as `Send` does; up to 0.9.12 it
+  always wrote `acemq@{host}` (TCK OUTBOX-001). An explicit `acemq.Origin`
+  option still wins.
+
 ## [0.9.12] - 2026-10-21
 
 ### Added

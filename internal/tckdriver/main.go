@@ -28,7 +28,7 @@ import (
 )
 
 var ops = []string{"hello", "begin", "end", "publish", "consume", "handled", "schedule", "request",
-	"declareStream", "readStream", "metrics", "replay", "pipeline"}
+	"declareStream", "readStream", "metrics", "replay", "pipeline", "claimCheck", "outbox", "consumeGroup"}
 
 type args map[string]any
 
@@ -106,6 +106,10 @@ type driver struct {
 	metrics    *recorder
 	scheduler  *patterns.Scheduler
 	requesters map[[2]string]*patterns.Requester[any, any]
+	origin     string
+	store      *patterns.InMemoryOutboxStore
+	relay      *patterns.OutboxRelay
+	groups     []*patterns.ConsumerGroup
 }
 
 func (d *driver) mq() (*acemq.Conn, error) {
@@ -129,8 +133,9 @@ func (d *driver) begin(a args) (any, error) {
 	}
 	d.ctx, d.cancel = context.WithCancel(context.Background())
 	d.metrics = &recorder{}
+	d.origin = a.str("clientName", "tck") + "@" + host
 	opts := []acemq.ConnOption{
-		acemq.WithOrigin(a.str("clientName", "tck") + "@" + host), acemq.WithObserver(d.metrics)}
+		acemq.WithOrigin(d.origin), acemq.WithObserver(d.metrics)}
 	if confirms, ok := a["confirms"].(bool); ok && !confirms {
 		// The library's switch for the user's own publishes lives on the
 		// RabbitMQ transport's configuration.
@@ -154,6 +159,14 @@ func (d *driver) end(args) (any, error) {
 		_ = d.scheduler.Close()
 		d.scheduler = nil
 	}
+	if d.relay != nil {
+		_ = d.relay.Close()
+		d.relay, d.store = nil, nil
+	}
+	for _, g := range d.groups {
+		_ = g.Close()
+	}
+	d.groups = nil
 	for _, p := range d.pipelines {
 		_ = p.Close()
 	}
@@ -174,32 +187,39 @@ func (d *driver) end(args) (any, error) {
 	return map[string]any{}, nil
 }
 
+// envelopeOptions turns an op's envelope argument into the library's options.
+func envelopeOptions(env args) []acemq.EnvelopeOption {
+	var opts []acemq.EnvelopeOption
+	if env == nil {
+		return opts
+	}
+	if v, ok := env["id"].(string); ok {
+		opts = append(opts, acemq.MessageID(v))
+	}
+	if v, ok := env["type"].(string); ok {
+		opts = append(opts, acemq.MessageType(v))
+	}
+	if _, ok := env["version"].(float64); ok {
+		opts = append(opts, acemq.SchemaVersion(env.num("version", 0)))
+	}
+	if v, ok := env["correlationId"].(string); ok {
+		opts = append(opts, acemq.CorrelationID(v))
+	}
+	if v, ok := env["causationId"].(string); ok {
+		opts = append(opts, acemq.CausationID(v))
+	}
+	for name, value := range env.obj("headers") {
+		opts = append(opts, acemq.Header(name, value))
+	}
+	return opts
+}
+
 func (d *driver) publish(a args) (any, error) {
 	conn, err := d.mq()
 	if err != nil {
 		return nil, err
 	}
-	var opts []acemq.EnvelopeOption
-	if env := a.obj("envelope"); env != nil {
-		if v, ok := env["id"].(string); ok {
-			opts = append(opts, acemq.MessageID(v))
-		}
-		if v, ok := env["type"].(string); ok {
-			opts = append(opts, acemq.MessageType(v))
-		}
-		if _, ok := env["version"].(float64); ok {
-			opts = append(opts, acemq.SchemaVersion(env.num("version", 0)))
-		}
-		if v, ok := env["correlationId"].(string); ok {
-			opts = append(opts, acemq.CorrelationID(v))
-		}
-		if v, ok := env["causationId"].(string); ok {
-			opts = append(opts, acemq.CausationID(v))
-		}
-		for name, value := range env.obj("headers") {
-			opts = append(opts, acemq.Header(name, value))
-		}
-	}
+	opts := envelopeOptions(a.obj("envelope"))
 	// Absent is the library's default, which is mandatory.
 	var popts []acemq.PublisherOption[any]
 	if mandatory, ok := a["mandatory"].(bool); ok {
@@ -475,6 +495,7 @@ func main() {
 		"consume": d.consume, "handled": d.handled, "schedule": d.schedule, "request": d.request,
 		"declareStream": d.declareStream, "readStream": d.readStream, "metrics": d.metricsOp,
 		"replay": d.replay, "pipeline": d.pipeline,
+		"claimCheck": d.claimCheck, "outbox": d.outbox, "consumeGroup": d.consumeGroup,
 	}
 
 	in := bufio.NewScanner(os.Stdin)
@@ -510,4 +531,56 @@ func main() {
 		}
 	}
 	_, _ = d.end(nil)
+}
+
+func (d *driver) claimCheck(a args) (any, error) {
+	if d.conn != nil {
+		_ = d.conn.Close()
+	}
+	codec := patterns.ClaimCheck(acemq.JSONCodec{}, patterns.NewFilesystemClaimCheckStore(a.str("directory", "")),
+		patterns.OffloadAbove(a.num("thresholdBytes", 0)))
+	var err error
+	d.conn, err = acemq.Connect(d.ctx, d.url, acemq.WithOrigin(d.origin), acemq.WithObserver(d.metrics), acemq.WithCodec(codec))
+	return map[string]any{}, err
+}
+
+func (d *driver) outbox(a args) (any, error) {
+	conn, err := d.mq()
+	if err != nil {
+		return nil, err
+	}
+	if d.relay == nil {
+		d.store = patterns.NewInMemoryOutboxStore()
+		d.relay = patterns.NewOutboxRelay(conn, d.store)
+		d.relay.Start(d.ctx)
+	}
+	record, err := patterns.Record[any](conn, a.str("exchange", ""), a.str("routingKey", ""), a["body"],
+		envelopeOptions(a.obj("envelope"))...)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.store.Add(d.ctx, record); err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": record.ID}, nil
+}
+
+func (d *driver) consumeGroup(a args) (any, error) {
+	conn, err := d.mq()
+	if err != nil {
+		return nil, err
+	}
+	queue := a.str("queue", "")
+	t := &tally{counts: map[string]int{}, redelivered: map[string]int{}}
+	if err := acemq.NewTopology().Queue(queue).DeadLetters(queue).Apply(d.ctx, conn); err != nil {
+		return nil, err
+	}
+	g, err := patterns.NewConsumerGroup(d.ctx, conn, queue, a.num("size", 1), failing(t, a.obj("behaviour")),
+		acemq.Prefetch(a.num("prefetch", 10)))
+	if err != nil {
+		return nil, err
+	}
+	d.groups = append(d.groups, g)
+	d.tallies[a.str("handle", "")] = t
+	return map[string]any{}, nil
 }
