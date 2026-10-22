@@ -266,12 +266,19 @@ func Header(name string, value any) EnvelopeOption {
 //
 // For a message sent because of another one that should travel on with it, such
 // as a pipeline hop: a tenant header, a W3C traceparent or an envelope header a
-// newer library added reach the next step as they reached this one. It sets no
-// envelope field — the id, correlation, causation, attempt and first-seen of the
-// new message are its own — and options after it override what it copied, so
-// pass it first.
+// newer library added reach the next step as they reached this one. It also
+// keeps the received message's first-seen, so the age of a message several hops
+// along is the age of the whole run rather than of the last hop (a message that
+// arrived without x-acemq-first-seen gets the time of the new publish, as
+// before). It sets no other envelope field — the id, correlation, causation and
+// attempt of the new message are its own — and options after it override what
+// it copied, so pass it first.
 func CarryHeaders(from Envelope) EnvelopeOption {
 	return func(b *envelopeBuilder) error {
+		if from.FirstSeen.UnixMilli() > 0 {
+			firstSeen := from.FirstSeen
+			b.firstSeen = &firstSeen
+		}
 		if len(from.Headers) > 0 && b.env.Headers == nil {
 			b.env.Headers = make(map[string]any, len(from.Headers))
 		}

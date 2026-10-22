@@ -233,8 +233,8 @@ and points back one step, so the chain can be walked in either direction.
 To carry the incoming message's own headers too — your application headers and
 any `x-acemq-` header this version does not know — put
 `acemq.CarryHeaders(m.Envelope)` first; the library's pipeline hops do exactly
-that. It sets no envelope field, so the id, attempt and first-seen are the new
-message's own.
+that. It also keeps the incoming first-seen, so the next message's age is the
+age of the whole run; the id and attempt are the new message's own.
 
 ## Your own headers
 

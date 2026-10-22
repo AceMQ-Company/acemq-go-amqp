@@ -8,6 +8,18 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A pipeline hop keeps the run's `x-acemq-first-seen`.** `NewPipeline`
+  steps, `Then` and `FollowSlip` now give the next message the incoming
+  message's first-seen, so the age reported at the end of a run (the
+  `patterns.RunObserver` age, which feeds `acemq.pipeline.run.duration`) is the
+  whole run. Up to 0.9.13 each hop stamped a new first-seen and a finished run
+  reported only the time since its last hop (TCK SLIP-006, SLIP-007).
+  `acemq.CarryHeaders` is what changed: it now keeps the first-seen too, so a
+  hop you write with it behaves the same; a later `acemq.FirstSeen` option
+  still overrides it. See `docs/patterns.md`, "What travels to the next step".
+
 ## [0.9.13] - 2026-10-22
 
 ### Added

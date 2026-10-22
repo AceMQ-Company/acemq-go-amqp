@@ -424,3 +424,30 @@ func (f *atomicFlag) isSet() bool {
 	defer f.mu.Unlock()
 	return f.set_
 }
+
+func TestCarryHeadersKeepsTheRunsFirstSeen(t *testing.T) {
+	// A pipeline hop builds a new message with CarryHeaders; the run's
+	// first-seen must survive it so the run duration covers every hop.
+	in := EnvelopeFromWire(map[string]any{HeaderFirstSeen: int64(1761134400000)}, "a", "m-1")
+
+	next, err := NewEnvelope("b", CarryHeaders(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := next.FirstSeen.UnixMilli(); got != 1761134400000 {
+		t.Errorf("FirstSeen = %d, want the incoming 1761134400000", got)
+	}
+	if next.ID == in.ID {
+		t.Error("the hop reused the incoming id")
+	}
+
+	// Without the header there is nothing to keep: the new publish's time,
+	// never the epoch.
+	bare, err := NewEnvelope("b", CarryHeaders(EnvelopeFromWire(map[string]any{}, "a", "m-2")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(bare.FirstSeen) > time.Minute {
+		t.Errorf("FirstSeen = %v, want about now", bare.FirstSeen)
+	}
+}
