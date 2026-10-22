@@ -20,6 +20,11 @@ While the version is `0.x` the public API may change in any release.
   hop you write with it behaves the same; a later `acemq.FirstSeen` option
   still overrides it. See `docs/patterns.md`, "What travels to the next step".
 
+### Added
+
+- Runs the AceMQ TCK v0.3.4 (was v0.3.3), which adds SLIP-006 and SLIP-007
+  to the default run: 40 cases.
+
 ## [0.9.13] - 2026-10-22
 
 ### Added
