@@ -45,13 +45,15 @@ anything. So everything that can be checked is checked before the tag exists.
    carrying its path:
 
    ```bash
-   for m in codec/yaml codec/toml codec/protobuf codec/avro telemetry/otel; do
+   for m in codec/yaml codec/toml codec/protobuf codec/avro telemetry/otel patterns/sqltest; do
      git tag -a "$m/v0.1.0" v0.1.0^{} -m "AceMQ for Go $m 0.1.0"
    done
-   git push origin codec/yaml/v0.1.0 codec/toml/v0.1.0 \
-                   codec/protobuf/v0.1.0 codec/avro/v0.1.0 \
-                   telemetry/otel/v0.1.0
+   git push origin codec/yaml/v0.1.0 codec/toml/v0.1.0 codec/protobuf/v0.1.0
+   git push origin codec/avro/v0.1.0 telemetry/otel/v0.1.0 patterns/sqltest/v0.1.0
    ```
+
+   At most three tags per push: GitHub starts no workflow for tags past the
+   third in one push, and nothing reports it.
 
    `telemetry/otel` is not a codec but is published exactly like one — its own
    module, its own path-prefixed tag — so it is tagged with them.
@@ -69,7 +71,9 @@ anything. So everything that can be checked is checked before the tag exists.
    tag nobody pushed. This was discovered by trying to consume 0.1.0 rather
    than by reading the workflow, which is the only way it would have been found.
 
-   `patterns/sqltest` is not tagged: it holds tests and nothing imports it.
+   `patterns/sqltest` is tagged too. It holds tests and nothing imports it, but
+   it is a module with its own `go.mod` requiring the parent, so it gets its
+   tag like the others.
 
 The release workflow then verifies the tag: that it is a `0.7.x` version, that
 `go.mod` still targets Go 1.23, that `acemq.Version` matches the tag, that every

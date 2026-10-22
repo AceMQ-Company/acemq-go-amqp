@@ -106,9 +106,18 @@ fi
 
 echo "Ready. Tag it:"
 echo
-for module in $nested_published; do
-  echo "  git tag -a $module/v$version -m 'AceMQ for Go $module $version'"
-done
 echo "  git tag -a v$version   # with release notes"
-echo "  git push origin $(for m in $nested_published; do printf '%s/v%s ' "$m" "$version"; done)"
 echo "  git push origin v$version"
+for module in $nested_all; do
+  echo "  git tag -a $module/v$version v$version^{} -m 'AceMQ for Go $module $version'"
+done
+# At most three tags per push: GitHub starts no workflow past the third.
+set -- $nested_all
+while [ $# -gt 0 ]; do
+  line="  git push origin"
+  for _ in 1 2 3; do
+    [ $# -gt 0 ] || break
+    line="$line $1/v$version"; shift
+  done
+  echo "$line"
+done
