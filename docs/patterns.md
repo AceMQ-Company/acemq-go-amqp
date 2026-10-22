@@ -207,6 +207,11 @@ The same holds on a connection dialled `WithoutConfirms`: the relay publishes on
 the library's own confirm channel, so a record is marked sent only once the
 broker has confirmed it reached a queue.
 
+A record carries the origin of the connection it was recorded on — the one given
+to `acemq.WithOrigin`, as `Send` stamps it — unless you pass `acemq.Origin`
+yourself. Up to 0.9.12 `Record` ignored `WithOrigin` and wrote `acemq@{host}`,
+so a relayed message did not say which service it came from (TCK OUTBOX-001).
+
 ### A record the broker will never take
 
 A sweep stops at the first record that fails and leaves it in the outbox. That is
@@ -430,6 +435,20 @@ could tell you. `FollowSlip` reports `completed` when it finishes the itinerary,
 and takes the step's name off the slip so it usually needs only `InPipeline`. An
 unnamed step reports nothing at all, rather than an event tagged with two empty
 strings.
+
+### What travels to the next step
+
+Every hop the library makes — a `NewPipeline` step, `Then` and `FollowSlip` —
+carries the message's own headers on to the next one: your application headers
+(`x-tenant`, a W3C `traceparent`) and any `x-acemq-` header this version has no
+field for, such as one a newer library added. The correlation carries too. The
+next message is still a new one: its own id, the incoming id as its causation,
+attempt 1, and the slip or route advanced past the step that just finished.
+
+Up to 0.9.12 a hop kept only the correlation and causation, so a tenant header,
+a trace context or an envelope header from a newer library stopped at the first
+step (TCK SLIP-004, SLIP-005). A hop you write yourself can do the same with
+`acemq.CarryHeaders(m.Envelope)`, passed before your other options.
 
 ## Replay
 

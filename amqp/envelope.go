@@ -260,6 +260,34 @@ func Header(name string, value any) EnvelopeOption {
 	}
 }
 
+// CarryHeaders copies a received message's application headers, and every
+// x-acemq- header it arrived with that this version has no field for, onto the
+// message being built.
+//
+// For a message sent because of another one that should travel on with it, such
+// as a pipeline hop: a tenant header, a W3C traceparent or an envelope header a
+// newer library added reach the next step as they reached this one. It sets no
+// envelope field — the id, correlation, causation, attempt and first-seen of the
+// new message are its own — and options after it override what it copied, so
+// pass it first.
+func CarryHeaders(from Envelope) EnvelopeOption {
+	return func(b *envelopeBuilder) error {
+		if len(from.Headers) > 0 && b.env.Headers == nil {
+			b.env.Headers = make(map[string]any, len(from.Headers))
+		}
+		for k, v := range from.Headers {
+			b.env.Headers[k] = v
+		}
+		if len(from.reserved) > 0 && b.env.reserved == nil {
+			b.env.reserved = make(map[string]any, len(from.reserved))
+		}
+		for k, v := range from.reserved {
+			b.env.reserved[k] = v
+		}
+		return nil
+	}
+}
+
 // NewEnvelope builds an envelope for a message type, applying the same defaults
 // the Java and .NET libraries apply.
 func NewEnvelope(msgType string, opts ...EnvelopeOption) (Envelope, error) {

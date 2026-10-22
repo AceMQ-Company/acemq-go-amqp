@@ -509,7 +509,10 @@ func FollowSlip[T any](
 			return acemq.Reject(acemq.Fatal(err))
 		}
 
+		// The incoming headers first, so the slip written below replaces the one
+		// this message arrived with.
 		onwards := append([]acemq.EnvelopeOption{
+			acemq.CarryHeaders(m.Envelope),
 			acemq.CorrelationID(m.Envelope.CorrelationID),
 			acemq.CausationID(m.Envelope.ID),
 		}, carrying...)

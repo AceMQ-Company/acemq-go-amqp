@@ -277,6 +277,10 @@ func WithOrdering[T any](key PartitionKey[T]) Middleware[T] {
 // Returning false publishes nothing and accepts the message, which is how a
 // step says "this one does not continue" without inventing an empty message.
 //
+// The next message carries the incoming one's application headers and unknown
+// x-acemq- headers (see [acemq.CarryHeaders]), its correlation, and its id as
+// the causation.
+//
 // The message is accepted only once the next one is published. If publishing
 // fails the input is retried, so the work runs again — which is why a step that
 // changes anything should be idempotent.
@@ -311,6 +315,7 @@ func Then[In, Out any](
 		}
 
 		err = publisher.Send(onbehalf.MarkMandatory(ctx), out,
+			acemq.CarryHeaders(m.Envelope),
 			acemq.CorrelationID(m.Envelope.CorrelationID),
 			acemq.CausationID(m.Envelope.ID))
 		if err != nil {

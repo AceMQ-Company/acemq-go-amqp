@@ -247,10 +247,15 @@ func (s *InMemoryOutboxStore) Len() int {
 //	record, _ := patterns.Record(mq, "orders-events", "order.placed", event)
 //	store.Add(ctx, record)   // the same tx
 //	tx.Commit()
+//
+// The record's origin is the connection's, as [acemq.Publisher] stamps it,
+// unless opts include an [acemq.Origin].
 func Record[T any](
 	conn *acemq.Conn, exchange, routingKey string, payload T, opts ...acemq.EnvelopeOption,
 ) (OutboxRecord, error) {
-	env, err := acemq.NewEnvelope(routingKey, opts...)
+	// The connection's origin, as a Publisher's Send stamps it, and before the
+	// caller's options so an explicit acemq.Origin still wins.
+	env, err := acemq.NewEnvelope(routingKey, append([]acemq.EnvelopeOption{acemq.Origin(conn.Origin())}, opts...)...)
 	if err != nil {
 		return OutboxRecord{}, err
 	}

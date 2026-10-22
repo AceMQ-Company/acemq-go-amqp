@@ -237,8 +237,10 @@ func (s *pipelineStep[In, Out]) start(
 			return acemq.Retry(err)
 		}
 		// The correlation carries so a whole run can be found, and the causation
-		// names this message as the reason for the next one.
+		// names this message as the reason for the next one. The incoming headers
+		// go first, so the slip written below replaces the one it arrived with.
 		all := append([]acemq.EnvelopeOption{
+			acemq.CarryHeaders(m.Envelope),
 			acemq.CorrelationID(m.Envelope.CorrelationID),
 			acemq.CausationID(m.Envelope.ID),
 		}, carrying...)

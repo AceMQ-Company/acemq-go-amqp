@@ -219,6 +219,10 @@ var errNilObserver = errors.New("acemq: WithObserver was given no observer")
 // Codec is the codec this connection publishes with.
 func (c *Conn) Codec() Codec { return c.codec }
 
+// Origin is the origin this connection stamps on what it publishes: the one
+// given to [WithOrigin], or acemq@{hostname}.
+func (c *Conn) Origin() string { return c.origin }
+
 // DeclareQueue creates a durable quorum queue if it is not already there.
 //
 // Quorum, not classic, and that is the same default the Java, .NET, Python and
