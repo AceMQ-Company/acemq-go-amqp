@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.9.12] - 2026-10-21
+
 ### Added
 
 - The TCK driver's `pipeline` op takes `behaviour`, so a step's own handler
