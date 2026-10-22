@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.9.13] - 2026-10-22
+
 ### Added
 
 - **`acemq.CarryHeaders(env)`**, an envelope option that copies a received
