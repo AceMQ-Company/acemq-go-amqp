@@ -40,6 +40,19 @@ the original is removing the copy that has been dealt with. Rejecting it instead
 would either requeue it into a hot loop or, with a dead-letter exchange on the
 queue, send it somewhere this library did not choose and without the reason.
 
+**A park the broker keeps refusing ends in `{queue}.dlq`, not lost.** When the
+broker refuses the republish onto `{queue}.parked` (the queue is full, or the
+publish comes back unroutable), the delivery goes back to its queue with a
+requeue after a one-second pause, and the next delivery tries again. A quorum
+queue counts those requeues: at its delivery limit, 20 by default on RabbitMQ 4,
+the broker dead-letters the message through the queue's own
+`x-dead-letter-exchange` into `{queue}.dlq`. So a park refused for longer than
+about twenty seconds (one second times twenty deliveries) lands in `.dlq`
+instead of `.parked`, with the broker's `x-death` rather than this library's
+`x-acemq-error`. That is a decision, not a bug, and Java, .NET, Python and Ruby
+behave the same: the message is never lost, and it is in the other set-aside
+queue. Look in both when a park went missing during a broker incident.
+
 Declare both with the topology:
 
 ```go

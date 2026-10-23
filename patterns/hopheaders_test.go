@@ -106,6 +106,52 @@ func TestASlipHopCarriesHeadersOn(t *testing.T) {
 	}
 }
 
+// TestARouteHopIsANewMessage is AMQP-SLIP-007 for the route form (TCK SLIP-008):
+// the hop gets its own x-acemq-id, its causation is the handled message's id and
+// the correlation is unchanged. TestASlipHopCarriesHeadersOn covers the
+// itinerary form (SLIP-009).
+func TestARouteHopIsANewMessage(t *testing.T) {
+	ctx := context.Background()
+	mq := brokerFor(t)
+	route := patterns.NewRoute("hops", "a", "b")
+	if err := mq.DeclareExchange(ctx, route.Name(), "direct"); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range route.Steps() {
+		if err := mq.DeclareQueue(ctx, route.QueueFor(step)); err != nil {
+			t.Fatal(err)
+		}
+		if err := mq.Bind(ctx, route.QueueFor(step), route.Name(), step); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sub, err := acemq.Consume(ctx, mq, route.QueueFor("a"), patterns.FollowSlip(mq,
+		func(_ context.Context, m acemq.Message[OrderPlaced]) (OrderPlaced, error) {
+			return m.Payload, nil
+		}, patterns.AlongRoute(route)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := acemq.NewPublisher[OrderPlaced](mq, route.Name(), "a").Send(ctx,
+		OrderPlaced{OrderID: "o-1"}, acemq.MessageID("h-r"), acemq.CorrelationID("corr-h"),
+		acemq.Route([]string{"a", "b"}, 0, "run-h")); err != nil {
+		t.Fatal(err)
+	}
+
+	wire := wireOf(t, mq, route.QueueFor("b"))
+	if wire[acemq.HeaderID] == "h-r" || wire[acemq.HeaderID] == "" {
+		t.Errorf("x-acemq-id = %v on the hop, want a new id", wire[acemq.HeaderID])
+	}
+	if wire[acemq.HeaderCausation] != "h-r" {
+		t.Errorf("causation = %v, want h-r", wire[acemq.HeaderCausation])
+	}
+	if wire[acemq.HeaderCorrelation] != "corr-h" {
+		t.Errorf("correlation = %v, want corr-h unchanged", wire[acemq.HeaderCorrelation])
+	}
+}
+
 func TestAThenHopCarriesHeadersOn(t *testing.T) {
 	ctx := context.Background()
 	mq := brokerFor(t)

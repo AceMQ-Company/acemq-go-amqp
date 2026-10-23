@@ -8,6 +8,23 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Documentation
+
+- **A filtered replay's trade-off is written down** (`docs/patterns.md`,
+  "Replay"): declined messages are held unacknowledged for the pass and go
+  back to the tail of the queue, so their order changes. Go puts them back
+  with a confirmed publish and has no wait for them to return, so a concurrent
+  consumer on the same queue cannot make it run out and there is nothing to
+  configure. No behaviour change.
+- **A park the broker keeps refusing ends in `{queue}.dlq`** (`docs/reliability.md`,
+  `docs/lifecycle.md`): the one-second requeue pause times the quorum
+  delivery limit of 20 means a park refused for longer than about twenty
+  seconds is dead-lettered by the broker into `.dlq`, never lost. Kept as is.
+- A pipeline or routing-slip hop is a new message (TCK AMQP-SLIP-007,
+  SLIP-008/009): a new `x-acemq-id`, causation set to the handled message's id,
+  correlation unchanged. Go already did this; a test now covers the route form
+  too. No behaviour change.
+
 ## [0.9.14] - 2026-10-22
 
 ### Fixed

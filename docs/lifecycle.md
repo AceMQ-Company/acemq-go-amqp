@@ -285,7 +285,10 @@ The same holds outside a shutdown. When the broker refuses the set-aside
 publish, or returns it as unroutable, the delivery goes back with a requeue
 after a pause of one second, and the worker is not held while it waits. Since
 0.9.11; before, it was requeued at once and refused again at once, some four
-hundred times a second into a full parked queue.
+hundred times a second into a full parked queue. On a quorum queue the broker
+counts those requeues, so a park refused for longer than about twenty seconds
+ends in `{queue}.dlq` — see
+[where a message goes](reliability.md#where-a-message-goes-when-it-is-given-up-on).
 
 **Which is why the cancellation comes last, and never first.** Cancelling the
 consumers' context is not a way to hurry a drain along. It is what happens when

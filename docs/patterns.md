@@ -446,7 +446,9 @@ so does `x-acemq-first-seen`, so the age a finished run reports through
 `patterns.RunObserver` (and `acemq.pipeline.run.duration`, if you record it) is
 the whole run from the first step. The next message is still a new one: its own
 id, the incoming id as its causation, attempt 1, and the slip or route advanced
-past the step that just finished.
+past the step that just finished. That is TCK requirement AMQP-SLIP-007 (cases
+SLIP-008 for the route form and SLIP-009 for the itinerary form), and Go has
+always done it; Java and .NET used to keep the incoming id on a hop.
 
 Up to 0.9.13 every hop stamped a new first-seen, so a finished run reported only
 the time since its last hop (TCK SLIP-006, SLIP-007).
@@ -528,6 +530,28 @@ never answers, and a quorum queue could read 0 straight after the replay.)
 A message is acknowledged only after the broker has confirmed the new copy. A
 crash in that gap replays it twice, which is the right way round for a
 dead-letter queue.
+
+**The trade-off of a filtered replay.** Three things follow from holding and
+then republishing what the filter declines, and they are deliberate:
+
+- **Declined messages are held unacknowledged for the whole pass.** They count
+  against the queue's unacknowledged messages, and nothing else can read them
+  until `Replay` returns. A long pass over a large queue holds a lot of them;
+  `Limit` and `Deadline` bound it.
+- **Declined messages come back in a different order.** They go to the tail of
+  the queue. On a drained queue that is where they were. On a queue something
+  is still writing to, they land behind whatever arrived during the pass.
+- **A concurrent consumer on the same queue does not make it run out of time.**
+  Java, .NET, Python and Ruby wait, 5 to 10 seconds by default and configurable,
+  for the passed-over messages to show back on the queue, and a consumer
+  draining that queue at the same time can make that wait run out. Go does not
+  wait. Its put-back is a confirmed publish, so `Replay` returns once every
+  declined message is back, whoever reads them next. That consumer can still
+  take a declined message as soon as it is back, so replay from a dead-letter
+  queue nothing else consumes.
+
+So Go has no wait to configure. Each library keeps its own approach; this is
+Go's.
 
 The new copy is published **mandatory**. A destination nothing is bound to is
 confirmed by the broker and then dropped, so until 0.9.5 a replay into it
